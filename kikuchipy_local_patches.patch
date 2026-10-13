@@ -1,0 +1,158 @@
+diff --git a/src/kikuchipy/indexing/_spherical/_gpu.py b/src/kikuchipy/indexing/_spherical/_gpu.py
+index 8de100cc..9a5c6618 100644
+--- a/src/kikuchipy/indexing/_spherical/_gpu.py
++++ b/src/kikuchipy/indexing/_spherical/_gpu.py
+@@ -1138,6 +1138,9 @@ class _GpuSession:
+         self.xp = cupy
+         self.fft = cupy.fft
+         self.lock = _DEVICE_LOCK
++        # the cuFFT plan cache of every thread which transformed for
++        # this session, by thread identifier; cleared in close()
++        self._plan_caches: dict[int, Any] = {}
+         self.batch_size = int(batch_size)
+         self.bandwidth = int(indexer.bandwidth)
+         slp = int(indexer.side_length)
+@@ -1181,9 +1184,26 @@ class _GpuSession:
+         # the batch spectrum buffer, zeroed at build (D2 freshness)
+         self.fxc = cupy.zeros((self.batch_size, slp, slp, bwp), dtype=np.complex64)
+ 
++    def register_plan_cache(self) -> None:
++        """Remember the cuFFT plan cache of the calling thread, so
++        that :meth:`close` can clear it.
++
++        CuPy caches cuFFT plans per thread and per device, and a
++        cached plan keeps its work area on the device.  The
++        transforms run in dask worker threads which outlive the
++        session, so without this the work areas of every worker stay
++        allocated after the run, where freeing the memory pool cannot
++        reach them, and the next call measures almost no free VRAM.
++        Call inside the device section, i.e. with :attr:`lock` held.
++        """
++        thread_id = threading.get_ident()
++        if thread_id not in self._plan_caches:
++            self._plan_caches[thread_id] = self.xp.fft.config.get_plan_cache()
++
+     def close(self) -> None:
+-        """Dispose every device allocation of this session and free
+-        the memory pool.  Idempotent: a second call is a no-op."""
++        """Dispose every device allocation of this session, clear the
++        cuFFT plan caches of the threads which used it and free the
++        memory pool.  Idempotent: a second call is a no-op."""
+         cupy = getattr(self, "xp", None)
+         self.a_tables = ()
+         self.r_dens = ()
+@@ -1191,6 +1211,11 @@ class _GpuSession:
+         self.fxc = None
+         self.xp = None
+         self.fft = None
++        plan_caches = getattr(self, "_plan_caches", {})
++        for cache in plan_caches.values():
++            # drops the plans and with them their device work areas
++            cache.clear()
++        plan_caches.clear()
+         if cupy is not None:
+             cupy.get_default_memory_pool().free_all_blocks()
+             cupy.get_default_pinned_memory_pool().free_all_blocks()
+diff --git a/src/kikuchipy/indexing/_spherical/_indexer.py b/src/kikuchipy/indexing/_spherical/_indexer.py
+index 514c6b75..92267ec8 100644
+--- a/src/kikuchipy/indexing/_spherical/_indexer.py
++++ b/src/kikuchipy/indexing/_spherical/_indexer.py
+@@ -947,6 +947,8 @@ def _index_chunk_gpu(
+         xp = session.xp
+         padded, slots = _gpu._pad_batch(np, gln_stack, session.batch_size, keep)
+         with session.lock:
++            # so that close() can clear this thread's cuFFT plans
++            session.register_plan_cache()
+             gln_batch = xp.asarray(padded)
+             # The pattern-side factors carry no phase term, so one
+             # build serves every phase of the batch
+diff --git a/src/kikuchipy/io/plugins/edax_binary/_api.py b/src/kikuchipy/io/plugins/edax_binary/_api.py
+index 6c0adf25..000045f7 100644
+--- a/src/kikuchipy/io/plugins/edax_binary/_api.py
++++ b/src/kikuchipy/io/plugins/edax_binary/_api.py
+@@ -17,11 +17,13 @@
+ # along with kikuchipy. If not, see <http://www.gnu.org/licenses/>.
+ #
+ 
++import os
+ from pathlib import Path
+ from typing import BinaryIO
+ import warnings
+ 
+ import dask.array as da
++from dask.base import tokenize
+ import numpy as np
+ 
+ from kikuchipy.signals.util._dask import get_chunking
+@@ -83,6 +85,25 @@ def file_reader(
+     return [scan]
+ 
+ 
++class _MemoryMapWithoutCopy:
++    """Memory map which dask slices chunks from without copying it.
++
++    Parameters
++    ----------
++    array
++        Memory map of the patterns.
++    """
++
++    def __init__(self, array: np.memmap) -> None:
++        self._array = array
++        self.shape = array.shape
++        self.dtype = array.dtype
++        self.ndim = array.ndim
++
++    def __getitem__(self, key) -> np.ndarray:
++        return self._array[key]
++
++
+ class EDAXBinaryFileReader:
+     """EDAX TSL's binary UP1/2 file reader.
+ 
+@@ -198,11 +219,30 @@ class EDAXBinaryFileReader:
+         )
+ 
+         if lazy:
+-            data = da.from_array(data)
++            # Name the array from the file instead of from its contents:
++            # without a name, dask hashes the whole memory map, which
++            # reads the entire file
++            file_stat = os.stat(self.file.name)
++            name = "edax-binary-" + tokenize(
++                str(self.file.name),
++                file_stat.st_size,
++                file_stat.st_mtime_ns,
++                header["pattern_offset"],
++                data_shape,
++                np.dtype(self.dtype).str,
++            )
+             chunks = get_chunking(
+                 data_shape=data_shape, nav_dim=nav_dim, sig_dim=2, dtype=self.dtype
+             )
+-            data = data.rechunk(chunks)
++            # The memory map is wrapped, since dask copies an array
++            # which has a copy() method, which reads the entire file
++            # into memory
++            data = da.from_array(
++                _MemoryMapWithoutCopy(data),
++                chunks=chunks,
++                name=name,
++                meta=np.empty((0,) * ndim, dtype=self.dtype),
++            )
+ 
+         units = ["um"] * ndim
+         scales = [header["dy"], header["dx"]] + [1, 1][:nav_dim]
+diff --git a/tests/test_indexing/test_spherical_gpu.py b/tests/test_indexing/test_spherical_gpu.py
+index 01b9e692..c842859d 100644
+--- a/tests/test_indexing/test_spherical_gpu.py
++++ b/tests/test_indexing/test_spherical_gpu.py
+@@ -1331,6 +1331,8 @@ def numpy_gpu_session(indexer, batch_size):
+     session.xp = np
+     session.fft = np.fft
+     session.lock = threading.Lock()
++    # numpy has no plan cache to register
++    session.register_plan_cache = lambda: None
+     session.batch_size = int(batch_size)
+     session.table = table64.astype(np.float32)
+     session.a_tables = tuple(

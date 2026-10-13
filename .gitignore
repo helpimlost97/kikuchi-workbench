@@ -1,0 +1,19 @@
+# Everything is ignored except the files listed with !
+*
+!.gitignore
+!Spherical Indexing README.md
+!kikuchipy_local_patches.patch
+!build_notebook.py
+!spherical_indexing_template.ipynb
+!spherical_indexing_RKD.ipynb
+!preset_RKD.txt
+!ebsd_params.py
+!sph_benchmark.py
+!test_gpu_memory_fix.py
+!Open RKD notebook.bat
+!Open template notebook.bat
+!osc_refinement_handoff/
+osc_refinement_handoff/*
+!osc_refinement_handoff/OSC_REFINEMENT_HANDOFF.md
+!osc_refinement_handoff/refine_pc_per_point.py
+!osc_refinement_handoff/edax_binary_lazy_load.patch

@@ -1,0 +1,77 @@
+diff --git a/src/kikuchipy/io/plugins/edax_binary/_api.py b/src/kikuchipy/io/plugins/edax_binary/_api.py
+index 6c0adf25..000045f7 100644
+--- a/src/kikuchipy/io/plugins/edax_binary/_api.py
++++ b/src/kikuchipy/io/plugins/edax_binary/_api.py
+@@ -17,11 +17,13 @@
+ # along with kikuchipy. If not, see <http://www.gnu.org/licenses/>.
+ #
+ 
++import os
+ from pathlib import Path
+ from typing import BinaryIO
+ import warnings
+ 
+ import dask.array as da
++from dask.base import tokenize
+ import numpy as np
+ 
+ from kikuchipy.signals.util._dask import get_chunking
+@@ -83,6 +85,25 @@ def file_reader(
+     return [scan]
+ 
+ 
++class _MemoryMapWithoutCopy:
++    """Memory map which dask slices chunks from without copying it.
++
++    Parameters
++    ----------
++    array
++        Memory map of the patterns.
++    """
++
++    def __init__(self, array: np.memmap) -> None:
++        self._array = array
++        self.shape = array.shape
++        self.dtype = array.dtype
++        self.ndim = array.ndim
++
++    def __getitem__(self, key) -> np.ndarray:
++        return self._array[key]
++
++
+ class EDAXBinaryFileReader:
+     """EDAX TSL's binary UP1/2 file reader.
+ 
+@@ -198,11 +219,30 @@ class EDAXBinaryFileReader:
+         )
+ 
+         if lazy:
+-            data = da.from_array(data)
++            # Name the array from the file instead of from its contents:
++            # without a name, dask hashes the whole memory map, which
++            # reads the entire file
++            file_stat = os.stat(self.file.name)
++            name = "edax-binary-" + tokenize(
++                str(self.file.name),
++                file_stat.st_size,
++                file_stat.st_mtime_ns,
++                header["pattern_offset"],
++                data_shape,
++                np.dtype(self.dtype).str,
++            )
+             chunks = get_chunking(
+                 data_shape=data_shape, nav_dim=nav_dim, sig_dim=2, dtype=self.dtype
+             )
+-            data = data.rechunk(chunks)
++            # The memory map is wrapped, since dask copies an array
++            # which has a copy() method, which reads the entire file
++            # into memory
++            data = da.from_array(
++                _MemoryMapWithoutCopy(data),
++                chunks=chunks,
++                name=name,
++                meta=np.empty((0,) * ndim, dtype=self.dtype),
++            )
+ 
+         units = ["um"] * ndim
+         scales = [header["dy"], header["dx"]] + [1, 1][:nav_dim]
