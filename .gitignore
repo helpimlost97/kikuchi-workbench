@@ -1,7 +1,7 @@
 # Everything is ignored except the files listed with !
 *
 !.gitignore
-!Spherical Indexing README.md
+!README.md
 !kikuchipy_local_patches.patch
 !build_notebook.py
 !spherical_indexing_template.ipynb
