@@ -384,13 +384,18 @@ def _scan_info_edaxh5(path, info, map_filter):
         info["sample_tilt"] = _to_float(lookup("sampletiltangle", "sampletilt", "tiltangle", "tilt"))
         info["camera_elevation"] = _to_float(lookup("cameraelevationangle", "elevationangle", "elevation"))
         info["camera_azimuth"] = _to_float(lookup("cameraazimuthalangle", "azimuthalangle", "azimuth"))
-        info["working_distance"] = _to_float(lookup("workingdistance"))
+        info["working_distance"] = _to_float(lookup("workingdistance", "semwd", "wd"))
         info["step_x"] = _to_float(lookup("stepx", "xstep"))
         info["step_y"] = _to_float(lookup("stepy", "ystep"))
-        info["n_cols"] = _to_int(lookup("ncolumns", "ncolsodd", "ncols"))
-        info["n_rows"] = _to_int(lookup("nrows"))
+        info["n_cols"] = _to_int(lookup("numberofcolumns", "ncolumns", "ncolsodd", "ncols"))
+        info["n_rows"] = _to_int(lookup("numberofrows", "nrows"))
         grid = lookup("gridtype", "grid")
         info["grid"] = None if grid is None else str(grid)
+        # Phases: EBSD/ANG/HEADER/Phase/<n>/Material Name
+        phase_group = "EBSD/ANG/HEADER/Phase"
+        if phase_group in g:
+            names = sorted(g[phase_group].keys(), key=lambda s: (not s.isdigit(), int(s) if s.isdigit() else s))
+            info["phases"] = [scalar(g[phase_group][k]["Material Name"]) for k in names if "Material Name" in g[phase_group][k]]
         info["notes"].append("values other than the pattern center were looked up by name in the .edaxh5 file; check them")
 
 def scan_info(scan_file=None, pattern_file=None, map_filter=None):

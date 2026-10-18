@@ -15,15 +15,19 @@ only the path syntax in the examples changes.
 
 | File / folder | Purpose |
 |---|---|
-| `kikuchipy/` | (Not in the repository; you create it in step 3.) Clone of https://github.com/jwestraadt/kikuchipy, branch `develop`, pinned at commit `71a1b2f`, plus the local patches below. Installed in editable mode. |
-| `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Apply after cloning, see step 3. |
-| `build_notebook.py` | Generates the indexing notebook. Edit this, then regenerate; do not hand-edit the generated `.ipynb` unless you know you will not regenerate it. |
-| `spherical_indexing_template.ipynb` | Generated notebook with default settings. Runs on kikuchipy's nickel demo data when no pattern file is given. |
-| `spherical_indexing_RKD.ipynb`, `preset_RKD.txt` | Example of a notebook generated with a preset file (an RKD data set, detector parallel to the sample). The paths in both are placeholders, see section 6.1. |
+| `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/jwestraadt/kikuchipy, branch `develop`, pinned at commit `4c7a0035`, plus the local patches below. Installed in editable mode. |
+| `update_fork.py` | Clones or updates that clone, checks out the pinned commit, applies the patch and installs it, in one command. Also undoes an earlier patch first, so re-running it after Johan pushes new commits is safe. See step 3. |
+| `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Applied by `update_fork.py`, or by hand, see step 3. |
+| `kikuchi_workbench.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor, spherical indexing and HROSM in one window, see section 6.8. `sph_core.py` holds the indexing code the GUI calls (the notebook's cells as functions, usable from scripts). |
+| `build_notebook.py` | Generates the indexing notebook (sections 0 to 10 plus an optional HROSM section 11). Edit this, then regenerate; do not hand-edit the generated `.ipynb` unless you know you will not regenerate it. |
+| `build_refinement_notebook.py` | Generates the projection center drift correction notebook: corrects an indexed map for the PC moving with the beam, from the scan geometry alone, no patterns needed (minutes), see section 6.6. |
+| `spherical_indexing_template.ipynb` | Generated indexing notebook with default settings. Runs on kikuchipy's nickel demo data when no pattern file is given. |
+| `spherical_refinement_template.ipynb` | Generated PC drift correction notebook for conventional EBSD. Starts from the `.h5` the indexing notebook writes; also runs on the demo data. |
+| `spherical_indexing_RKD.ipynb`, `spherical_refinement_RKD.ipynb`, `preset_RKD.txt` | Example of the two notebooks generated with a preset file (an RKD data set, detector parallel to the sample). The paths in all three are placeholders, see section 6.1. |
 | `ebsd_params.py` | Reads acquisition parameters (pattern size, projection center, map size, step) from an EDAX `.ang` or `.edaxh5` file and a `.up1`/`.up2` file. Used by the notebook's first cell and usable from the command line. |
 | `sph_benchmark.py` | CPU vs GPU speed and parity benchmark on the nickel demo data set. Use it to verify the install. |
 | `test_gpu_memory_fix.py` | Checks that VRAM is released between two GPU runs (tests one of the local patches). |
-| `osc_refinement_handoff/` | The notebook's refinement stage (section 11) as a stand-alone script for a CPU cluster, with its own hand-off notes. |
+| `osc_refinement_handoff/` | Full pattern-matching refinement with a PC per map point (hours to days, CPU) as a stand-alone script for a cluster, with its own hand-off notes. |
 | `Open ... notebook.bat` | Windows shortcuts that start JupyterLab on a notebook from this folder. They use the `python` on PATH; set the `PYTHON` variable at the top to a full interpreter path if your environment is elsewhere. |
 
 ---
@@ -47,26 +51,40 @@ only the path syntax in the examples changes.
 
 ## 3. Install the kikuchipy fork
 
-Open a terminal in the folder where you want this project (any path; quote paths that
-contain spaces). Activate your environment first.
+Open a terminal in this folder (quote paths that contain spaces) and activate your environment
+first. Then
+
+```bash
+python update_fork.py                     # clones ./kikuchipy, checks out 4c7a0035, applies the patch, pip installs
+python update_fork.py --dir D:\path\to\kikuchipy   # if the clone lives elsewhere
+```
+
+That is the whole of this step; the manual equivalent is
 
 ```bash
 git clone https://github.com/jwestraadt/kikuchipy.git
 cd kikuchipy
-git checkout 71a1b2f          # the commit everything here was tested with
-```
-
-`develop` keeps moving (the author has since merged further features such as HROSM). The
-notebook and scripts in this folder were only run against `71a1b2f`; newer commits may work
-but have not been tried.
-
-Apply the local patches (from inside the `kikuchipy` folder, with
-`kikuchipy_local_patches.patch` one level up, as in this folder's layout):
-
-```bash
+git checkout 4c7a0035         # the commit everything here was tested with
 git apply ../kikuchipy_local_patches.patch
 git status --short            # should list 4 modified files
+pip install -e .
 ```
+
+`4c7a0035` is the head of `develop` on 2026-10-18. Compared with the earlier pin `71a1b2f` it adds
+NLPAR (`EBSD.average_non_local_neighbour_patterns`; not used here, the Kikuchi Pattern Processor
+does NLPAR through pyebsdindex), HROSM (`EBSD.hrosm`, section 6.7) and a HyperSpy 2.5 fix. The
+spherical indexing code and its `spherical_indexing()` signature are unchanged, the patch applies
+cleanly, and the fork's spherical indexing tests (326, with the patch) and the whole template
+notebook on the demo data were re-run against it. To try a newer commit later:
+
+```bash
+python update_fork.py --show-latest       # lists the commits on origin/develop after the pin
+python update_fork.py --commit develop    # checks it out and re-applies the patch (stops if the patch no longer fits)
+```
+
+When moving the pin, change `PINNED_COMMIT` in `update_fork.py` and this README together. If
+you already have a clone with the patch applied by hand, `update_fork.py` recognises it (it
+reverts exactly that patch before checking out) and refuses to touch any other local change.
 
 What the patch does:
 
@@ -80,14 +98,14 @@ What the patch does:
 - `tests/test_indexing/test_spherical_gpu.py`: a no-op to keep the author's test suite in
   step with the change above.
 
-Now install the fork in editable mode, still inside the `kikuchipy` folder:
+`update_fork.py` has already run `pip install -e kikuchipy`. Add what the notebook and scripts
+need beyond the core package:
 
 ```bash
-pip install -e .
 pip install pooch nlopt jupyterlab nbformat psutil ipywidgets
 ```
 
-The second line adds what the notebook and scripts need beyond the core package: `pooch`
+In that line, `pooch`
 downloads the nickel demo data, `nlopt` is used by the refinement stage, `jupyterlab` runs the
 notebook, `nbformat` builds it, `psutil` decides whether to load a file lazily. Alternatively
 `pip install -e ".[all]"` installs the author's full extra set (adds pyebsdindex, pyvista and
@@ -189,9 +207,11 @@ python build_notebook.py my_scan.ipynb my_preset.txt  # with a preset
 ```
 
 A preset is a text file of `NAME = value` lines that overwrite settings in the notebook's
-first two cells. Every `NAME` must exist in the settings cell, and `value` is Python source,
-so paths are written as raw strings. `preset_RKD.txt` is a complete example; a minimal one for
-conventional EBSD looks like
+first two cells. `value` is Python source, so paths are written as raw strings. Names that
+are not settings of the notebook being built are listed and ignored, so one preset can serve
+both the indexing and the refinement notebook. A notebook built earlier can be given in the
+place of a preset; its settings are then copied. `preset_RKD.txt` is a complete example; a
+minimal one for conventional EBSD looks like
 
 ```
 PATTERN_FILE = r"C:\data\scan.up1"
@@ -246,11 +266,10 @@ The notebook follows the author's tutorial, `kikuchipy/doc/tutorials/spherical_i
 4. **Section 7** indexes the full map (or `ROI`), **8** plots it, **9** saves `.ang` and `.h5`
    files to `OUTPUT_DIR`, **10** compares against `REFERENCE_FILE` if you have a result for the
    same map from EMSphInx or OIM.
-5. **Section 11, refinement** (optional, CPU only, slow). Refines each orientation against
-   patterns simulated from an EMsoft master pattern `.h5` (`MASTER_PATTERN_FILE`; an `.sht`
-   file cannot be used here) with a projection center fitted per map point. Expect a few
-   patterns per second at `REFINE_BINNING = 2`, so run it on a region first, or use the script
-   in `osc_refinement_handoff/` on a cluster.
+5. The `.h5` written in section 9 is the input of the PC drift correction notebook, section 6.6.
+   Run that on every map wider than a few hundred micrometres.
+6. **Section 11, HROSM** (optional, needs an EMsoft master pattern `.h5`): re-indexes every grain on
+   a fine misorientation ball, section 6.7.
 
 ### 6.5 Reading scan parameters without the notebook
 
@@ -259,7 +278,132 @@ python ebsd_params.py "scan.ang" --up1 "scan.up1"            # EDAX and EMsoft p
 python ebsd_params.py "scan.edaxh5" --map "Area 1" --px 115
 ```
 
+### 6.6 Correct the projection center drift
+
+Spherical indexing (like EMSphInx) uses one projection center (PC) for the whole map, but the
+true PC moves with the beam by one step length per scan step. Indexed with a fixed PC, that
+shift is read as a rotation of about *beam travel / detector distance*: for a 3 mm wide map at
+a detector distance of 18 mm it is 10 degrees edge to edge, and about 0.1 degrees across a 30 um
+grain. Point-to-point noise is unaffected, but grain reference orientation deviations and
+orientation gradients within grains are.
+
+`spherical_refinement_template.ipynb` (built by `build_refinement_notebook.py`) removes that
+error from an indexed map without re-indexing and without the pattern file, in minutes:
+
+1. The PC of every map point is extrapolated from one anchor PC and the scan geometry (the
+   model of `EBSDDetector.extrapolate_pc()`, generalised to a twisted detector).
+2. The rotation a PC offset imposes on an indexed orientation is linearised once for the
+   detector geometry, and every orientation is rotated back by its local correction.
+
+Checked against patterns simulated with the true PC and refined with the anchor PC: a fixed-PC
+error of 1.3 / 3.4 / 4.7 degrees becomes 0.03 / 0.1 / 0.2 degrees. Gradients within grains are
+right to second order everywhere. Build it with the settings of the indexing notebook of the
+same scan, so that the geometry matches:
+
+```bash
+python build_refinement_notebook.py my_scan_pccorr.ipynb my_scan.ipynb
+python build_refinement_notebook.py my_scan_pccorr.ipynb my_scan.ipynb my_preset.txt   # plus a preset
+```
+
+1. **Section 0, files.** `INDEXED_FILE`, the `.h5` the indexing notebook wrote (its `.ang`
+   works too, but carries no image quality and only the proper point group; an EMSphInx or OIM
+   result of the same points works as well), and `SCAN_FILE` for the PC and pattern size.
+2. **Section 1, settings.** The detector geometry the map was indexed with: `PC` (the anchor),
+   `PC_POSITION` (the map point that PC belongs to, default the centre), `PATTERN_SHAPE` (needed
+   when the scan file does not give it), `SAMPLE_TILT`, `CAMERA_TILT`, the detector size via
+   `PX_SIZE` or `DETECTOR_WIDTH_UM` (the drift scales with 1 / detector size, so check the
+   printed width and distance), `TWIST` and `CIRCULAR_MASK`.
+3. **Section 4** shows where in the map the single PC fitted best (indexing score over image
+   quality per band), which is where `PC_POSITION` should point. **Section 5** prints the PC
+   change over the map and checks the plane against `extrapolate_pc`. **Section 6** prints the
+   apparent rotation per millimetre of beam travel.
+4. **Section 7** measures on the map itself how much of the geometric drift is really there:
+   the mean rotation between points k steps apart within grains, which real gradients average
+   out of and the artefact does not. Expect about 1 for a beam-scanned map indexed with one PC
+   and about 0 for a map acquired by stage movement (the source then never moves relative to
+   the detector) or already indexed with a PC per point. The correction is scaled by the
+   measured fraction (`DRIFT_FACTOR = "measured"`, or give a number). **Section 8** corrects
+   the orientations and shows the correction angle over the map; the neighbour misorientation
+   inside grains must not change. **Section 9** (optional, `SELF_CHECK = True`, a minute)
+   verifies the correction on simulated patterns for your geometry. **Section 10** saves
+   `<name>_pccorr.h5` / `.ang` with the correction angle as an extra property.
+
+For a twisted detector (RKD, `TWIST != 0`) the drift direction follows kikuchipy's detector
+twist, whose sign equivalence with the indexing notebook's `TWIST` is not verified. The full
+pattern-matching refinement with a PC per point, which also removes the band limit, remains
+available as a cluster script in `osc_refinement_handoff/`; it costs hours to days.
+
 The docstring at the top of `ebsd_params.py` lists all options.
+
+### 6.7 HROSM: re-index every grain on a fine misorientation ball
+
+`EBSD.hrosm()` (new in the fork since `71a1b2f`; Johan's port of EMsoftOO's EMHROSM, Marquardt
+et al. 2017) takes an indexed map, computes its kernel average misorientation (KAM), segments it
+into grains, and re-indexes every grain by dictionary indexing against patterns simulated on a
+cubochoric grid within `HROSM_MAX_ANGLE` of the grain's reference orientation. The result is a high
+angular resolution orientation similarity map (HROSM), orientations on a grid much finer than the
+global search, and the KAM, grain labels and grain reference orientation deviation (GROD). Section
+11 of the indexing notebook runs it on the map of section 7 and saves `<name>_hrosm_n<steps>.h5`
+and `.ang`; the GUI's third tab does the same.
+
+- `HROSM_MASTER_FILE`: the EMsoft master pattern `.h5` of the phase. Patterns are simulated, so an
+  `.sht` file cannot be used. `None` skips the section (the demo data uses its own master).
+- `HROSM_MAX_ANGLE` (5 deg) must be at least the largest GROD of the grains; the run warns and
+  names the radius that covers every grain otherwise. `HROSM_N_STEPS` (10) gives `(2 n + 1)^3`
+  orientations per grain, 9261 for 10 and 68921 for 20 (EMHROSM's default); the cost grows with the
+  cube of it and with the number of grains, not much with the grain size. Start with 10 and an
+  `HROSM_ROI`. On the nickel demo (4125 patterns, 31 grains) `HROSM_N_STEPS = 4` took 13 s on 3
+  CPU workers; `n_steps=10` on the same map is about 20 s on a 20-core workstation according to
+  the fork's tutorial (`kikuchipy/doc/tutorials/hrosm.ipynb`, which also discusses `threshold`,
+  `average` and `dilate`).
+- HROSM runs on the orientations as indexed (without `TWIST`); the twist is applied to the result.
+  The whole computation is on the CPU (Dask threads, `N_WORKERS`); the GPU backend only concerns
+  the spherical search.
+
+### 6.8 The GUI: pattern processor, spherical indexing and HROSM in one window
+
+`kikuchi_workbench.py` puts the [Kikuchi Pattern Processor](https://github.com/helpimlost97/kikuchi-pattern-processor)
+and the indexing of this folder into one PyQt5 window with three tabs:
+
+1. **Pattern processor**: the unchanged `gpu_pattern_viewer.py`, imported from its own folder
+   (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`).
+2. **Spherical indexing**: the settings of the notebook as a form. The patterns come either from a
+   file, or straight from the processor tab: its processing chain (NLPAR result, background,
+   stretch, CLAHE, IQ exclusion) is run over the whole data set in RAM, exactly as `Apply && Save`
+   would write it, and the result is indexed without a file in between. Patterns excluded by the
+   processor's IQ range are not indexed. `Read scan parameters` fills the projection center from
+   the `.ang`; `Check geometry` shows one pattern on the sphere; then `Index test region`,
+   `Index full map`, `Save .ang / .h5`, `Compare with reference`. `Save preset` writes a preset file
+   that `build_notebook.py` accepts, and `Load preset` reads one (e.g. `preset_RKD.txt`), so the
+   GUI and the notebook share settings. A file written by the processor's `Apply && Save` is
+   offered to the indexing tab automatically.
+3. **HROSM**: section 6.7 on the last indexed map (test region or full map, or an indexed `.h5`
+   loaded for the prepared patterns), with the KAM, grain, GROD and OSM maps, and save.
+
+```bash
+python kikuchi_workbench.py                                   # processor found next to this folder
+python kikuchi_workbench.py --processor-dir C:\path\to\kikuchi-pattern-processor
+python kikuchi_workbench.py --preset preset_RKD.txt
+```
+
+On Windows `Open workbench.bat` does the same (set `PYTHON` and, if needed, `KPP_DIR` at its top).
+The processor's clone is looked for in `--processor-dir`, `KPP_DIR`, then as `kikuchi-pattern-processor`
+next to this folder, inside it, in the current folder or in the home folder. Without it the indexing
+and HROSM tabs still work from files. The environment is the one of this README (fork, CuPy) plus
+the processor's packages: `pip install pyqt5 pyebsdindex scipy scikit-image` (and `pyopencl` for
+NLPAR on the GPU). The processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...)
+apply inside the workbench too.
+
+Memory: the in-RAM route holds the processed data set once more in RAM (the file size, so 6.5 GB
+for a 479 px RKD scan of 28 000 patterns, on top of the processor's own copies); it refuses with
+a message when that does not fit, in which case use `Apply && Save` and the file source. Long
+steps run in a worker thread with their console output in the log pane; the processor's chain
+itself runs in the GUI thread with a progress line, as `Apply && Save` does.
+
+Verified headlessly on the nickel demo data written as a `.up1` (no GPU in that environment, CPU
+backend): processor load, chain in RAM, test region, HROSM, full map, save, and the same map
+indexed from the file with kikuchipy's background removal, which agreed with the processor route
+to a median of 0.03 deg (every point within 1 deg; the two background corrections differ).
 
 ---
 
@@ -279,7 +423,8 @@ dask.config.set(num_workers=8)
 xmap = s.spherical_indexing(harmonics, det, bandwidth=68, backend="gpu")
 ```
 
-Signature on the pinned commit:
+`sph_core.py` wraps these steps as functions with the notebook's settings names (see its docstring).
+Signature on the pinned commit (unchanged from `71a1b2f`):
 
 ```
 EBSD.spherical_indexing(harmonics, detector, bandwidth=68, n_best=1, navigation_mask=None,
@@ -315,15 +460,18 @@ patterns per Dask chunk and, on the GPU, the device batch size.
   On an RKD data set the notebook matched an EMSphInx result to a median of 0.03 deg.
 - **Old `.up1` files** (header version 3) do not store the map size or step; the notebook
   takes them from the `.ang` file. Hexagonal grids are not handled by that fallback.
-- **Dask version.** Tested with dask 2026.1.2, numba 0.64, numpy 2.3, orix 0.14, hyperspy 2.4.
+- **Dask version.** Tested with dask 2026.1.2, numba 0.64, numpy 2.3, orix 0.14, hyperspy 2.4 on
+  the laptop (commit `71a1b2f`); the re-pin to `4c7a0035` was verified with dask 2026.8, numba 0.68,
+  numpy 2.5, orix 0.15, hyperspy 2.5, pyebsdindex 0.3.10.1 (CPU only).
 
 ---
 
 ## 9. References
 
-- Fork: https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `71a1b2f`).
-  Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, design notes in `specs/`,
-  tutorial in `doc/tutorials/spherical_indexing.ipynb`.
+- Fork: https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `4c7a0035`).
+  Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, HROSM in
+  `src/kikuchipy/indexing/_hrosm/`, design notes in `specs/`, tutorials in
+  `doc/tutorials/spherical_indexing.ipynb` and `doc/tutorials/hrosm.ipynb`.
 - W. C. Lenthe, S. Singh, M. De Graef, "A spherical harmonic transform approach to the
   indexing of electron back-scattered diffraction patterns", Ultramicroscopy 207 (2019).
 - EMSphInx: https://github.com/EMsoft-org/EMSphInx

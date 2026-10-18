@@ -1,7 +1,9 @@
 # Handoff: orientation refinement with a PC per map point, on OSC
 
 Written 2026-10-06 for a session on a university HPC cluster ("OSC" in file names and text below refers to it).
-Goal: run **only the refinement stage** (section 11 of the spherical indexing notebook) on a
+Goal: run **only the pattern-matching refinement stage** (formerly section 11 of the spherical indexing
+notebook; the project's `spherical_refinement_template.ipynb` now does a cheaper projection center drift
+correction instead, and this script is the only remaining form of the full refinement) on a
 2.3-million-point EBSD map, starting from an EMSphInx result that already exists. Do not build or
 run spherical indexing; the starting orientations come from a file.
 

@@ -1,5 +1,7 @@
 """Build spherical_indexing_template.ipynb"""
+import re
 import sys
+from pathlib import Path
 
 import nbformat as nbf
 
@@ -83,7 +85,11 @@ REMOVE_DYNAMIC_BACKGROUND = True
 # For several phases give a list of files.
 MASTER_FILE = None
 # MASTER_FILE = r"C:\path\to\master.sht"
-MASTER_BANDWIDTH = 188     # only for .h5 masters: bandwidth of the harmonics computed from the master pattern
+# MASTER_BANDWIDTH: only for .h5 masters, the bandwidth of the harmonics computed from the master pattern. Keep it
+# >= 384 (the mp2sht default) even when BANDWIDTH below is much lower: the transform aliases at a low bandwidth and
+# the aliasing is not cubic, so the symmetry copies of the correlation peak become unequal and the KAM map fills
+# with variant-hop lines and rings (NOTES_master_pattern_symmetry.md).
+MASTER_BANDWIDTH = 384
 MASTER_ENERGY = None       # only for .h5 masters with several energies: beam energy in keV to load. None = all (weighted)
 # The master pattern carries the sample tilt it was simulated for, and indexing refuses to run if it differs
 # from SAMPLE_TILT. True = accept the mismatch and use SAMPLE_TILT anyway.
@@ -116,18 +122,26 @@ NORMALIZE = True           # normalized cross-correlation (EMSphInx "normed")
 CHUNKSIZE = None           # patterns per chunk = GPU batch size. None = automatic
 TEST_SIZE = 50             # side length in map points of the test region indexed in section 6
 
-# ======================= REFINEMENT (section 11) =======================
-# Refinement matches every pattern to patterns simulated from the master pattern, with a projection center
-# per map point. It starts from the spherical indexing result of section 7 and runs on the CPU.
-MASTER_PATTERN_FILE = None   # EMsoft master pattern .h5 of the phase (refinement cannot use an .sht file)
-ENERGY = 20                  # beam energy in keV of the master pattern to use
-REFINE_BINNING = 2           # patterns are binned by this factor for refinement. 1 = full size (slowest, most detail)
-PC_GRID = (5, 5)             # (rows, cols) of map blocks; the best pattern of each block is used to calibrate the PC
-PC_TRUST_REGION = 0.05       # calibration: how far each PC value may move from PC
-REFINE_TRUST_REGION = 2.0    # how far each Euler angle may move from the spherical indexing result, in degrees
-REFINE_RTOL = 1e-5           # stop refining a pattern when the score changes by less than this (relative)
-REFINE_MAXEVAL = 300         # ... or after this many simulated patterns
-REFINE_ROI = None            # (col_start, col_stop, row_start, row_stop) within the indexed map. None = everything
+# Refinement of the orientations with a projection center per map point has its own notebook, built by
+# build_refinement_notebook.py from the .h5 that section 9 writes.
+
+# ======================= HROSM (section 11, optional) =======================
+# High angular resolution orientation similarity map: every grain of the indexed map is re-indexed by dictionary
+# indexing against patterns simulated on a fine misorientation ball around the grain's reference orientation
+# (EBSD.hrosm, the fork's port of EMsoftOO's EMHROSM). Gives orientations on a grid far finer than the global search,
+# the OSM, KAM, grain labels and GROD. Patterns are simulated, so it needs the EMsoft master pattern .h5 of the phase;
+# an .sht file cannot be used here. None = skip section 11 (the demo data set uses its own master pattern).
+HROSM_MASTER_FILE = None   # e.g. r"C:\path\to\Ni-master.h5"
+HROSM_ENERGY = None        # beam energy in keV of the master pattern to use. None = the highest in the file
+HROSM_THRESHOLD = 5.0      # KAM difference in degrees below which neighbours join the same grain (EMHROSM gangle)
+HROSM_MAX_ANGLE = 5.0      # radius in degrees of the misorientation ball (EMHROSM misorang); >= the largest GROD
+HROSM_N_STEPS = 10         # steps per half axis of the ball: (2 n + 1)^3 orientations per grain. 20 = EMHROSM default
+HROSM_KEEP_N = 20          # best matches kept per point
+HROSM_N_OSM = 10           # best matches compared between neighbours in the OSM (<= HROSM_KEEP_N)
+HROSM_AVERAGE = "mean"     # grain reference orientation: "mean", "center" (EMHROSM default), "vmf", "watson"
+HROSM_MIN_PIXELS = 10      # smallest grain that is re-indexed
+HROSM_DILATE = False       # grow the grains into unassigned neighbours before averaging
+HROSM_ROI = None           # (col_start, col_stop, row_start, row_stop) of the indexed map to re-index. None = all
 
 # ======================= OUTPUT =======================
 OUTPUT_DIR = None          # None = next to the pattern file (or the current folder for the demo data)
@@ -148,6 +162,7 @@ from pathlib import Path
 
 import dask
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 import numpy as np
 
 import kikuchipy as kp
@@ -494,7 +509,13 @@ for phase_id, phase in xmap.phases_in_data:
     ax.set_title(phase.name, fontsize=11)
 ''')
 
-md("## 9. Save")
+md(r"""
+## 9. Save
+
+The `.h5` written here is the starting point of the projection center drift correction notebook
+(`spherical_refinement_template.ipynb`, built by `build_refinement_notebook.py`), which corrects these orientations
+for the projection center moving with the beam. Section 11 below (HROSM) also starts from the indexed map.
+""")
 
 code(r'''
 if demo:
@@ -572,345 +593,211 @@ else:
 ''')
 
 md(r"""
-## 11. Refinement with a projection center per map point
+## 11. Optional: HROSM, re-index every grain on a fine misorientation ball
 
-Approach taken from https://kikuchipy.org/en/stable/tutorials/hybrid_indexing.html.
+`EBSD.hrosm()` (the fork's port of EMsoftOO's EMHROSM, Marquardt et al. 2017) takes the indexed map of section 7,
+computes its kernel average misorientation (KAM), segments it into grains, and re-indexes every grain by dictionary
+indexing against patterns simulated on a cubochoric grid within `HROSM_MAX_ANGLE` of the grain's reference
+orientation. The result is a high angular resolution orientation similarity map (HROSM), orientations on a grid
+much finer than the global search, and the KAM, grain labels and grain reference orientation deviation (GROD).
+It needs the EMsoft master pattern `.h5` of the phase (`HROSM_MASTER_FILE`), since patterns are simulated.
 
-The flow is that of the tutorial, with spherical indexing in the place of Hough indexing and without the
-dictionary indexing:
-
-1. Calibration: orientation and projection center (PC) of a few good patterns spread over the map are refined
-   together, and a plane is fitted to their PCs. That gives a PC for every map point.
-2. The orientations of a test region are refined with those PCs, which also gives the time for the full map.
-3. The orientations of the full map (or of `REFINE_ROI`) are refined.
-
-Everything here starts from `xmap_indexed` of section 7, i.e. the orientations without `TWIST`, since they
-belong to the detector without twist. `TWIST` is applied to the refined map at the end.
-""")
-
-md(r"""
-### 11.1 Master pattern and patterns for refinement
+Cost: every grain's ball of `(2 HROSM_N_STEPS + 1)^3` orientations is simulated and matched, so the time grows
+with the cube of `HROSM_N_STEPS` and with the number of grains, not much with the grain size. Start with
+`HROSM_N_STEPS = 10` and an `HROSM_ROI`; the fork's tutorial `doc/tutorials/hrosm.ipynb` discusses the parameters.
+The orientations are re-indexed as indexed, i.e. without `TWIST`, which is applied to the result afterwards.
 """)
 
 code(r'''
-ids = [i for i in xmap_indexed.phases_in_data.ids if i != -1]
-if len(ids) != 1:
-    raise ValueError("Section 11 is written for a map with one phase")
-phase = xmap_indexed.phases[ids[0]]
-
-mp = kp.load(MASTER_PATTERN_FILE, projection="lambert", hemisphere="both", energy=ENERGY)
-mp.phase = phase.deepcopy()  # refinement requires the phase of the map and of the master pattern to be equal
-print(mp)
-
-# Patterns and detector for refinement: cropped to a multiple of the binning factor, then binned
-if REFINE_BINNING > 1:
-    rows = sig_shape[0] - sig_shape[0] % REFINE_BINNING
-    cols = sig_shape[1] - sig_shape[1] % REFINE_BINNING
-    det_ref = det.crop((0, rows, 0, cols))  # updates the PC for the cropped pattern
-    det_ref.pc = det_ref.pc_average
-    s_ref = s.isig[:cols, :rows].downsample(REFINE_BINNING, inplace=False)
-    det_ref.shape = s_ref.axes_manager.signal_shape[::-1]
-    det_ref.binning = REFINE_BINNING
-else:
-    s_ref = s
-    det_ref = det.deepcopy()
-print(f"Patterns for refinement: {det_ref.shape} px (binning {REFINE_BINNING}), lazy: {s_ref._lazy}")
-det_ref
-''')
-
-md(r"""
-### 11.2 Calibration: a projection center per map point
-""")
-
-code(r'''
-def neighbour_misorientation(xmap):
-    """Misorientation of every map point to its right and its lower neighbour in degrees, as two 2D arrays.
-
-    Inside a grain this is mostly the noise of the orientations. Points without that neighbour are NaN.
-    """
-    point_group = xmap.phases[[i for i in xmap.phases_in_data.ids if i != -1][0]].point_group
-    quat = xmap.rotations.data.reshape(xmap.shape + (4,))
-    right = np.full(xmap.shape, np.nan)
-    below = np.full(xmap.shape, np.nan)
-    o1 = Orientation(quat[:, :-1].reshape(-1, 4), point_group)
-    o2 = Orientation(quat[:, 1:].reshape(-1, 4), point_group)
-    right[:, :-1] = o1.angle_with(o2, degrees=True).reshape(quat[:, :-1].shape[:2])
-    o1 = Orientation(quat[:-1].reshape(-1, 4), point_group)
-    o2 = Orientation(quat[1:].reshape(-1, 4), point_group)
-    below[:-1] = o1.angle_with(o2, degrees=True).reshape(quat[:-1].shape[:2])
-    return right, below
-
-
-# The best pattern of each block of the map: the highest score among the points inside a grain,
-# i.e. with all four neighbours within 1 degree
-scores_indexed = xmap_indexed.get_map_data("scores")
-right, below = neighbour_misorientation(xmap_indexed)
-in_grain = (right < 1) & (below < 1)
-in_grain[:, 1:] &= right[:, :-1] < 1
-in_grain[1:] &= below[:-1] < 1
-
-n_rows, n_cols = nav_shape
-row_edges = np.linspace(0, n_rows, PC_GRID[0] + 1).astype(int)
-col_edges = np.linspace(0, n_cols, PC_GRID[1] + 1).astype(int)
-cal_rc = []
-for r0, r1 in zip(row_edges[:-1], row_edges[1:]):
-    for c0, c1 in zip(col_edges[:-1], col_edges[1:]):
-        block = np.where(in_grain[r0:r1, c0:c1], scores_indexed[r0:r1, c0:c1], -np.inf)
-        if np.isfinite(block.max()):
-            r, c = np.unravel_index(np.argmax(block), block.shape)
-            cal_rc.append((r0 + r, c0 + c))
-cal_rc = np.array(cal_rc)
-print(f"{len(cal_rc)} calibration patterns")
-
-# The calibration patterns as a signal of their own, with their orientations from spherical indexing
-cal_patterns = dask.compute(*[s_ref.data[r, c] for r, c in cal_rc])
-s_cal = kp.signals.EBSD(np.stack([np.asarray(p) for p in cal_patterns]))
-s_cal.axes_manager[0].name = "x"
-cal_flat = np.ravel_multi_index(cal_rc.T, nav_shape)
-xmap_cal = CrystalMap(
-    rotations=xmap_indexed.rotations[cal_flat],
-    phase_id=np.zeros(len(cal_rc), dtype=int),
-    phase_list=PhaseList(phase),
-    x=np.arange(len(cal_rc), dtype=float),
-)
-det_cal = det_ref.deepcopy()
-det_cal.pc = np.tile(det_ref.pc_average, (len(cal_rc), 1))
-
-fig, ax = plt.subplots(figsize=(7, 5))
-ax.imshow(scores_indexed)
-ax.scatter(cal_rc[:, 1], cal_rc[:, 0], c="r", marker="+", s=120)
-for i, (r, c) in enumerate(cal_rc):
-    ax.text(c + 3, r - 3, i, color="w")
-ax.set(title="Calibration patterns on the score map")
-ax.axis("off")
-fig.tight_layout()
-''')
-
-code(r'''
-t0 = time.perf_counter()
-xmap_cal_ref, det_cal_ref = s_cal.refine_orientation_projection_center(
-    xmap=xmap_cal,
-    detector=det_cal,
-    master_pattern=mp,
-    energy=ENERGY,
-    method="LN_NELDERMEAD",
-    trust_region=3 * [REFINE_TRUST_REGION] + 3 * [PC_TRUST_REGION],
-    rtol=REFINE_RTOL,
-    maxeval=2 * REFINE_MAXEVAL,  # six values are searched for here, three in the refinement of the map
-    chunk_kwargs=dict(chunk_shape=1),  # one pattern per chunk, so that all workers are used
-)
-print(f"Calibration: {time.perf_counter() - t0:.0f} s")
-
-pc_cal = det_cal_ref.pc_flattened
-pc_shift = pc_cal - det_ref.pc_average
-angles_cal = xmap_cal.orientations.angle_with(xmap_cal_ref.orientations, degrees=True)
-
-# A PC is left out of the fit if its search ran into the trust region or did not finish, or if the PC
-# lies far from the others
-at_bound = (abs(pc_shift) > 0.95 * PC_TRUST_REGION).any(axis=1) | (xmap_cal_ref.num_evals >= 2 * REFINE_MAXEVAL)
-deviation = abs(pc_cal - np.median(pc_cal, axis=0))
-spread = 1.4826 * np.median(deviation, axis=0) + 1e-6
-is_outlier = at_bound | (deviation > 5 * spread + 0.002).any(axis=1)
-
-print(" #   row  col   score  evals  rotated   PCx      PCy      PCz")
-for i, (r, c) in enumerate(cal_rc):
-    print(
-        f"{i:2d}  {r:4d} {c:4d}  {xmap_cal_ref.scores[i]:.3f}  {xmap_cal_ref.num_evals[i]:5d}  {angles_cal[i]:5.2f} deg"
-        f"  {pc_cal[i, 0]:.4f}  {pc_cal[i, 1]:.4f}  {pc_cal[i, 2]:.4f}" + ("   left out" if is_outlier[i] else "")
-    )
-print(f"PC before (Bruker convention): {np.round(det_ref.pc_average, 4)}")
-print(f"PC after, mean of those used:  {np.round(pc_cal[~is_outlier].mean(axis=0), 4)}")
-print(f"PC after, their spread (std):  {np.round(pc_cal[~is_outlier].std(axis=0), 4)}")
-''')
-
-code(r'''
-# Plane of PCs for the whole map. The sample tilt which fit_pc() estimates from the plane is not used.
-det_plane = det_cal_ref.fit_pc(
-    cal_rc.T,
-    map_indices=np.indices(nav_shape),
-    transformation="affine",
-    is_outlier=is_outlier,
-)
-det_plane.sample_tilt = det_ref.sample_tilt
-
-pc_plane = det_plane.pc
-step_x, step_y = [a.scale for a in s.axes_manager.navigation_axes]
-detector_width = PX_SIZE * BINNING * sig_shape[1]  # um
-per_col = (pc_plane[0, -1] - pc_plane[0, 0]) / (n_cols - 1)
-per_row = (pc_plane[-1, 0] - pc_plane[0, 0]) / (n_rows - 1)
-print(f"PC average of the plane (Bruker convention): {np.round(det_plane.pc_average, 4)}")
-print("Change of (PCx, PCy, PCz) over the map")
-print(f"  along scan x: {np.round(per_col * (n_cols - 1), 4)}")
-print(f"  along scan y: {np.round(per_row * (n_rows - 1), 4)}")
-print(
-    f"Change in the detector plane per scan step: measured {np.hypot(*per_col[:2]):.2e} (x), "
-    f"{np.hypot(*per_row[:2]):.2e} (y); expected from step size and detector size {step_x / detector_width:.2e}"
-)
-print(
-    "Direction of the PC shift along scan x, measured from the detector x axis: "
-    f"{np.rad2deg(np.arctan2(per_col[1], per_col[0])):.1f} deg (compare with TWIST = {TWIST})"
-)
-det_plane.plot_pc()
-''')
-
-md(r"""
-Check before going on: the refined PCs of the calibration patterns should lie close to a plane, and the
-measured change per scan step should be close to the expected one. If the PCs scatter by more than they
-change over the map, use more calibration patterns (`PC_GRID`) or less binning (`REFINE_BINNING`). To go on
-with one PC for the whole map instead, run `det_plane = det_ref.deepcopy()` in a new cell.
-
-### 11.3 Test region
-""")
-
-code(r'''
-ref_kwargs = dict(
-    master_pattern=mp,
-    energy=ENERGY,
-    method="LN_NELDERMEAD",
-    trust_region=3 * [REFINE_TRUST_REGION],
-    rtol=REFINE_RTOL,
-    maxeval=REFINE_MAXEVAL,
-)
-
-
-def refine_region(region):
-    """Refine the orientations of the map region (col_start, col_stop, row_start, row_stop).
-
-    Returns the refined map and the map from spherical indexing of that region, both without TWIST.
-    """
-    c0, c1, r0, r1 = region
-    if (c1 - c0) * (r1 - r0) == n_patterns:
-        nav_mask = None
+hrosm_master = HROSM_MASTER_FILE is not None or demo
+if hrosm_master:
+    if demo:
+        mp_hrosm = kp.data.nickel_ebsd_master_pattern_small(projection="lambert", hemisphere="both")
     else:
-        nav_mask = np.ones(nav_shape, dtype=bool)  # True = do not refine
+        kwargs = {"projection": "lambert", "hemisphere": "both"}
+        if HROSM_ENERGY is not None:
+            kwargs["energy"] = HROSM_ENERGY
+        mp_hrosm = kp.load(HROSM_MASTER_FILE, **kwargs)
+    print(mp_hrosm)
+    ids = [i for i in xmap_indexed.phases_in_data.ids if i != -1]
+    if len(ids) > 1 and mp_hrosm.phase.name not in [xmap_indexed.phases[i].name for i in ids]:
+        raise ValueError(
+            f"The map has the phases {[xmap_indexed.phases[i].name for i in ids]}; the master pattern's phase "
+            f"{mp_hrosm.phase.name!r} must be one of them (rename it with mp_hrosm.phase.name = ...)"
+        )
+    if mp_hrosm.phase.point_group != xmap_indexed.phases[ids[0]].point_group:
+        warnings.warn(
+            f"Point group of the master pattern ({mp_hrosm.phase.point_group.name}) and of the indexed map "
+            f"({xmap_indexed.phases[ids[0]].point_group.name}) differ; check HROSM_MASTER_FILE"
+        )
+
+    # Only the points of HROSM_ROI are assigned to grains and re-indexed
+    nav_mask = None
+    if HROSM_ROI is not None:
+        c0, c1, r0, r1 = HROSM_ROI
+        nav_mask = np.ones(nav_shape, dtype=bool)  # True = leave out
         nav_mask[r0:r1, c0:c1] = False
-    xmap_region_ref = s_ref.refine_orientation(
-        xmap=xmap_indexed, detector=det_plane, navigation_mask=nav_mask, **ref_kwargs
+    signal_mask = ~kp.filters.Window("circular", det.shape).astype(bool) if CIRCULAR_MASK else None
+
+    t0 = time.perf_counter()
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        xmap_hrosm_indexed = s.hrosm(
+            xmap_indexed,
+            mp_hrosm,
+            det,
+            energy=HROSM_ENERGY,
+            threshold=HROSM_THRESHOLD,
+            max_angle=HROSM_MAX_ANGLE,
+            n_steps=HROSM_N_STEPS,
+            keep_n=HROSM_KEEP_N,
+            n_osm=HROSM_N_OSM,
+            average=HROSM_AVERAGE,
+            min_pixels=HROSM_MIN_PIXELS,
+            dilate=HROSM_DILATE,
+            signal_mask=signal_mask,
+            navigation_mask=nav_mask,
+        )
+    dt = time.perf_counter() - t0
+    for w in record:
+        if issubclass(w.category, UserWarning):
+            print("NB!", w.message)
+    xmap_hrosm = apply_twist(xmap_hrosm_indexed)
+
+    reindexed = xmap_hrosm.prop["reindexed"].astype(bool)
+    n_grains = np.unique(xmap_hrosm.prop["grain_id"][reindexed]).size
+    pg = xmap_indexed.phases[ids[0]].point_group
+    moved = Orientation(xmap_indexed.rotations[reindexed], pg).angle_with(
+        Orientation(xmap_hrosm_indexed.rotations[reindexed], pg), degrees=True
     )
-    return xmap_region_ref, xmap_indexed[r0:r1, c0:c1]
+    print(
+        f"HROSM: {reindexed.sum()} of {reindexed.size} points re-indexed in {n_grains} grains, "
+        f"{(2 * HROSM_N_STEPS + 1) ** 3} orientations per grain "
+        f"(mean spacing {kp.indexing.misorientation_ball_spacing(HROSM_MAX_ANGLE, HROSM_N_STEPS):.3f} deg), {dt / 60:.1f} min"
+    )
+    print(
+        f"Rotation from the spherical indexing result: median {np.median(moved):.3f} deg, p99 {np.percentile(moved, 99):.3f} deg; "
+        f"median OSM of the re-indexed points {np.nanmedian(xmap_hrosm.prop['osm'][reindexed]):.1f} of {HROSM_N_OSM}"
+    )
+else:
+    print("No HROSM_MASTER_FILE given, HROSM skipped")
+''')
 
-
-def plot_refinement(xmap_ref, xmap_before, title=""):
-    """Neighbour misorientation before and after refinement, and how far refinement rotated the orientations."""
-    before = np.nanmean(neighbour_misorientation(xmap_before), axis=0)
-    after = np.nanmean(neighbour_misorientation(xmap_ref), axis=0)
-    rotated = xmap_before.orientations.angle_with(xmap_ref.orientations, degrees=True).reshape(xmap_ref.shape)
-    for name, values in (("spherical indexing", before), ("refined", after)):
-        inside = values[values < 1]
-        print(f"Neighbour misorientation inside grains, {name}: median {np.median(inside):.3f} deg, mean {inside.mean():.3f} deg")
-    print(f"Rotated by refinement: median {np.median(rotated):.3f} deg, p99 {np.percentile(rotated, 99):.3f} deg")
-    print(f"Score: mean {xmap_ref.scores.mean():.3f}; simulated patterns per point: mean {xmap_ref.num_evals.mean():.0f}, max {xmap_ref.num_evals.max()}")
-
-    fig, axes = plt.subplots(ncols=4, figsize=(20, 4.5))
-    for ax, values, name in zip(axes, (before, after, rotated), ("Neighbours, spherical indexing", "Neighbours, refined", "Rotated by refinement")):
-        im = ax.imshow(values, vmin=0, vmax=0.5)
-        ax.set(title=name)
+code(r'''
+if hrosm_master and xmap_hrosm.ndim == 2:
+    cmap = plt.get_cmap("viridis").with_extremes(bad="0.6")
+    rng = np.random.default_rng(42)
+    grain_id = xmap_hrosm.get_map_data("grain_id")
+    grain_id = np.nan_to_num(grain_id, nan=0).astype(int)
+    grain_colors = rng.uniform(0.2, 1, (grain_id.max() + 1, 3))
+    grain_colors[0] = 0
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    panels = [
+        ("KAM [deg]", xmap_hrosm.get_map_data("kam"), dict(vmin=0, vmax=2, cmap=cmap)),
+        ("Grains (black: no grain)", grain_id, dict(cmap=ListedColormap(grain_colors), interpolation="nearest")),
+        ("GROD, spherical indexing [deg]", xmap_hrosm.get_map_data("grod"), dict(vmin=0, vmax=HROSM_MAX_ANGLE, cmap=cmap)),
+        (f"HROSM (grey: not re-indexed), of {HROSM_N_OSM}", xmap_hrosm.get_map_data("osm"), dict(vmin=0, vmax=HROSM_N_OSM, cmap=cmap)),
+    ]
+    for ax, (title, values, kw) in zip(axes.ravel(), panels):
+        im = ax.imshow(values, **kw)
+        ax.set(title=title)
         ax.axis("off")
-        fig.colorbar(im, ax=ax, pad=0.02, shrink=0.8, label="deg")
-    bins = np.linspace(0, 1, 101)
-    axes[3].hist(before.ravel(), bins=bins, histtype="step", label="spherical indexing")
-    axes[3].hist(after.ravel(), bins=bins, histtype="step", label="refined")
-    axes[3].set(xlabel="Neighbour misorientation [deg]", ylabel="Map points")
-    axes[3].legend()
-    fig.suptitle(title)
+        if "Grains" not in title:
+            fig.colorbar(im, ax=ax, pad=0.02, shrink=0.8)
     fig.tight_layout()
 
-
-if REFINE_ROI is None:
-    refine_roi = (0, n_cols, 0, n_rows)
-else:
-    refine_roi = tuple(REFINE_ROI)
-n_refine = (refine_roi[1] - refine_roi[0]) * (refine_roi[3] - refine_roi[2])
-
-# The same region as in section 6
-r0 = max(0, n_rows // 2 - TEST_SIZE // 2)
-c0 = max(0, n_cols // 2 - TEST_SIZE // 2)
-test_region = (c0, min(n_cols, c0 + TEST_SIZE), r0, min(n_rows, r0 + TEST_SIZE))
-
-_ = refine_region((c0, c0 + 4, r0, r0 + 1))  # warm-up so that compilation is not part of the timing
-t0 = time.perf_counter()
-xmap_test_ref, xmap_test_indexed = refine_region(test_region)
-dt = time.perf_counter() - t0
-speed = xmap_test_ref.size / dt
-print(f"Test region: {xmap_test_ref.size} patterns in {dt:.1f} s = {speed:.1f} patterns/s ({det_ref.shape} px)")
-print(f"Estimated time for the {n_refine} patterns to refine: {n_refine / speed / 60:.0f} min")
-plot_refinement(xmap_test_ref, xmap_test_indexed, "Test region")
-''')
-
-md(r"""
-### 11.4 Refine the map
-""")
-
-code(r'''
-t0 = time.perf_counter()
-xmap_refined_indexed, xmap_before = refine_region(refine_roi)  # without the twist
-dt = time.perf_counter() - t0
-print(f"{xmap_refined_indexed.size} patterns in {dt / 60:.1f} min = {xmap_refined_indexed.size / dt:.1f} patterns/s")
-
-# The refined points as a map of their own, with the image quality and the score of spherical indexing.
-# The coordinates start at zero, as in an .ang file of that region.
-xmap_refined_indexed = CrystalMap(
-    rotations=xmap_refined_indexed.rotations,
-    phase_id=xmap_refined_indexed.phase_id,
-    phase_list=xmap_refined_indexed.phases,
-    prop={
-        "scores": xmap_refined_indexed.scores,
-        "num_evals": xmap_refined_indexed.num_evals,
-        "iq": xmap_before.prop["iq"],
-        "scores_indexed": xmap_before.prop["scores"],
-    },
-    scan_unit=xmap_refined_indexed.scan_unit,
-    x=xmap_refined_indexed.x - xmap_refined_indexed.x.min(),
-    y=xmap_refined_indexed.y - xmap_refined_indexed.y.min(),
-)
-xmap_refined = apply_twist(xmap_refined_indexed)
-if TWIST:
-    print(f"Orientations rotated by {TWIST} deg about the sample normal (TWIST)")
-xmap_refined
+    # GROD of the re-indexed orientations about the same grain references: the gradients HROSM resolves
+    grains = kp.indexing.average_grain_orientations(xmap_hrosm_indexed, grain_id)
+    grod_hrosm = kp.indexing.grain_reference_orientation_deviation_map(xmap_hrosm_indexed, grain_id, grains)
+    fig, axes = plt.subplots(ncols=2, figsize=(14, 5))
+    vmax = np.nanpercentile(grod_hrosm, 99) if np.isfinite(np.nanmax(grod_hrosm)) else 1
+    for ax, values, title in zip(
+        axes, [xmap_hrosm.get_map_data("grod"), grod_hrosm], ["GROD, spherical indexing", "GROD, re-indexed (HROSM)"]
+    ):
+        im = ax.imshow(values, vmin=0, vmax=vmax, cmap=cmap)
+        ax.set(title=f"{title} [deg]")
+        ax.axis("off")
+        fig.colorbar(im, ax=ax, pad=0.02, shrink=0.8)
+    fig.tight_layout()
 ''')
 
 code(r'''
-plot_refinement(xmap_refined_indexed, xmap_before, "Refined map")
-plot_maps(xmap_refined, "Refined map")
-''')
-
-md(r"""
-### 11.5 Save
-""")
-
-code(r'''
-# out_dir and stem are those of section 9
-name = f"{stem}_refined_bin{REFINE_BINNING}"
-if SAVE_H5:
-    io.save(out_dir / f"{name}.h5", xmap_refined, overwrite=True)
-    print("Saved", out_dir / f"{name}.h5")
-if SAVE_ANG:
-    io.save(
-        out_dir / f"{name}.ang",
-        xmap_refined,
-        overwrite=True,
-        image_quality_prop="iq",
-        confidence_index_prop="scores",
+if hrosm_master:
+    # out_dir and stem are those of section 9. The best match in the ball is the orientation of every re-indexed
+    # point; "scores" holds the HROSM_KEEP_N best NCC scores per point, "scores_sph" the spherical indexing score.
+    name = f"{stem}_hrosm_n{HROSM_N_STEPS}"
+    prop = {k: v for k, v in xmap_hrosm.prop.items() if k != "simulation_indices"}
+    prop["scores_sph"] = xmap_indexed.prop["scores"]
+    prop["iq"] = xmap_indexed.prop["iq"]
+    xmap_hrosm_out = CrystalMap(
+        rotations=xmap_hrosm.rotations,
+        phase_id=xmap_hrosm.phase_id,
+        phase_list=xmap_hrosm.phases,
+        prop=prop,
+        scan_unit=xmap_hrosm.scan_unit,
+        x=xmap_hrosm.x,
+        y=xmap_hrosm.y,
     )
-    print("Saved", out_dir / f"{name}.ang")
-np.save(out_dir / f"{name}_pc.npy", det_plane.pc)
-print("Saved", out_dir / f"{name}_pc.npy", "(PC per map point for the binned patterns, Bruker convention)")
+    if SAVE_H5:
+        io.save(out_dir / f"{name}.h5", xmap_hrosm_out, overwrite=True)
+        print("Saved", out_dir / f"{name}.h5")
+    if SAVE_ANG:
+        # The .ang takes one score per point: the best NCC of the ball, or the spherical score where not re-indexed
+        best = np.where(reindexed, np.nan_to_num(xmap_hrosm.prop["scores"][:, 0]), xmap_indexed.prop["scores"])
+        xmap_hrosm_out.prop["best_score"] = best
+        io.save(
+            out_dir / f"{name}.ang",
+            xmap_hrosm_out,
+            overwrite=True,
+            image_quality_prop="iq",
+            confidence_index_prop="best_score",
+        )
+        print("Saved", out_dir / f"{name}.ang")
 ''')
 
-# Optional: preset the settings cell from a file of "NAME = value" lines (sys.argv[2])
-if len(sys.argv) > 2:
-    import re
+def read_settings(source):
+    """NAME -> value (Python source) from a preset file of "NAME = value" lines, or from the settings cells
+    (tagged "files" / "parameters") of a notebook built by this script or build_refinement_notebook.py."""
+    source = Path(source)
+    if source.suffix.lower() == ".ipynb":
+        cells = nbf.read(source, as_version=4).cells
+        text = "\n".join(
+            c.source for c in cells if c.cell_type == "code" and {"parameters", "files"} & set(c.metadata.get("tags", []))
+        )
+    else:
+        text = source.read_text(encoding="utf-8")
+    settings = {}
+    for line in text.splitlines():
+        match = re.match(r"^([A-Z][A-Z0-9_]*) = (.*?)(\s+#.*)?$", line)
+        if match:
+            settings[match.group(1)] = match.group(2)
+    return settings
 
+
+def apply_settings(settings):
+    r"""Overwrite the settings of the notebook under construction with those given; names it does not have are listed.
+
+    A value of None does not replace a path placeholder (r"C:\path\to\..."), since the placeholder says what
+    goes there and None would not.
+    """
     cells = [c for c in C if {"parameters", "files"} & set(c.metadata.get("tags", []))]
-    for line in open(sys.argv[2], encoding="utf-8").read().splitlines():
-        if "=" not in line or line.lstrip().startswith("#"):
-            continue
-        name, value = (part.strip() for part in line.split("=", 1))
-        pattern = re.compile(rf"^{name} = .*?(\s+#.*)?$", flags=re.MULTILINE)
+    ignored = []
+    for name, value in settings.items():
+        pattern = re.compile(rf"^{name} = (.*?)(\s+#.*)?$", flags=re.MULTILINE)
         cell = next((c for c in cells if pattern.search(c.source)), None)
         if cell is None:
-            raise ValueError(f"no setting named {name}")
-        cell.source = pattern.sub(lambda m: f"{name} = {value}" + (m.group(1) or ""), cell.source, count=1)
+            ignored.append(name)
+            continue
+        if value == "None" and pattern.search(cell.source).group(1).startswith(r'r"C:\path\to'):
+            continue
+        cell.source = pattern.sub(lambda m: f"{name} = {value}" + (m.group(2) or ""), cell.source, count=1)
+    if ignored:
+        print("ignored (not settings of this notebook):", ", ".join(ignored))
+
+
+# Optional: settings from preset files ("NAME = value" lines) and/or notebooks, applied in the order given
+for source in sys.argv[2:]:
+    apply_settings(read_settings(source))
 
 nb["cells"] = C
 nb.metadata["kernelspec"] = {"display_name": "Python 3", "language": "python", "name": "python3"}

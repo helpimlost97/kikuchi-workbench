@@ -1,5 +1,7 @@
 # Preset for an RKD scan (detector parallel to the sample, 479 x 479 px patterns, 55 um/px, Ni at 10 kV).
 # Usage:  python build_notebook.py spherical_indexing_RKD.ipynb preset_RKD.txt
+#         python build_refinement_notebook.py spherical_refinement_RKD.ipynb spherical_indexing_RKD.ipynb preset_RKD.txt
+# Both builders read it; each ignores the names that are not settings of its notebook and says so.
 # Lines starting with # are ignored. Replace every path below with your own; values are Python source.
 
 # <-- your pattern file (an NLPAR / background-processed .up1 here, hence no background removal below)
@@ -10,6 +12,7 @@ REMOVE_STATIC_BACKGROUND = False
 REMOVE_DYNAMIC_BACKGROUND = False
 # <-- EMSphInx .sht master pattern of the phase, simulated for sample tilt 0 (RKD geometry)
 MASTER_FILE = r"C:\path\to\Ni-RKD-master.sht"
+SAMPLE_TILT = 0.0
 CAMERA_TILT = -90.0
 PX_SIZE = 55.0
 TWIST = 15.0
@@ -20,6 +23,8 @@ TEST_SIZE = 40
 OUTPUT_DIR = r"C:\path\to\results"
 # <-- optional: an existing result of the same map (EMSphInx .h5 / .ang) to compare with, or None
 REFERENCE_FILE = r"C:\path\to\reference_result.h5"
-# <-- EMsoft master pattern .h5 of the same phase, only needed for the refinement stage (section 11)
-MASTER_PATTERN_FILE = r"C:\path\to\Ni-RKD-master.h5"
-ENERGY = 10
+
+# PC drift correction notebook only
+# <-- the .h5 written by the indexing notebook, the map to correct
+INDEXED_FILE = r"C:\path\to\results\scan_Processed_sph_bw123.h5"
+PATTERN_SHAPE = (479, 479)
