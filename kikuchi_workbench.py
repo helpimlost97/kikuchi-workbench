@@ -89,8 +89,8 @@ else:
 from PyQt5.QtCore import Qt, QThread, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QSplitter,
-    QTabWidget, QVBoxLayout, QWidget,
+    QGridLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa: E402
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT  # noqa: E402
@@ -194,6 +194,56 @@ def _to_text(value) -> str:
     return repr(value)
 
 
+def _fit(widget, min_width=60):
+    """Let a field shrink to the width its column has, instead of demanding the width of its contents.
+
+    With QSizePolicy.Ignored the layout decides the width, so long paths and long combo texts are elided or
+    scroll inside the box rather than pushing the panel wider than the pane it sits in.
+    """
+    policy = widget.sizePolicy()
+    policy.setHorizontalPolicy(QSizePolicy.Ignored)
+    widget.setSizePolicy(policy)
+    widget.setMinimumWidth(min_width)
+    if isinstance(widget, QComboBox):
+        widget.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        widget.setMinimumContentsLength(8)
+    return widget
+
+
+def button_rows(buttons, per_row=4) -> QGridLayout:
+    """Buttons in rows of ``per_row``, each allowed to shrink below its text width, so that the pane they sit
+    in never forces the settings panel narrower."""
+    grid = QGridLayout()
+    grid.setContentsMargins(0, 0, 0, 0)
+    for i, b in enumerate(buttons):
+        b.setMinimumWidth(40)
+        policy = b.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Ignored)
+        b.setSizePolicy(policy)
+        grid.addWidget(b, i // per_row, i % per_row)
+    return grid
+
+
+def side_by_side(left: QWidget, right: QWidget, left_width: int = 470) -> QSplitter:
+    """A settings panel in a scroll area and a work area next to it, with a draggable divider between them."""
+    scroll = QScrollArea()
+    scroll.setWidget(left)
+    scroll.setWidgetResizable(True)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll.setMinimumWidth(350)
+    splitter = QSplitter(Qt.Horizontal)
+    splitter.addWidget(scroll)
+    splitter.addWidget(right)
+    splitter.setCollapsible(0, False)
+    splitter.setCollapsible(1, False)
+    right.setMinimumWidth(320)
+    splitter.setStretchFactor(0, 0)
+    splitter.setStretchFactor(1, 1)
+    splitter.setSizes([left_width, 1000])
+    splitter.setHandleWidth(8)
+    return splitter
+
+
 class SettingsForm(QWidget):
     """Widgets for a subset of the Settings fields, in groups. settings()/set_settings() convert both ways."""
 
@@ -202,12 +252,25 @@ class SettingsForm(QWidget):
         self._fields: dict[str, tuple] = {}
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(4, 4, 4, 4)
+        # The panel takes the width the scroll area gives it, whatever the longest label would like; the
+        # fields shrink (see _fit), and only a very narrow panel clips the end of a long checkbox text.
+        self._layout.setSizeConstraint(QLayout.SetNoConstraint)
         self._form = None
+
+    def minimumSizeHint(self):  # noqa: N802 (Qt name)
+        # The scroll area never makes the panel narrower than this; the layout's own minimum (the longest
+        # row) would pin the panel at that width and let the splitter clip it behind the right pane.
+        hint = super().minimumSizeHint()
+        hint.setWidth(200)
+        return hint
 
     def group(self, title: str) -> QFormLayout:
         box = QGroupBox(title)
         self._form = QFormLayout(box)
         self._form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        # a long label goes above its field when the panel is narrow, instead of squeezing the field
+        self._form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self._form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self._layout.addWidget(box)
         return self._form
 
@@ -215,7 +278,14 @@ class SettingsForm(QWidget):
         self._layout.addStretch()
 
     def add_widget(self, widget):
+        if isinstance(widget, (QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox)):
+            _fit(widget)
+        elif isinstance(widget, QLabel):
+            widget.setWordWrap(True)
         self._form.addRow(widget)
+
+    def add_row(self, label, widget):
+        self._form.addRow(label, _fit(widget))
 
     # one line of a group per setting
     def add_bool(self, name, label, tip="", default=False):
@@ -231,7 +301,7 @@ class SettingsForm(QWidget):
         w.setRange(lo, hi)
         w.setValue(int(default))
         w.setToolTip(tip)
-        self._form.addRow(label, w)
+        self._form.addRow(label, _fit(w))
         self._fields[name] = (w.value, lambda v: w.setValue(int(v)))
         return w
 
@@ -241,7 +311,7 @@ class SettingsForm(QWidget):
         w.setDecimals(decimals)
         w.setValue(float(default))
         w.setToolTip(tip)
-        self._form.addRow(label, w)
+        self._form.addRow(label, _fit(w))
         self._fields[name] = (w.value, lambda v: w.setValue(float(v)))
         return w
 
@@ -250,7 +320,7 @@ class SettingsForm(QWidget):
         w = QLineEdit(_to_text(default))
         w.setToolTip(tip)
         w.setPlaceholderText(placeholder)
-        self._form.addRow(label, w)
+        self._form.addRow(label, _fit(w))
         self._fields[name] = (lambda: _literal(w.text()), lambda v: w.setText(_to_text(v)))
         return w
 
@@ -259,7 +329,7 @@ class SettingsForm(QWidget):
         w.addItems([str(o) for o in options])
         w.setCurrentText(str(default))
         w.setToolTip(tip)
-        self._form.addRow(label, w)
+        self._form.addRow(label, _fit(w))
         self._fields[name] = (lambda: type(options[0])(w.currentText()) if options and not isinstance(options[0], str) else w.currentText(),
                               lambda v: w.setCurrentText(str(v)))
         return w
@@ -288,9 +358,9 @@ class SettingsForm(QWidget):
                 edit.setText(path)
 
         btn.clicked.connect(browse)
-        lay.addWidget(edit)
+        lay.addWidget(_fit(edit))
         lay.addWidget(btn)
-        self._form.addRow(label, row)
+        self._form.addRow(label, _fit(row, 100))
 
         def get():
             text = edit.text().strip()
@@ -550,13 +620,14 @@ class Workbench(QMainWindow):
         if self.proc is not None:
             self.source_combo.addItem("Processor tab: its processed patterns, in RAM (as 'Apply && Save' writes them)")
         self.source_combo.setToolTip("Where the patterns to index come from")
-        form._form.addRow("Source:", self.source_combo)
+        form.add_row("Source:", self.source_combo)
         form.add_path("PATTERN_FILE", "Pattern file:", tip="EDAX .up1/.up2 or any format kp.load() reads; blank = the nickel demo data",
                       filter="Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)")
         form.add_path("SCAN_FILE", "Scan file (.ang/.edaxh5):", tip="The .ang or .edaxh5 written at acquisition: gives the projection center, map size and step",
                       filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)")
         form.add_text("EDAXH5_MAP", "edaxh5 map filter:", tip="Only for .edaxh5 files with several maps: part of the map's name, e.g. 'Area 8'", placeholder="None")
-        self.btn_scan = QPushButton("Read scan parameters (fills the projection center)")
+        self.btn_scan = QPushButton("Read scan parameters")
+        self.btn_scan.setToolTip("Reads the scan and pattern file headers, prints them in the log and fills the projection center")
         self.btn_scan.clicked.connect(self.read_scan)
         form.add_widget(self.btn_scan)
         form.add_text("NAV_SHAPE", "Map (rows, cols):", tip="Only when the pattern file does not store the map size; blank = from the file or the scan file", placeholder="None")
@@ -578,7 +649,7 @@ class Workbench(QMainWindow):
                       filter="Master patterns (*.sht *.h5 *.hdf5);;All files (*)", multi=True)
         form.add_int("MASTER_BANDWIDTH", "Master bandwidth (.h5):", 384, 16, 1024, "Bandwidth of the harmonics computed from an .h5 master; keep >= 384 (see build_notebook.py)")
         form.add_text("MASTER_ENERGY", "Master energy keV (.h5):", tip="Only for .h5 masters with several energies; blank = all, weighted", placeholder="None")
-        form.add_bool("OVERRIDE_MASTER_SAMPLE_TILT", "Override the master's sample tilt with the value below", "Indexing refuses a mismatch otherwise")
+        form.add_bool("OVERRIDE_MASTER_SAMPLE_TILT", "Override master sample tilt", "Use the sample tilt below even when the master pattern was simulated for another one; indexing refuses the mismatch otherwise")
 
         form.group("Detector geometry")
         form.add_text("PC", "Projection center (x*, y*, z*):", (0.5, 0.5, 0.5), "Values from an .ang file are in the EDAX convention")
@@ -611,15 +682,8 @@ class Workbench(QMainWindow):
                       filter="Crystal maps (*.ang *.h5 *.hdf5 *.ctf);;All files (*)")
         form.finish()
 
-        scroll = QScrollArea()
-        scroll.setWidget(form)
-        scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(470)
-        outer.addWidget(scroll)
-
         right = QWidget()
         rl = QVBoxLayout(right)
-        buttons = QHBoxLayout()
         self.btn_preset_load = QPushButton("Load preset...")
         self.btn_preset_load.clicked.connect(lambda: self.load_preset())
         self.btn_preset_save = QPushButton("Save preset...")
@@ -636,9 +700,8 @@ class Workbench(QMainWindow):
         self.btn_save.clicked.connect(self.save_result)
         self.btn_compare = QPushButton("Compare with reference")
         self.btn_compare.clicked.connect(self.compare_reference)
-        for b in (self.btn_preset_load, self.btn_preset_save, self.btn_geometry, self.btn_test, self.btn_full, self.btn_save, self.btn_compare):
-            buttons.addWidget(b)
-        rl.addLayout(buttons)
+        rl.addLayout(button_rows([self.btn_preset_load, self.btn_preset_save, self.btn_geometry, self.btn_compare,
+                                  self.btn_test, self.btn_full, self.btn_save]))
         split = QSplitter(Qt.Vertical)
         self.maps = MapCanvas()
         split.addWidget(self.maps)
@@ -654,7 +717,7 @@ class Workbench(QMainWindow):
         split.addWidget(bottom)
         split.setSizes([600, 300])
         rl.addWidget(split)
-        outer.addWidget(right, stretch=1)
+        outer.addWidget(side_by_side(form, right))
         self.tabs.addTab(tab, "2. Spherical indexing")
 
     # ---------------------------------------------------------------- tab 3: HROSM
@@ -674,21 +737,15 @@ class Workbench(QMainWindow):
         form.add_int("HROSM_N_OSM", "Matches compared (OSM):", 10, 1, 1000, "At most the number kept")
         form.add_combo("HROSM_AVERAGE", "Grain reference:", ["mean", "center", "vmf", "watson"], "mean")
         form.add_int("HROSM_MIN_PIXELS", "Smallest grain (points):", 10, 1, 100000)
-        form.add_bool("HROSM_DILATE", "Dilate grains into unassigned neighbours")
+        form.add_bool("HROSM_DILATE", "Dilate grains", "Grow the grains into neighbouring points not assigned to any grain before averaging")
         form.add_text("HROSM_ROI", "ROI (c0, c1, r0, r1):", tip="Only these map points are segmented and re-indexed; blank = all", placeholder="None = all")
         form.finish()
-        scroll = QScrollArea()
-        scroll.setWidget(form)
-        scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(470)
-        outer.addWidget(scroll)
 
         right = QWidget()
         rl = QVBoxLayout(right)
-        buttons = QHBoxLayout()
         self.hrosm_source = QLabel("Map to re-index: none yet (index a test region or the full map in tab 2)")
         self.hrosm_source.setWordWrap(True)
-        self.btn_hrosm_load = QPushButton("Load an indexed map (.h5) for the prepared patterns...")
+        self.btn_hrosm_load = QPushButton("Load indexed map (.h5)...")
         self.btn_hrosm_load.setToolTip("A spherical indexing .h5 of the same points as the patterns prepared in tab 2 (e.g. from the notebook)")
         self.btn_hrosm_load.clicked.connect(self.load_indexed_map)
         self.btn_hrosm = QPushButton("Run HROSM")
@@ -696,14 +753,11 @@ class Workbench(QMainWindow):
         self.btn_hrosm.clicked.connect(self.run_hrosm)
         self.btn_hrosm_save = QPushButton("Save HROSM .ang / .h5")
         self.btn_hrosm_save.clicked.connect(self.save_hrosm)
-        buttons.addWidget(self.btn_hrosm_load)
-        buttons.addWidget(self.btn_hrosm)
-        buttons.addWidget(self.btn_hrosm_save)
         rl.addWidget(self.hrosm_source)
-        rl.addLayout(buttons)
+        rl.addLayout(button_rows([self.btn_hrosm_load, self.btn_hrosm, self.btn_hrosm_save], per_row=3))
         self.hmaps = MapCanvas()
         rl.addWidget(self.hmaps, stretch=1)
-        outer.addWidget(right, stretch=1)
+        outer.addWidget(side_by_side(form, right))
         self.tabs.addTab(tab, "3. HROSM")
 
     # ---------------------------------------------------------------- settings, presets, log
