@@ -18,7 +18,7 @@ only the path syntax in the examples changes.
 | `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/jwestraadt/kikuchipy, branch `develop`, pinned at commit `4c7a0035`, plus the local patches below. Installed in editable mode. |
 | `update_fork.py` | Clones or updates that clone, checks out the pinned commit, applies the patch and installs it, in one command. Also undoes an earlier patch first, so re-running it after Johan pushes new commits is safe. See step 3. |
 | `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Applied by `update_fork.py`, or by hand, see step 3. |
-| `kikuchi_workbench.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor, spherical indexing and HROSM in one window, see section 6.8. `sph_core.py` holds the indexing code the GUI calls (the notebook's cells as functions, usable from scripts). |
+| `kikuchi_workbench.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.8. `sph_core.py` holds the indexing code the GUI calls (the notebook's cells as functions, usable from scripts), `live_view.py` the animated progress view. |
 | `build_notebook.py` | Generates the indexing notebook (sections 0 to 10 plus an optional HROSM section 11). Edit this, then regenerate; do not hand-edit the generated `.ipynb` unless you know you will not regenerate it. |
 | `build_refinement_notebook.py` | Generates the projection center drift correction notebook: corrects an indexed map for the PC moving with the beam, from the scan geometry alone, no patterns needed (minutes), see section 6.6. |
 | `spherical_indexing_template.ipynb` | Generated indexing notebook with default settings. Runs on kikuchipy's nickel demo data when no pattern file is given. |
@@ -344,7 +344,7 @@ cubochoric grid within `HROSM_MAX_ANGLE` of the grain's reference orientation. T
 angular resolution orientation similarity map (HROSM), orientations on a grid much finer than the
 global search, and the KAM, grain labels and grain reference orientation deviation (GROD). Section
 11 of the indexing notebook runs it on the map of section 7 and saves `<name>_hrosm_n<steps>.h5`
-and `.ang`; the GUI's third tab does the same.
+and `.ang`. (The GUI does not do HROSM; it is pattern processing and spherical indexing only.)
 
 - `HROSM_MASTER_FILE`: the EMsoft master pattern `.h5` of the phase. Patterns are simulated, so an
   `.sht` file cannot be used. `None` skips the section (the demo data uses its own master).
@@ -360,25 +360,44 @@ and `.ang`; the GUI's third tab does the same.
   The whole computation is on the CPU (Dask threads, `N_WORKERS`); the GPU backend only concerns
   the spherical search.
 
-### 6.8 The GUI: pattern processor, spherical indexing and HROSM in one window
+### 6.8 The GUI: pattern processor and spherical indexing in one window
 
 `kikuchi_workbench.py` puts the [Kikuchi Pattern Processor](https://github.com/helpimlost97/kikuchi-pattern-processor)
-and the indexing of this folder into one PyQt5 window with three tabs:
+and the indexing of this folder into one PyQt5 window with two tabs:
 
 1. **Pattern processor**: the unchanged `gpu_pattern_viewer.py`, imported from its own folder
    (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`).
-2. **Spherical indexing**: the settings of the notebook as a form. The patterns come either from a
-   file, or straight from the processor tab: its processing chain (NLPAR result, background,
-   stretch, CLAHE, IQ exclusion) is run over the whole data set in RAM, exactly as `Apply && Save`
-   would write it, and the result is indexed without a file in between. Patterns excluded by the
-   processor's IQ range are not indexed. `Read scan parameters` fills the projection center from
-   the `.ang`; `Check geometry` shows one pattern on the sphere; then `Index test region`,
-   `Index full map`, `Save .ang / .h5`, `Compare with reference`. `Save preset` writes a preset file
-   that `build_notebook.py` accepts, and `Load preset` reads one (e.g. `preset_RKD.txt`), so the
-   GUI and the notebook share settings. A file written by the processor's `Apply && Save` is
-   offered to the indexing tab automatically.
-3. **HROSM**: section 6.7 on the last indexed map (test region or full map, or an indexed `.h5`
-   loaded for the prepared patterns), with the KAM, grain, GROD and OSM maps, and save.
+2. **Spherical indexing**: the settings of the notebook as a form on the left (drag the divider to
+   resize it), the live view, the result maps and a log on the right.
+
+Workflow in the indexing tab:
+
+- **Pattern source**: a file (anything kikuchipy loads), or the processor tab. With the processor
+  source, the processor's processing chain (NLPAR result, background, stretch, CLAHE, IQ exclusion)
+  is run over the whole data set in RAM, exactly as `Apply && Save` would write it, and the result
+  is indexed without a file in between; patterns excluded by the processor's IQ range are not
+  indexed. A file written by `Apply && Save` is offered to the indexing tab automatically.
+- **Load patterns (quasi-IQ map)**: runs by itself after browsing for a pattern file (and when the
+  source is switched to the processor, whose IQ map is reused). It loads the patterns, computes a
+  quasi image quality map (the standard deviation of every raw pattern, the processor's definition),
+  stretches it between its 1st and 99th percentile and shows it in the **Live** view. For a memory
+  mapped file this is one read of the file.
+- **Read scan parameters** fills the projection center from the `.ang`; the scan file dialog opens in
+  the pattern file's folder. The **pixel size** is filled in automatically as 30 mm / pattern width
+  for the EDAX/TSL convention (the EDAX detector is 30 mm wide) and stays editable. Static and
+  dynamic background removal are off by default (the processor already did them) and the circular
+  mask is on.
+- **Check geometry** shows one pattern on the sphere; **Index test region** and **Index full map**
+  index with the live view on by default: the map is indexed band by band (bands of whole rows
+  sized to about 8 s each; identical results to one call, at a few per cent of extra time for the
+  per-band setup), and the Live view paints each finished
+  band with its IPF-Z colours over the grey quasi-IQ map, tints the band being indexed with a
+  left-to-right sweep, shows a pattern of that band on the right (cycling through the band), and
+  reports elapsed time, ETA, the speed over the last few seconds and the speed of the current band.
+  The **Results** tab then shows the score, IQ, IPF-Z and IPF-X maps. Untick *Live view* for a
+  single call without animation.
+- **Save .ang / .h5**, **Compare with reference**, and **Load/Save preset**: a preset file that
+  `build_notebook.py` accepts, so the GUI and the notebook share settings.
 
 ```bash
 python kikuchi_workbench.py                                   # processor found next to this folder
@@ -389,21 +408,24 @@ python kikuchi_workbench.py --preset preset_RKD.txt
 On Windows `Open workbench.bat` does the same (set `PYTHON` and, if needed, `KPP_DIR` at its top).
 The processor's clone is looked for in `--processor-dir`, `KPP_DIR`, then as `kikuchi-pattern-processor`
 next to this folder, inside it, in the current folder or in the home folder. Without it the indexing
-and HROSM tabs still work from files. The environment is the one of this README (fork, CuPy) plus
-the processor's packages: `pip install pyqt5 pyebsdindex scipy scikit-image` (and `pyopencl` for
-NLPAR on the GPU). The processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...)
-apply inside the workbench too.
+tab still works from files. The environment is the one of this README (fork, CuPy) plus the
+processor's packages: `pip install pyqt5 pyebsdindex scipy scikit-image` (and `pyopencl` for NLPAR
+on the GPU). The processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...) apply
+inside the workbench too.
 
 Memory: the in-RAM route holds the processed data set once more in RAM (the file size, so 6.5 GB
 for a 479 px RKD scan of 28 000 patterns, on top of the processor's own copies); it refuses with
-a message when that does not fit, in which case use `Apply && Save` and the file source. Long
-steps run in a worker thread with their console output in the log pane; the processor's chain
-itself runs in the GUI thread with a progress line, as `Apply && Save` does.
+a message when that does not fit, in which case use `Apply && Save` and the file source. With the
+file source and the background removals off, the loaded patterns are indexed as they are (no
+second copy); with a removal on, the file is read again and processed. Long steps run in a worker
+thread with their console output in the log pane; the processor's chain itself runs in the GUI
+thread with a progress line, as `Apply && Save` does.
 
 Verified headlessly on the nickel demo data written as a `.up1` (no GPU in that environment, CPU
-backend): processor load, chain in RAM, test region, HROSM, full map, save, and the same map
-indexed from the file with kikuchipy's background removal, which agreed with the processor route
-to a median of 0.03 deg (every point within 1 deg; the two background corrections differ).
+backend): processor load, chain in RAM, quasi-IQ map, band-wise test region and full map with the
+live events, save, and the same map indexed from the file, which agreed with the processor route
+to a median of 0.03 deg (every point within 1 deg; the two background corrections differ). The
+band-wise result is checked to be identical to a single call.
 
 ---
 

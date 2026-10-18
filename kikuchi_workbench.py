@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Kikuchi workbench: the Kikuchi Pattern Processor, GPU spherical indexing and HROSM in one window.
+"""Kikuchi workbench: the Kikuchi Pattern Processor and GPU spherical indexing in one window.
 
     python kikuchi_workbench.py                              # finds the pattern processor next to this folder
     python kikuchi_workbench.py --processor-dir C:\\path\\to\\kikuchi-pattern-processor
     python kikuchi_workbench.py --preset preset_RKD.txt      # start with the settings of a notebook preset
     set KPP_DIR=C:\\path\\to\\kikuchi-pattern-processor       # alternative to --processor-dir (Windows cmd)
 
-Three tabs:
+Two tabs:
 
 1. **Pattern processor**: the unchanged Kikuchi Pattern Processor (gpu_pattern_viewer.py of
    https://github.com/helpimlost97/kikuchi-pattern-processor), imported from its own folder. Load a UP1/UP2,
@@ -17,18 +17,18 @@ Three tabs:
    (NLPAR result, background, stretch, CLAHE, IQ exclusion) is run on the whole data set in RAM, exactly as
    "Apply && Save" would write it, and the result is indexed without touching the disk. Check the geometry on one
    pattern, index a test region, index the full map, save .ang/.h5. Load and save notebook presets.
-3. **HROSM**: re-index every grain of the last indexed map on a fine misorientation ball (EBSD.hrosm of the
-   fork), with the KAM, grain, GROD and OSM maps, and save the result.
 
 Needs the environment of README.md (the kikuchipy fork, CuPy for the GPU) plus the pattern processor's packages
-(PyQt5, pyebsdindex, scipy, scikit-image). Without the processor folder the indexing and HROSM tabs still work
+(PyQt5, pyebsdindex, scipy, scikit-image). Without the processor folder the indexing tab still works
 from files.
 """
 from __future__ import annotations
 
 import argparse
 import ast
+import collections
 import dataclasses
+import inspect
 import os
 import sys
 import time
@@ -94,14 +94,20 @@ from PyQt5.QtWidgets import (  # noqa: E402
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa: E402
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT  # noqa: E402
-from matplotlib.colors import ListedColormap  # noqa: E402
 from matplotlib.figure import Figure  # noqa: E402
 
 import ebsd_params  # noqa: E402
 import sph_core  # noqa: E402
+from live_view import LiveView  # noqa: E402
 from sph_core import Settings  # noqa: E402
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+# The EDAX detector is 30 mm wide: the pixel size of the EDAX/TSL projection center convention follows from the
+# pattern width alone, which is why the GUI fills it in (ebsd_params.py uses the same default, --det-mm 30).
+DETECTOR_WIDTH_UM = 30000.0
+# How the map is indexed with the live view on: bands of rows that each take about this long
+LIVE_BLOCK_SECONDS = 8.0
 
 
 # ----------------------------------------------------------------------------------------------
@@ -148,21 +154,29 @@ class _Tee:
 
 
 class Worker(QThread):
+    """Runs ``fn(log)`` or ``fn(log, emit_event)`` in a thread. ``emit_event(name, data)`` delivers typed events
+    (block_start, progress, block_done, ...) to the GUI thread through the ``event`` signal."""
+
     log = pyqtSignal(str)
     progress = pyqtSignal(str)
+    event = pyqtSignal(str, object)
     done = pyqtSignal(object)
     failed = pyqtSignal(str)
 
     def __init__(self, fn, parent=None):
         super().__init__(parent)
         self.fn = fn
+        self.takes_events = len(inspect.signature(fn).parameters) >= 2
 
     def run(self):
         orig_out, orig_err = sys.stdout, sys.stderr
         sys.stdout = _Tee(orig_out, self.log.emit, self.progress.emit)
         sys.stderr = _Tee(orig_err, self.log.emit, self.progress.emit)
         try:
-            result = self.fn(self.log.emit)
+            if self.takes_events:
+                result = self.fn(self.log.emit, self.event.emit)
+            else:
+                result = self.fn(self.log.emit)
         except Exception:  # noqa: BLE001
             self.failed.emit(traceback.format_exc())
         else:
@@ -334,7 +348,11 @@ class SettingsForm(QWidget):
                               lambda v: w.setCurrentText(str(v)))
         return w
 
-    def add_path(self, name, label, default=None, tip="", filter="All files (*)", save=False, directory=False, multi=False):
+    def add_path(self, name, label, default=None, tip="", filter="All files (*)", save=False, directory=False, multi=False,
+                 start_dir=None, on_chosen=None):
+        """A path field with a browse button. ``start_dir`` is a callable returning the folder the dialog opens in
+        when the field is still empty (e.g. the folder of another field's file); ``on_chosen(path)`` is called
+        after a file was picked in the dialog."""
         row = QWidget()
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -344,7 +362,10 @@ class SettingsForm(QWidget):
         btn.setFixedWidth(28)
 
         def browse():
-            start = edit.text().strip() or str(Path.cwd())
+            start = edit.text().strip()
+            if not start and start_dir is not None:
+                start = start_dir() or ""
+            start = start or str(Path.cwd())
             if directory:
                 path = QFileDialog.getExistingDirectory(self, label, start)
             elif multi:
@@ -356,6 +377,8 @@ class SettingsForm(QWidget):
                 path, _ = QFileDialog.getOpenFileName(self, label, start, filter)
             if path:
                 edit.setText(path)
+                if on_chosen is not None:
+                    on_chosen(path)
 
         btn.clicked.connect(browse)
         lay.addWidget(_fit(edit))
@@ -520,13 +543,6 @@ class MapCanvas(QWidget):
         self.canvas.draw_idle()
 
 
-def _grain_cmap(grain_id):
-    rng = np.random.default_rng(42)
-    colors = rng.uniform(0.2, 1, (int(np.nanmax(grain_id)) + 1, 3))
-    colors[0] = 0
-    return ListedColormap(colors)
-
-
 # ----------------------------------------------------------------------------------------------
 # The window
 # ----------------------------------------------------------------------------------------------
@@ -535,23 +551,24 @@ def _grain_cmap(grain_id):
 class Workbench(QMainWindow):
     def __init__(self, preset: str | None = None):
         super().__init__()
-        self.setWindowTitle(f"Kikuchi workbench v{__version__}: pattern processor + spherical indexing + HROSM")
+        self.setWindowTitle(f"Kikuchi workbench v{__version__}: pattern processor + spherical indexing")
         self.setGeometry(60, 60, 1500, 950)
         self.worker: Worker | None = None
         self.base = Settings()
         # prepared state of the indexing tab
+        self.loaded = None        # dict: key, signal (raw patterns), scan, iq (stretched quasi-IQ), source, source_file
         self.prepared = None      # dict: signal, scan, key, source, nav_mask, source_file
+        self.pattern_width = None  # pixels, once a pattern file or the processor's data set is known
+        self.live_run = None      # state of the run shown in the live view
         self.harmonics = None     # list, with its key
         self.harmonics_key = None
         self.det = None
         self.last_run = None      # dict: label, signal, xmap, xmap_indexed, det, seconds, offset
-        self.last_hrosm = None    # dict: xmap, xmap_indexed, label
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.proc = None
         self._build_processor_tab()
         self._build_indexing_tab()
-        self._build_hrosm_tab()
         self.tabs.setCurrentIndex(1 if self.proc is None else 0)
         if preset:
             self.load_preset(preset)
@@ -567,7 +584,7 @@ class Workbench(QMainWindow):
             w = QWidget()
             lay = QVBoxLayout(w)
             lab = QLabel("The pattern processor is not available:\n" + PROCESSOR_INFO +
-                         "\n\nThe indexing and HROSM tabs work from pattern files.")
+                         "\n\nThe indexing tab works from pattern files.")
             lab.setWordWrap(True)
             lay.addWidget(lab)
             lay.addStretch()
@@ -602,6 +619,12 @@ class Workbench(QMainWindow):
         self.proc.apply_save_btn.clicked.disconnect()
         self.proc.apply_save_btn.clicked.connect(apply_and_save_then_register)
 
+    def _source_changed(self, index):
+        """Switching to the processor source shows its IQ map at once; the file source re-reads on demand."""
+        self.prepared = None
+        if index == 1 and self.proc is not None and self.proc.f_orig is not None:
+            self.load_patterns_clicked()
+
     def _processor_saved(self, path):
         self.log(f"Processor saved {path}; set as the pattern file of the indexing tab")
         self.form._fields["PATTERN_FILE"][1](path)
@@ -620,12 +643,20 @@ class Workbench(QMainWindow):
         if self.proc is not None:
             self.source_combo.addItem("Processor tab: its processed patterns, in RAM (as 'Apply && Save' writes them)")
         self.source_combo.setToolTip("Where the patterns to index come from")
+        self.source_combo.currentIndexChanged.connect(self._source_changed)
         form.add_row("Source:", self.source_combo)
-        form.add_path("PATTERN_FILE", "Pattern file:", tip="EDAX .up1/.up2 or any format kp.load() reads; blank = the nickel demo data",
-                      filter="Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)")
+        self.pattern_file_edit = form.add_path(
+            "PATTERN_FILE", "Pattern file:", tip="EDAX .up1/.up2 or any format kp.load() reads; blank = the nickel demo data",
+            filter="Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)",
+            on_chosen=lambda path: self.load_patterns_clicked())
         form.add_path("SCAN_FILE", "Scan file (.ang/.edaxh5):", tip="The .ang or .edaxh5 written at acquisition: gives the projection center, map size and step",
-                      filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)")
+                      filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)", start_dir=self._pattern_file_dir)
         form.add_text("EDAXH5_MAP", "edaxh5 map filter:", tip="Only for .edaxh5 files with several maps: part of the map's name, e.g. 'Area 8'", placeholder="None")
+        self.btn_load = QPushButton("Load patterns (quasi-IQ map)")
+        self.btn_load.setToolTip("Loads the pattern file (or takes the processor's data set), shows its quasi image quality map "
+                                 "in the Live view and fills the pixel size; done automatically after browsing for a file")
+        self.btn_load.clicked.connect(self.load_patterns_clicked)
+        form.add_widget(self.btn_load)
         self.btn_scan = QPushButton("Read scan parameters")
         self.btn_scan.setToolTip("Reads the scan and pattern file headers, prints them in the log and fills the projection center")
         self.btn_scan.clicked.connect(self.read_scan)
@@ -638,8 +669,8 @@ class Workbench(QMainWindow):
         form.add_bool("FLIP_PATTERNS_UD", "Flip patterns upside down", "Try this when the test maps look like noise")
 
         form.group("Pattern processing (file source; the processor tab does its own)")
-        form.add_bool("REMOVE_STATIC_BACKGROUND", "Remove static background", "The background stored with the file, or else the mean pattern", True)
-        form.add_bool("REMOVE_DYNAMIC_BACKGROUND", "Remove dynamic background", "", True)
+        form.add_bool("REMOVE_STATIC_BACKGROUND", "Remove static background", "The background stored with the file, or else the mean pattern. Off by default: patterns from the processor are already corrected", False)
+        form.add_bool("REMOVE_DYNAMIC_BACKGROUND", "Remove dynamic background", "Off by default: patterns from the processor are already corrected", False)
         note = QLabel("NLPAR: use the pattern processor tab (pyebsdindex)")
         note.setStyleSheet("color: gray")
         form.add_widget(note)
@@ -653,10 +684,13 @@ class Workbench(QMainWindow):
 
         form.group("Detector geometry")
         form.add_text("PC", "Projection center (x*, y*, z*):", (0.5, 0.5, 0.5), "Values from an .ang file are in the EDAX convention")
-        form.add_combo("PC_CONVENTION", "PC convention:", ["edax", "tsl", "bruker", "oxford", "emsoft"], "edax")
+        self.pc_convention_combo = form.add_combo("PC_CONVENTION", "PC convention:", ["edax", "tsl", "bruker", "oxford", "emsoft"], "edax")
+        self.pc_convention_combo.currentTextChanged.connect(lambda *_: self.auto_px_size())
         form.add_text("SAMPLE_TILT", "Sample tilt deg:", tip="Blank = the tilt the master pattern was simulated for (as EMSphInx does)", placeholder="None = from master")
         form.add_float("CAMERA_TILT", "Camera tilt deg:", 0.0, -180, 180, 2, "Detector tilt / camera elevation (EMSphInx thetac): 8 for EBSD, -90 for RKD")
-        form.add_float("PX_SIZE", "Pixel size um:", 1.0, 1e-6, 1e6, 4, "Detector pixel size; only needed for the emsoft PC convention")
+        self.px_size_spin = form.add_float("PX_SIZE", "Pixel size um:", 1.0, 1e-6, 1e6, 4,
+                                           f"Detector pixel size. Filled automatically as {DETECTOR_WIDTH_UM / 1000:.0f} mm / pattern width "
+                                           "for the EDAX/TSL convention once the pattern width is known; editable")
         form.add_int("BINNING", "Binning:", 1, 1, 64)
         form.add_float("TWIST", "Twist deg:", 0.0, -180, 180, 2, "Rotation of the detector about its normal, e.g. 15 for RKD; applied to the orientations afterwards")
 
@@ -667,7 +701,7 @@ class Workbench(QMainWindow):
         form.add_int("N_WORKERS", "Dask workers:", max(1, (os.cpu_count() or 8) // 2), 1, 256, "About the number of performance cores")
         form.add_bool("REFINE", "Newton refinement", "", True)
         form.add_int("N_REGIONS", "AHE tiles (n_regions):", 10, 0, 64, "Adaptive histogram equalization tiles per axis; 0 = off")
-        form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector")
+        form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector", True)
         form.add_bool("GAUSSIAN_BACKGROUND", "Gaussian background", "Fit and subtract a 2D Gaussian background (EMSphInx gausbckg)")
         form.add_bool("NORMALIZE", "Normalized cross-correlation", "", True)
         form.add_text("CHUNKSIZE", "Chunk / GPU batch size:", tip="Patterns per chunk; blank = automatic from free VRAM", placeholder="None = automatic")
@@ -702,9 +736,18 @@ class Workbench(QMainWindow):
         self.btn_compare.clicked.connect(self.compare_reference)
         rl.addLayout(button_rows([self.btn_preset_load, self.btn_preset_save, self.btn_geometry, self.btn_compare,
                                   self.btn_test, self.btn_full, self.btn_save]))
+        self.live_check = QCheckBox("Live view: index band by band and animate the progress on the quasi-IQ map")
+        self.live_check.setChecked(True)
+        self.live_check.setToolTip("Off = one call for the whole map (no animation, a few per cent faster on tiny maps)")
+        rl.addWidget(self.live_check)
         split = QSplitter(Qt.Vertical)
+        self.view_tabs = QTabWidget()
+        self.live = LiveView()
+        self.live.set_pattern_source(self._live_pattern)
         self.maps = MapCanvas()
-        split.addWidget(self.maps)
+        self.view_tabs.addTab(self.live, "Live")
+        self.view_tabs.addTab(self.maps, "Results")
+        split.addWidget(self.view_tabs)
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
@@ -720,50 +763,9 @@ class Workbench(QMainWindow):
         outer.addWidget(side_by_side(form, right))
         self.tabs.addTab(tab, "2. Spherical indexing")
 
-    # ---------------------------------------------------------------- tab 3: HROSM
-    def _build_hrosm_tab(self):
-        tab = QWidget()
-        outer = QHBoxLayout(tab)
-        self.hform = form = SettingsForm()
-        form.group("Master pattern for the simulated dictionaries")
-        form.add_path("HROSM_MASTER_FILE", "EMsoft master .h5:", tip="An EMsoft master pattern .h5 of the phase (.sht cannot be used: patterns are simulated). Blank with the demo data = the demo master",
-                      filter="EMsoft master patterns (*.h5 *.hdf5);;All files (*)")
-        form.add_text("HROSM_ENERGY", "Energy keV:", tip="Blank = the highest energy in the file", placeholder="None")
-        form.group("Grains and misorientation ball")
-        form.add_float("HROSM_THRESHOLD", "KAM threshold deg:", 5.0, 0.01, 180, 2, "Neighbours whose KAM differs by less join the same grain (EMHROSM gangle)")
-        form.add_float("HROSM_MAX_ANGLE", "Ball radius deg:", 5.0, 0.01, 179, 2, "Must be at least the largest GROD of the grains (EMHROSM misorang)")
-        form.add_int("HROSM_N_STEPS", "Steps per half axis:", 10, 1, 60, "(2 n + 1)^3 orientations per grain: 9261 for 10, 68921 for 20 (EMHROSM default); cost grows with the cube")
-        form.add_int("HROSM_KEEP_N", "Best matches kept:", 20, 1, 1000)
-        form.add_int("HROSM_N_OSM", "Matches compared (OSM):", 10, 1, 1000, "At most the number kept")
-        form.add_combo("HROSM_AVERAGE", "Grain reference:", ["mean", "center", "vmf", "watson"], "mean")
-        form.add_int("HROSM_MIN_PIXELS", "Smallest grain (points):", 10, 1, 100000)
-        form.add_bool("HROSM_DILATE", "Dilate grains", "Grow the grains into neighbouring points not assigned to any grain before averaging")
-        form.add_text("HROSM_ROI", "ROI (c0, c1, r0, r1):", tip="Only these map points are segmented and re-indexed; blank = all", placeholder="None = all")
-        form.finish()
-
-        right = QWidget()
-        rl = QVBoxLayout(right)
-        self.hrosm_source = QLabel("Map to re-index: none yet (index a test region or the full map in tab 2)")
-        self.hrosm_source.setWordWrap(True)
-        self.btn_hrosm_load = QPushButton("Load indexed map (.h5)...")
-        self.btn_hrosm_load.setToolTip("A spherical indexing .h5 of the same points as the patterns prepared in tab 2 (e.g. from the notebook)")
-        self.btn_hrosm_load.clicked.connect(self.load_indexed_map)
-        self.btn_hrosm = QPushButton("Run HROSM")
-        self.btn_hrosm.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px; }")
-        self.btn_hrosm.clicked.connect(self.run_hrosm)
-        self.btn_hrosm_save = QPushButton("Save HROSM .ang / .h5")
-        self.btn_hrosm_save.clicked.connect(self.save_hrosm)
-        rl.addWidget(self.hrosm_source)
-        rl.addLayout(button_rows([self.btn_hrosm_load, self.btn_hrosm, self.btn_hrosm_save], per_row=3))
-        self.hmaps = MapCanvas()
-        rl.addWidget(self.hmaps, stretch=1)
-        outer.addWidget(side_by_side(form, right))
-        self.tabs.addTab(tab, "3. HROSM")
-
     # ---------------------------------------------------------------- settings, presets, log
     def settings(self) -> Settings:
         st = self.form.settings(self.base)
-        st = self.hform.settings(st)
         if isinstance(st.LAZY, str) and st.LAZY != "auto":
             st.LAZY = st.LAZY == "True"
         if isinstance(st.PC, (list, tuple)) and len(st.PC) == 3:
@@ -772,7 +774,6 @@ class Workbench(QMainWindow):
 
     def set_settings(self, st: Settings):
         self.form.set_settings(st)
-        self.hform.set_settings(st)
 
     def load_preset(self, path=None):
         if not path:
@@ -803,11 +804,11 @@ class Workbench(QMainWindow):
         QApplication.processEvents()
 
     def _busy(self, busy: bool):
-        for b in (self.btn_geometry, self.btn_test, self.btn_full, self.btn_save, self.btn_compare, self.btn_hrosm,
-                  self.btn_hrosm_load, self.btn_hrosm_save, self.btn_preset_load, self.btn_scan):
+        for b in (self.btn_geometry, self.btn_test, self.btn_full, self.btn_save, self.btn_compare,
+                  self.btn_preset_load, self.btn_scan, self.btn_load):
             b.setEnabled(not busy)
 
-    def _start(self, fn, on_done):
+    def _start(self, fn, on_done, on_event=None):
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.information(self, "Busy", "Wait for the running step to finish")
             return
@@ -815,6 +816,7 @@ class Workbench(QMainWindow):
         self.worker = Worker(fn, self)
         self.worker.log.connect(self.log)
         self.worker.progress.connect(self.set_progress)
+        self.worker.event.connect(on_event or self.on_run_event)
 
         def done(result):
             self._busy(False)
@@ -828,6 +830,9 @@ class Workbench(QMainWindow):
         def failed(text):
             self._busy(False)
             self.set_progress("")
+            if self.live_run is not None:
+                self.live.end_run(False)
+                self.live_run = None
             self.log(text)
             QMessageBox.critical(self, "Error", text[-1500:])
 
@@ -865,7 +870,84 @@ class Workbench(QMainWindow):
             self.log(f"Projection center set to {tuple(scan['pc'])} (edax convention)")
         if scan.get("camera_elevation") is not None:
             self.log(f"Camera elevation in the scan file: {scan['camera_elevation']} deg (CAMERA_TILT is not changed automatically)")
+        if scan.get("pattern_width"):
+            self.set_pattern_width(int(scan["pattern_width"]))
         self.prepared = None
+
+    # ---------------------------------------------------------------- pixel size, folders
+    def _pattern_file_dir(self):
+        """Folder of the pattern file, for the scan file dialog; None when no pattern file is set."""
+        text = self.pattern_file_edit.text().strip()
+        return os.path.dirname(text) if text else None
+
+    def set_pattern_width(self, width: int):
+        self.pattern_width = int(width)
+        self.auto_px_size()
+
+    def auto_px_size(self):
+        """Pixel size = 30 mm / pattern width for the EDAX/TSL convention (the EDAX detector is 30 mm wide)."""
+        if not self.pattern_width or self.pc_convention_combo.currentText() not in ("edax", "tsl"):
+            return
+        px = DETECTOR_WIDTH_UM / self.pattern_width
+        if abs(self.px_size_spin.value() - px) > 1e-6:
+            self.px_size_spin.setValue(round(px, 4))
+            self.log(f"Pixel size set to {px:.4f} um = {DETECTOR_WIDTH_UM / 1000:.0f} mm / {self.pattern_width} px (editable)")
+
+    # ---------------------------------------------------------------- loading patterns and the quasi-IQ map
+    def _load_key(self, st: Settings):
+        if self.source_combo.currentIndex() == 1:
+            return ("processor", None if self.proc is None else self.proc.orig_path, st.ROI, st.FLIP_PATTERNS_UD)
+        return ("file", st.PATTERN_FILE, st.SCAN_FILE, st.EDAXH5_MAP, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI, st.FLIP_PATTERNS_UD)
+
+    def load_patterns_clicked(self):
+        """Load the pattern file (or take the processor's data set), compute and show the quasi-IQ map."""
+        st = self.settings()
+        key = self._load_key(st)
+        if self.loaded is not None and self.loaded["key"] == key:
+            self._show_loaded()
+            return
+        if self.source_combo.currentIndex() == 1:
+            if self.proc is None or self.proc.f_orig is None or self.proc.iq_map is None:
+                QMessageBox.information(self, "Patterns", "Load a UP1/UP2 file in the pattern processor tab first")
+                return
+            iq = np.asarray(self.proc.iq_map, dtype=np.float32)
+            if st.ROI is not None:
+                c0, c1, r0, r1 = st.ROI
+                iq = iq[r0:r1, c0:c1]
+            self.loaded = {"key": key, "signal": None, "scan": {}, "iq": sph_core.stretch(iq), "source": "processor",
+                           "source_file": self.proc.orig_path, "nav_shape": iq.shape}
+            self.set_pattern_width(int(self.proc.f_orig.patternW))
+            self.log(f"Processor data set: {os.path.basename(self.proc.orig_path)}, {iq.shape[1]} x {iq.shape[0]} points; its IQ map is shown")
+            self._show_loaded()
+            return
+
+        def work(log, emit):
+            s, scan = sph_core.load_patterns(st, log=log)
+            t0 = time.perf_counter()
+            iq = sph_core.quasi_iq(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
+            log(f"Quasi-IQ map (per-pattern standard deviation) in {time.perf_counter() - t0:.1f} s")
+            return {"key": key, "signal": s, "scan": scan, "iq": sph_core.stretch(iq), "source": "file",
+                    "source_file": st.PATTERN_FILE, "nav_shape": tuple(s.axes_manager.navigation_shape[::-1])}
+
+        def done(loaded):
+            self.loaded = loaded
+            self.prepared = None
+            sig_shape = loaded["signal"].axes_manager.signal_shape
+            self.set_pattern_width(int(sig_shape[0]))
+            self._show_loaded()
+
+        self._start(work, done)
+
+    def _show_loaded(self):
+        if self.loaded is None:
+            return
+        iq = self.loaded["iq"]
+        name = os.path.basename(self.loaded["source_file"]) if self.loaded["source_file"] else "nickel demo"
+        if iq.ndim == 2:
+            self.live.set_base_map(iq, f"Quasi-IQ of {name} ({iq.shape[1]} x {iq.shape[0]} points)")
+        else:
+            self.live.set_base_map(None, f"{name}: 1D map, no live view")
+        self.view_tabs.setCurrentWidget(self.live)
 
     # ---------------------------------------------------------------- preparing patterns, master, detector
     def _prepare_key(self, st: Settings):
@@ -908,8 +990,13 @@ class Workbench(QMainWindow):
         """Loads the patterns from a file when needed, then the harmonics and the detector."""
         key = self._prepare_key(st)
         if prepared is None:
-            s, scan = sph_core.load_patterns(st, log=log)
-            sph_core.preprocess(s, st, log)
+            loaded = self.loaded
+            if loaded is not None and loaded["source"] == "file" and loaded["key"] == self._load_key(st) and loaded["signal"] is not None \
+                    and not (st.REMOVE_STATIC_BACKGROUND or st.REMOVE_DYNAMIC_BACKGROUND):
+                s, scan = loaded["signal"], loaded["scan"]  # the raw patterns already in memory, nothing to change
+            else:
+                s, scan = sph_core.load_patterns(st, log=log)
+                sph_core.preprocess(s, st, log)
             prepared = {"key": key, "signal": s, "scan": scan, "source": "file", "nav_mask": None,
                         "source_file": st.PATTERN_FILE}
         demo = prepared["source"] == "file" and st.PATTERN_FILE is None
@@ -972,7 +1059,14 @@ class Workbench(QMainWindow):
             QMessageBox.critical(self, "Patterns", f"{type(e).__name__}: {e}")
             return
 
-        def work(log):
+        live = self.live_check.isChecked()
+        if self.loaded is None or self.loaded["key"] != self._load_key(st):
+            # the quasi-IQ map of this data set is not there yet: the live view then shows a blank map
+            self.loaded = None
+            self.live.set_base_map(None, "")
+        self.live_run = None
+
+        def work(log, emit):
             result = self._prepare_in_worker(st, prepared, log)
             prepared_, harmonics, hkey, det, demo = result
             s = prepared_["signal"]
@@ -988,11 +1082,35 @@ class Workbench(QMainWindow):
                 nav_mask = None
             if nav_mask is not None:
                 log(f"{int(nav_mask.sum())} patterns excluded by the processor's IQ range are not indexed")
-            log(f"Indexing the {label}: {int(np.prod(s_run.axes_manager.navigation_shape))} patterns, bandwidth {st.BANDWIDTH}, {st.BACKEND}")
-            xmap, xmap_indexed, dt = sph_core.index(s_run, harmonics, det, st, log, navigation_mask=nav_mask, warm_up=s_warm)
+            nav_shape = tuple(int(v) for v in s_run.axes_manager.navigation_shape[::-1])
+            n_run = int(np.prod(nav_shape))
+            log(f"Indexing the {label}: {n_run} patterns, bandwidth {st.BANDWIDTH}, {st.BACKEND}")
+            emit("run_start", {"r0": offset[0], "c0": offset[1], "rows": nav_shape[0], "cols": nav_shape[-1] if len(nav_shape) == 2 else 1,
+                               "n_patterns": n_run, "signal": s_run, "label": label})
+            if live and len(nav_shape) == 2:
+                def on_event(name, data):
+                    if name == "block_done":
+                        data = dict(data)
+                        xb = data.pop("xmap")
+                        data["rgb"] = None if xb is None else sph_core.ipf_rgb_map(xb, "z")
+                    emit(name, data)
+
+                # a test region is small: shorter bands, so that the animation shows several of them
+                xmap_indexed, dt, speed = sph_core.index_blocks(
+                    s_run, harmonics, det, st, log, navigation_mask=nav_mask, on_event=on_event,
+                    target_seconds=1.0 if test else LIVE_BLOCK_SECONDS,
+                    first_patterns=max(nav_shape[1], min(300, max(1, n_run // 10))))
+                xmap = sph_core.apply_twist(xmap_indexed, st.TWIST)
+                log(f"{xmap.size} patterns in {dt:.1f} s; steady speed {speed:.0f} patterns/s ({st.BACKEND}, bandwidth {st.BANDWIDTH})")
+                if st.TWIST:
+                    log(f"Orientations rotated by {st.TWIST} deg about the sample normal (TWIST)")
+            else:
+                xmap, xmap_indexed, dt = sph_core.index(s_run, harmonics, det, st, log, navigation_mask=nav_mask, warm_up=s_warm)
+                speed = xmap.size / dt
+            emit("run_end", {"success": True})
             if test:
                 n_all = int(np.prod(s.axes_manager.navigation_shape))
-                log(f"Estimated time for the full map of {n_all} patterns: {n_all / (xmap.size / dt) / 60:.1f} min")
+                log(f"Estimated time for the full map of {n_all} patterns: {n_all / speed / 60:.1f} min at {speed:.0f} patterns/s")
             return result, dict(label=label, signal=s_run, xmap=xmap, xmap_indexed=xmap_indexed, det=det, seconds=dt, offset=offset)
 
         def done(out):
@@ -1000,9 +1118,68 @@ class Workbench(QMainWindow):
             self._store_prepared(result)
             self.last_run = run
             self.show_indexing_maps(run)
-            self.hrosm_source.setText(f"Map to re-index: the {run['label']} indexed just now ({run['xmap'].size} points)")
+            self.view_tabs.setCurrentWidget(self.maps)
 
-        self._start(work, done)
+        self._start(work, done, on_event=self.on_run_event)
+
+    # ---------------------------------------------------------------- live view plumbing
+    def _live_pattern(self, row, col):
+        """One pattern of the running region, for the live view (called in the GUI thread, a few times per second)."""
+        run = self.live_run
+        if run is None:
+            return None
+        s = run["signal"]
+        data = s.data[int(row) - run["r0"], int(col) - run["c0"]]
+        return np.asarray(data)
+
+    def on_run_event(self, name, data):
+        if name == "run_start":
+            self.live_run = {"signal": data["signal"], "r0": data["r0"], "c0": data["c0"], "n_patterns": data["n_patterns"],
+                             "done": 0, "t0": time.perf_counter(), "window": collections.deque(), "block": None}
+            self.live.begin_run(data["r0"], data["c0"], data["rows"], data["cols"], data["n_patterns"])
+            self.view_tabs.setCurrentWidget(self.live)
+            return
+        run = self.live_run
+        if run is None:
+            return
+        r0, c0 = run["r0"], run["c0"]
+        if name == "block_start":
+            run["block"] = (data["r0"], data["r1"], data["n_patterns"])
+            self.live.block_started(r0 + data["r0"], r0 + data["r1"], c0 + data["c0"], c0 + data["c1"], data["n_patterns"])
+        elif name == "progress":
+            if data.get("what") == "iq":
+                self.set_progress(f"Quasi-IQ map: {100 * data['frac_index']:.0f} %")
+                return
+            self.live.block_progress(data["frac_index"], data["frac_refine"])
+            if run["block"] is not None:
+                # patterns done so far, with the coarse search of the current band counted by its fraction
+                done = run["done"] + data["frac_index"] * run["block"][2]
+                self._update_speed(run, done)
+        elif name == "block_done":
+            n_block = int(data.get("n_patterns", data["done_patterns"] - run["done"]))
+            run["done"] = data["done_patterns"]
+            run["block"] = None
+            self.live.block_done(r0 + data["r0"], r0 + data["r1"], c0 + data["c0"], c0 + data["c1"], data["rgb"],
+                                 n_block, data["seconds"])
+            self.live.set_progress(data["done_patterns"], data["total_patterns"], data["eta_seconds"])
+            self._update_speed(run, data["done_patterns"])
+            self.set_progress(
+                f"{data['done_patterns']} / {data['total_patterns']} patterns, {data['patterns_per_second']:.0f} patterns/s in this band, "
+                f"ETA {data['eta_seconds'] / 60:.1f} min")
+        elif name == "run_end":
+            self.live.end_run(bool(data.get("success", True)))
+            self.live_run = None
+
+    def _update_speed(self, run, done_patterns, window_seconds=3.0):
+        """The 'now' speed: patterns completed over the last few seconds."""
+        now = time.perf_counter()
+        window = run["window"]
+        window.append((now, float(done_patterns)))
+        while len(window) > 2 and now - window[0][0] > window_seconds:
+            window.popleft()
+        if len(window) >= 2 and now - window[0][0] > 0.5:
+            speed = (window[-1][1] - window[0][1]) / (now - window[0][0])
+            self.live.set_speed(max(speed, 0.0))
 
     def show_indexing_maps(self, run):
         xmap = run["xmap"]
@@ -1052,78 +1229,6 @@ class Workbench(QMainWindow):
                 self.maps.show_panels([("Misorientation to the reference [deg]", ang.reshape(run["xmap"].shape), dict(vmax=5), "deg")])
 
         self._start(work, done)
-
-    # ---------------------------------------------------------------- HROSM
-    def load_indexed_map(self):
-        if self.prepared is None or self.det is None:
-            QMessageBox.information(self, "HROSM", "Run 'Check geometry' in tab 2 first, so that the patterns and detector of the map are prepared")
-            return
-        path, _ = QFileDialog.getOpenFileName(self, "Indexed map", str(HERE), "Crystal maps (*.h5 *.hdf5 *.ang);;All files (*)")
-        if not path:
-            return
-        from orix import io
-
-        st = self.settings()
-        xmap = io.load(path)
-        s = self.prepared["signal"]
-        nav_shape = tuple(s.axes_manager.navigation_shape[::-1])
-        if tuple(xmap.shape) != nav_shape:
-            QMessageBox.critical(self, "HROSM", f"The map is {tuple(xmap.shape)} but the prepared patterns are {nav_shape}")
-            return
-        xmap_indexed = sph_core.apply_twist(xmap, -st.TWIST)  # the saved map carries TWIST; HROSM needs the orientations as indexed
-        self.last_run = dict(label=f"map {Path(path).name}", signal=s, xmap=xmap, xmap_indexed=xmap_indexed, det=self.det, seconds=np.nan, offset=(0, 0))
-        self.hrosm_source.setText(f"Map to re-index: {path} ({xmap.size} points)")
-        self.log(f"Loaded {path} for HROSM (TWIST {st.TWIST} deg removed for the re-indexing)")
-
-    def run_hrosm(self):
-        if self.last_run is None:
-            QMessageBox.information(self, "HROSM", "Index a test region or the full map in tab 2 first, or load an indexed map")
-            return
-        st = self.settings()
-        run = self.last_run
-        demo = getattr(self, "demo", False)
-
-        def work(log):
-            mp = sph_core.load_master_pattern(st, log, demo=demo)
-            xmap_hrosm, xmap_hrosm_indexed, dt, messages = sph_core.run_hrosm(run["signal"], run["xmap_indexed"], mp, run["det"], st, log)
-            grain_id = np.nan_to_num(sph_core.map_data(xmap_hrosm, "grain_id"), nan=0).astype(int)
-            grod_hrosm = sph_core.grod_of(xmap_hrosm_indexed, grain_id) if xmap_hrosm.ndim == 2 else None
-            return dict(xmap=xmap_hrosm, xmap_indexed=xmap_hrosm_indexed, label=run["label"], seconds=dt, grain_id=grain_id, grod_hrosm=grod_hrosm)
-
-        def done(res):
-            self.last_hrosm = res
-            xmap = res["xmap"]
-            if xmap.ndim != 2:
-                return
-            cmap = "viridis"
-            osm = sph_core.map_data(xmap, "osm")
-            panels = [
-                ("KAM [deg]", sph_core.map_data(xmap, "kam"), dict(vmin=0, vmax=2, cmap=cmap), "deg"),
-                ("Grains (black: none)", res["grain_id"], dict(cmap=_grain_cmap(res["grain_id"]), interpolation="nearest"), None),
-                ("GROD, spherical indexing [deg]", sph_core.map_data(xmap, "grod"), dict(vmin=0, vmax=st.HROSM_MAX_ANGLE, cmap=cmap), "deg"),
-                (f"HROSM (of {st.HROSM_N_OSM}; grey: not re-indexed)", np.ma.masked_invalid(osm), dict(vmin=0, vmax=st.HROSM_N_OSM, cmap=cmap), "OSM"),
-                ("GROD, re-indexed [deg]", np.ma.masked_invalid(res["grod_hrosm"]), dict(vmin=0, cmap=cmap), "deg"),
-                ("IPF-Z, re-indexed", sph_core.ipf_rgb_map(xmap, "z"), {}, None),
-            ]
-            self.hmaps.show_panels(panels, f"HROSM of the {res['label']}: {res['seconds'] / 60:.1f} min")
-
-        self._start(work, done)
-
-    def save_hrosm(self):
-        if self.last_hrosm is None:
-            QMessageBox.information(self, "Save", "No HROSM result yet")
-            return
-        st = self.settings()
-        out_dir, stem = sph_core.output_location(st, self.prepared.get("source_file") if self.prepared else None)
-        if self.last_hrosm["label"] == "test region":
-            stem += "_test"
-        stem += f"_hrosm_n{st.HROSM_N_STEPS}"
-        try:
-            xmap_out = sph_core.hrosm_output_map(self.last_hrosm["xmap"], self.last_run["xmap_indexed"])
-            sph_core.save_xmap(xmap_out, out_dir, stem, st.SAVE_ANG, st.SAVE_H5, iq_prop="iq", ci_prop="best_score", log=self.log)
-        except Exception as e:  # noqa: BLE001
-            self.log(f"{type(e).__name__}: {e}")
-            QMessageBox.critical(self, "Save", f"{type(e).__name__}: {e}")
 
     def closeEvent(self, event):
         if self.worker is not None and self.worker.isRunning():

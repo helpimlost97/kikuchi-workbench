@@ -1,4 +1,4 @@
-"""Spherical indexing and HROSM without a notebook: the functions behind kikuchi_workbench.py.
+"""Spherical indexing without a notebook: the functions behind kikuchi_workbench.py.
 
 Everything here mirrors the cells of spherical_indexing_template.ipynb (built by build_notebook.py) so that
 the GUI and the notebook do the same thing with the same settings names. Nothing in here imports Qt, so the
@@ -12,6 +12,8 @@ module can be used from a script too::
     det = sph_core.make_detector(st, s, harmonics)
     xmap, xmap_indexed, dt = sph_core.index(s, harmonics, det, st)
     sph_core.save_xmap(xmap, "results", "scan_sph_bw68")
+
+:func:`index_blocks` gives the same map band by band with progress events, for a GUI.
 
 Settings names are those of the notebook's settings cells, so a notebook preset file (NAME = value lines) can
 be read with :func:`read_preset` and written with :func:`write_preset`.
@@ -27,6 +29,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 import numpy as np
+from dask.callbacks import Callback
 
 Log = Callable[[str], None]
 
@@ -81,18 +84,6 @@ class Settings:
     NORMALIZE: bool = True
     CHUNKSIZE: int | None = None
     TEST_SIZE: int = 50
-    # HROSM
-    HROSM_MASTER_FILE: str | None = None
-    HROSM_ENERGY: float | None = None
-    HROSM_THRESHOLD: float = 5.0
-    HROSM_MAX_ANGLE: float = 5.0
-    HROSM_N_STEPS: int = 10
-    HROSM_KEEP_N: int = 20
-    HROSM_N_OSM: int = 10
-    HROSM_AVERAGE: str = "mean"
-    HROSM_MIN_PIXELS: int = 10
-    HROSM_DILATE: bool = False
-    HROSM_ROI: tuple | None = None
     # output
     OUTPUT_DIR: str | None = None
     OUTPUT_NAME: str | None = None
@@ -254,6 +245,99 @@ def preprocess(s, st: Settings, log: Log = _print) -> None:
     if st.REMOVE_DYNAMIC_BACKGROUND:
         s.remove_dynamic_background()
         log("Dynamic background removed")
+
+
+_SLAB_BYTES = 64 * 1024**2
+
+
+class _Throttle:
+    """True from :meth:`ready` at most once per ``interval`` seconds."""
+
+    def __init__(self, interval: float = 0.2):
+        self.interval = float(interval)
+        self._last = -np.inf
+
+    def ready(self) -> bool:
+        now = time.monotonic()
+        if now - self._last >= self.interval:
+            self._last = now
+            return True
+        return False
+
+
+class _FractionCallback(Callback):
+    """Dask callback calling ``progress(fraction of tasks done)``, at most about 5 times a second."""
+
+    def __init__(self, progress: Callable[[float], None], interval: float = 0.2):
+        super().__init__()
+        self.progress = progress
+        self._throttle = _Throttle(interval)
+
+    def _posttask(self, key, result, dsk, state, worker_id):
+        n_done = len(state["finished"])
+        n_tasks = n_done + len(state["ready"]) + len(state["waiting"]) + len(state["running"])
+        if n_tasks and self._throttle.ready():
+            self.progress(n_done / n_tasks)
+
+
+def quasi_iq(s, progress: Callable[[float], None] | None = None) -> np.ndarray:
+    """A quick image quality map: the standard deviation of every raw pattern, float32 of the navigation
+    shape ((rows, cols), or (n,) for a line scan).
+
+    An in-RAM signal is done in slabs of about 64 MB of float32, a lazy one with dask in chunks of about that
+    size. ``progress(fraction_done)`` (0..1) is called now and then (at most about 5 times a second) when given.
+    """
+    nav_shape = tuple(s.axes_manager.navigation_shape[::-1])
+    sig_shape = tuple(s.axes_manager.signal_shape[::-1])
+    n = int(np.prod(nav_shape)) if nav_shape else 1
+    pattern_bytes_f32 = 4 * int(np.prod(sig_shape))
+    if getattr(s, "_lazy", False):
+        data = s.data
+        n_nav = data.ndim - 2
+        # Chunks of ~64 MB once cast to float32: the limit is for the stored data type
+        limit = max(1, int(_SLAB_BYTES * data.dtype.itemsize / 4))
+        chunks = {i: "auto" for i in range(n_nav)}
+        chunks.update({n_nav: -1, n_nav + 1: -1})
+        data = data.rechunk(chunks, block_size_limit=limit)
+        result = data.astype(np.float32).std(axis=(-2, -1))
+        if progress is None:
+            out = result.compute()
+        else:
+            with _FractionCallback(progress):
+                out = result.compute()
+            progress(1.0)
+        return np.asarray(out, dtype=np.float32).reshape(nav_shape)
+    data = np.asarray(s.data)
+    slab = max(1, _SLAB_BYTES // max(1, pattern_bytes_f32))
+    try:  # one flat list of patterns, if that needs no copy (it does for e.g. a column ROI)
+        data = data.reshape((n,) + sig_shape, copy=False)
+        slabs = [(slice(i0, min(n, i0 + slab)),) for i0 in range(0, n, slab)]
+    except (ValueError, TypeError):  # 2D map that is not contiguous: slabs within rows
+        n_cols = nav_shape[-1]
+        slabs = [(r, slice(c0, min(n_cols, c0 + slab))) for r in range(nav_shape[0]) for c0 in range(0, n_cols, slab)]
+    out = np.empty(nav_shape if data.ndim > 3 else (n,), dtype=np.float32)
+    throttle = _Throttle()
+    for k, idx in enumerate(slabs):
+        out[idx] = data[idx].astype(np.float32).std(axis=(-2, -1))
+        if progress is not None and (k == len(slabs) - 1 or throttle.ready()):
+            progress((k + 1) / len(slabs))
+    return out.reshape(nav_shape)
+
+
+def stretch(image: np.ndarray, lo_pct: float = 1.0, hi_pct: float = 99.0) -> np.ndarray:
+    """``image`` scaled to [0, 1] (float32) between the lo_pct and hi_pct percentiles of its finite values;
+    non-finite values become 0, as does all of a constant image."""
+    image = np.asarray(image, dtype=np.float64)
+    out = np.zeros(image.shape, dtype=np.float32)
+    finite = np.isfinite(image)
+    if not finite.any():
+        return out
+    lo, hi = np.percentile(image[finite], [float(lo_pct), float(hi_pct)])
+    if not hi > lo:
+        return out
+    scaled = np.clip((image - lo) / (hi - lo), 0.0, 1.0)
+    out[finite] = scaled[finite]
+    return out
 
 
 def preprocess_pattern_for_preview(pattern: np.ndarray, st: Settings) -> np.ndarray:
@@ -466,6 +550,299 @@ def index(s, harmonics: Sequence, det, st: Settings, log: Log = _print, navigati
     return xmap, xmap_indexed, dt
 
 
+# Dask task keys of kikuchipy.indexing._spherical._indexer, e.g. ("_index_chunk-<hash>", 0, 0, 0) from
+# map_blocks(_index_chunk) and ("refine_chunk-<hash>", 0, 0) from blockwise(_refine_chunk): blockwise strips the
+# leading underscore of the function name, map_blocks keeps it. Matched without leading underscores.
+_INDEX_TASK = "index_chunk"
+_REFINE_TASK = "refine_chunk"
+
+
+def _task_kind(key) -> str | None:
+    name = key[0] if isinstance(key, tuple) and key else key
+    if isinstance(name, str):
+        name = name.lstrip("_")
+        if name.startswith(_INDEX_TASK):
+            return "index"
+        if name.startswith(_REFINE_TASK):
+            return "refine"
+    return None
+
+
+class IndexingProgress(Callback):
+    """Progress of one ``spherical_indexing`` call, from its dask tasks::
+
+        with IndexingProgress(lambda fi, fr: print(f"search {fi:.0%}, refinement {fr:.0%}")):
+            xmap = s.spherical_indexing(...)
+
+    ``on_progress(frac_index, frac_refine)`` gets the fractions (0..1) of the coarse search tasks
+    (``_index_chunk``, the expensive stage) and of the refinement tasks (``_refine_chunk``) that are done. It
+    is called at most about 5 times a second, but always when the last task of a stage finishes. A stage
+    without tasks counts as done (1.0). NB: ``spherical_indexing`` refines inside ``_index_chunk`` (one
+    compute), so for it ``frac_index`` is the whole run and ``frac_refine`` stays 1.0; ``_refine_chunk``
+    tasks come from ``refine_orientation_spherical``. When a stage is computed again (e.g. the GPU retries
+    with a smaller batch after running out of memory) its count starts over.
+    """
+
+    def __init__(self, on_progress: Callable[[float, float], None], interval: float = 0.2):
+        super().__init__()
+        self.on_progress = on_progress
+        self.n_tasks = {"index": 0, "refine": 0}
+        self.n_done = {"index": 0, "refine": 0}
+        self._throttle = _Throttle(interval)
+
+    def _start_state(self, dsk, state):
+        counts = {"index": 0, "refine": 0}
+        for key in dsk:
+            kind = _task_kind(key)
+            if kind is not None:
+                counts[kind] += 1
+        for kind, n in counts.items():
+            if n:
+                self.n_tasks[kind] = n
+                self.n_done[kind] = 0
+
+    def fractions(self) -> tuple[float, float]:
+        out = []
+        for kind in ("index", "refine"):
+            n = self.n_tasks[kind]
+            out.append(min(1.0, self.n_done[kind] / n) if n else 1.0)
+        return out[0], out[1]
+
+    def _posttask(self, key, result, dsk, state, worker_id):
+        kind = _task_kind(key)
+        if kind is None:
+            return
+        self.n_done[kind] += 1
+        last = self.n_done[kind] >= self.n_tasks[kind]
+        if self._throttle.ready() or last:
+            self.on_progress(*self.fractions())
+
+
+def _navigation_steps(s) -> tuple[float, float]:
+    """(step_x, step_y) of a 2D map from the signal's navigation axes; 1.0 where missing."""
+    steps = []
+    for axis in list(s.axes_manager.navigation_axes)[:2]:
+        scale = getattr(axis, "scale", None)
+        steps.append(float(scale) if scale else 1.0)
+    steps += [1.0] * (2 - len(steps))
+    return steps[0], steps[1]
+
+
+def _scan_unit(s) -> str:
+    axes = s.axes_manager.navigation_axes
+    unit = str(axes[0].units) if axes else ""
+    return unit if unit and unit != "<undefined>" else "um"
+
+
+def _block_quaternions(xmap, in_data: np.ndarray) -> np.ndarray:
+    """The quaternions of the points in a crystal map's data, bit for bit as stored.
+
+    ``xmap.rotations`` makes a new Rotation, and orix normalizes every new Rotation: reading through it and
+    storing the result again changes the last bit of a few quaternions (1e-16), so the assembled map would not
+    be identical to one ``spherical_indexing`` call. The stored rotations of all points are read instead
+    (``CrystalMap._rotations``, all points of the grid in row-major order), with the public property as the
+    fallback should orix rename it.
+    """
+    stored = getattr(xmap, "_rotations", None)
+    if stored is not None and stored.shape[0] == in_data.size:
+        return np.asarray(stored.data)[in_data]
+    return np.asarray(xmap.rotations.data)
+
+
+def assemble_blocks(blocks: Sequence, nav_shape: tuple[int, int], step_size: tuple[float, float] = (1.0, 1.0),
+                    scan_unit: str = "um"):
+    """One crystal map on the full (rows, cols) grid from crystal maps of bands of whole rows.
+
+    ``blocks`` is a list of ``(r0, r1, xmap)``: map rows r0:r1 indexed as one crystal map of shape
+    (r1 - r0, cols), or ``None`` for a band that was skipped (all of it masked out). ``step_size`` is
+    (step_x, step_y). Points that are not in a block's data, and all points of skipped bands, are not in the
+    returned map's data (identity rotation, phase -1, NaN properties on the full grid).
+    """
+    from orix.crystal_map import CrystalMap, PhaseList, create_coordinate_arrays
+    from orix.quaternion import Rotation
+
+    n_rows, n_cols = (int(v) for v in nav_shape)
+    n_all = n_rows * n_cols
+    present = [(int(r0), int(r1), x) for r0, r1, x in blocks if x is not None]
+    if not present:
+        raise ValueError("No block was indexed")
+    first = present[0][2]
+    rot_tail = first.rotations.shape[1:]  # (n_best,) or ()
+    # Identity everywhere, then the blocks' quaternions set as they are: Rotation(array) would normalize them
+    # again and change the last bit of some, as spherical_indexing's own map does not
+    rot = Rotation.identity((n_all,) + rot_tail)
+    quat = rot.data  # a view: written in place
+    phase_id = np.full(n_all, -1, dtype=int)
+    in_data = np.zeros(n_all, dtype=bool)
+    prop = {}
+    for name in first.prop:
+        values = np.asarray(first.prop[name])
+        dtype = values.dtype if np.issubdtype(values.dtype, np.floating) else np.float64
+        prop[name] = np.full((n_all,) + values.shape[1:], np.nan, dtype=dtype)
+    phases = {}
+    for r0, r1, xmap in present:
+        block_in_data = np.asarray(xmap.is_in_data, dtype=bool).ravel()
+        if block_in_data.size != (r1 - r0) * n_cols:
+            raise ValueError(f"Block of rows {r0}:{r1} has {block_in_data.size} points, not {(r1 - r0) * n_cols}")
+        idx = np.arange(r0 * n_cols, r1 * n_cols)[block_in_data]
+        in_data[idx] = True
+        quat[idx] = _block_quaternions(xmap, block_in_data).reshape((idx.size,) + rot_tail + (4,))
+        phase_id[idx] = xmap.phase_id
+        for name, full in prop.items():
+            values = np.asarray(xmap.prop[name])
+            if full.ndim == 1:
+                full[idx] = values
+            else:
+                for j in range(full.shape[1]):
+                    full[idx, j] = values[:, j]
+        for i, phase in xmap.phases:
+            if i != -1 and i not in phases:
+                phases[i] = phase
+    phase_list = PhaseList({i: phases[i] for i in sorted(phases)}) if phases else first.phases
+    coords, _ = create_coordinate_arrays((n_rows, n_cols), (float(step_size[1]), float(step_size[0])))
+    return CrystalMap(
+        rotations=rot,
+        phase_id=phase_id,
+        x=coords["x"],
+        y=coords["y"],
+        phase_list=phase_list,
+        prop=prop,
+        scan_unit=scan_unit,
+        is_in_data=in_data,
+    )
+
+
+def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, navigation_mask=None,
+                 on_event: Callable[[str, dict], None] | None = None, target_seconds: float = 4.0,
+                 first_patterns: int | None = None, verbose: int = 0):
+    """Spherical indexing of a 2D map band by band (whole map rows, from the top), so that a GUI can show the
+    map growing; the result is that of one ``spherical_indexing`` call (every pattern is indexed on its own).
+
+    The first band has about ``first_patterns`` patterns (default max(columns, 300)), later bands about
+    ``target_seconds`` of work at the speed of the band before. ``navigation_mask`` is a boolean (rows, cols)
+    array, True = do not index. ``on_event(kind, info)`` is called with
+
+    * ``"block_start"``: r0, r1, c0, c1, n_patterns (to index), index, n_blocks_estimate
+    * ``"progress"``: frac_index, frac_refine (0..1, see :class:`IndexingProgress`), r0, r1, n_patterns
+    * ``"block_done"``: r0, r1, c0, c1, xmap (the band's crystal map as indexed, None for a band that is
+      masked out completely), seconds, patterns_per_second, done_patterns, total_patterns, elapsed,
+      eta_seconds
+
+    A line scan (one navigation axis) is indexed in one call (one block). Returns (crystal map as indexed on
+    the full grid, TWIST not applied; seconds; steady patterns/s, without the first band, which includes the
+    numba compilation on the CPU, when there are at least 3 bands).
+    """
+    import dask
+
+    dask.config.set(num_workers=int(st.N_WORKERS))
+    kwargs = index_kwargs(st)
+    if st.BACKEND == "gpu":
+        log(f"GPU batch size: {kwargs['chunksize']}")
+    harmonics_arg = harmonics[0] if len(harmonics) == 1 else list(harmonics)
+
+    def emit(kind: str, info: dict) -> None:
+        if on_event is not None:
+            on_event(kind, info)
+
+    nav_shape = tuple(int(v) for v in s.axes_manager.navigation_shape[::-1])
+    if navigation_mask is not None:
+        navigation_mask = np.asarray(navigation_mask, dtype=bool)
+        if navigation_mask.shape != nav_shape:
+            raise ValueError(f"navigation_mask has shape {navigation_mask.shape}, the map {nav_shape}")
+        if not navigation_mask.any():
+            navigation_mask = None
+    total_patterns = int(np.prod(nav_shape)) - (int(navigation_mask.sum()) if navigation_mask is not None else 0)
+    if kwargs.get("chunksize") is None:
+        # The fork sizes CPU chunks from the number of patterns of the call, and for a small band that gives a
+        # few big chunks which run far slower than the chunks it would use for the whole map (measured: 66
+        # against 91 patterns/s). Size the chunks once for the whole map and use that for every band.
+        try:
+            from kikuchipy.indexing._spherical._indexer import _batch_estimate, _n_workers
+
+            kwargs["chunksize"] = int(_batch_estimate(int(st.BANDWIDTH), _n_workers(), max(1, total_patterns)))
+        except Exception:  # noqa: BLE001  (a fork without these helpers: let every call choose)
+            pass
+
+    def run(signal, mask, r0, r1, n):
+        with IndexingProgress(
+            lambda fi, fr: emit("progress", {"frac_index": fi, "frac_refine": fr, "r0": r0, "r1": r1, "n_patterns": n})
+        ):
+            return signal.spherical_indexing(harmonics_arg, det, navigation_mask=mask, verbose=verbose, **kwargs)
+
+    free_gpu_memory()
+    t_start = time.perf_counter()
+    if len(nav_shape) != 2:
+        n = total_patterns
+        emit("block_start", {"r0": 0, "r1": 1, "c0": 0, "c1": nav_shape[0], "n_patterns": n, "index": 0,
+                             "n_blocks_estimate": 1})
+        t0 = time.perf_counter()
+        xmap = run(s, navigation_mask, 0, 1, n)
+        dt = time.perf_counter() - t0
+        pps = n / dt if dt > 0 else 0.0
+        emit("block_done", {"r0": 0, "r1": 1, "c0": 0, "c1": nav_shape[0], "xmap": xmap, "seconds": dt,
+                            "patterns_per_second": pps, "done_patterns": n, "total_patterns": total_patterns,
+                            "elapsed": time.perf_counter() - t_start, "eta_seconds": 0.0})
+        log(f"{n} patterns in {dt:.1f} s = {pps:.0f} patterns/s ({st.BACKEND}, bandwidth {st.BANDWIDTH})")
+        return xmap, dt, pps
+
+    n_rows, n_cols = nav_shape
+    if first_patterns is None:
+        first_patterns = max(n_cols, 300)
+    blocks = []
+    timings = []  # (patterns indexed, seconds) of every band that was indexed
+    done_patterns = 0
+    grid_rate = None  # best map points per second of a band so far, masked points included
+    r0 = 0
+    i = 0
+    while r0 < n_rows:
+        wanted = first_patterns if grid_rate is None else target_seconds * grid_rate
+        rows = int(min(n_rows - r0, max(1, round(wanted / n_cols))))
+        r1 = r0 + rows
+        estimate = i + 1 + int(np.ceil((n_rows - r1) / rows))
+        mask = navigation_mask[r0:r1] if navigation_mask is not None else None
+        n = rows * n_cols - (int(mask.sum()) if mask is not None else 0)
+        emit("block_start", {"r0": r0, "r1": r1, "c0": 0, "c1": n_cols, "n_patterns": n, "index": i,
+                             "n_blocks_estimate": estimate})
+        if n == 0:
+            xmap, dt = None, 0.0
+        else:
+            if mask is not None and not mask.any():
+                mask = None
+            t0 = time.perf_counter()
+            xmap = run(s.inav[:, r0:r1], mask, r0, r1, n)
+            dt = time.perf_counter() - t0
+            timings.append((n, dt))
+            if dt > 0:
+                # the best rate so far: a band slowed down by something else must not shrink the next one
+                grid_rate = max(grid_rate or 0.0, rows * n_cols / dt)
+        blocks.append((r0, r1, xmap))
+        done_patterns += n
+        steady = _steady_speed(timings)
+        remaining = total_patterns - done_patterns
+        emit("block_done", {"r0": r0, "r1": r1, "c0": 0, "c1": n_cols, "xmap": xmap, "seconds": dt,
+                            "patterns_per_second": n / dt if dt > 0 else 0.0, "done_patterns": done_patterns,
+                            "total_patterns": total_patterns, "elapsed": time.perf_counter() - t_start,
+                            "eta_seconds": remaining / steady if steady > 0 else 0.0})
+        r0 = r1
+        i += 1
+    total_seconds = sum(dt for _, dt in timings)
+    steady = _steady_speed(timings)
+    xmap = assemble_blocks(blocks, nav_shape, _navigation_steps(s), _scan_unit(s))
+    log(
+        f"{total_patterns} patterns in {len(blocks)} bands, {total_seconds:.1f} s; {steady:.0f} patterns/s "
+        f"({st.BACKEND}, bandwidth {st.BANDWIDTH})"
+    )
+    return xmap, total_seconds, steady
+
+
+def _steady_speed(timings: Sequence[tuple[int, float]]) -> float:
+    """Patterns per second over all bands but the first (numba compilation) when there are 3 or more."""
+    use = timings[1:] if len(timings) >= 3 else timings
+    n = sum(n for n, _ in use)
+    dt = sum(dt for _, dt in use)
+    return n / dt if dt > 0 else 0.0
+
+
 def ipf_rgb(xmap, direction="z") -> np.ndarray:
     """IPF colours (n, 3) of a crystal map for the sample direction "x", "y" or "z"."""
     from orix import plot
@@ -554,116 +931,3 @@ def compare_with_reference(xmap_indexed, reference_file: str | Path, roi=None, f
     ids = [i for i in xmap_indexed.phases_in_data.ids if i != -1]
     pg = xmap_indexed.phases[ids[0]].point_group
     return Orientation(xmap_indexed.rotations, pg).angle_with(Orientation(rot_ref.flatten(), pg), degrees=True)
-
-
-# ----------------------------------------------------------------------------------------------
-# HROSM
-# ----------------------------------------------------------------------------------------------
-
-
-def load_master_pattern(st: Settings, log: Log = _print, demo: bool = False):
-    """The EMsoft master pattern (Lambert, both hemispheres) that HROSM simulates patterns from."""
-    import kikuchipy as kp
-
-    if demo or st.HROSM_MASTER_FILE is None:
-        if not demo:
-            raise ValueError("HROSM_MASTER_FILE is not set (an EMsoft master pattern .h5; .sht files cannot be used)")
-        return kp.data.nickel_ebsd_master_pattern_small(projection="lambert", hemisphere="both")
-    kwargs = {"projection": "lambert", "hemisphere": "both"}
-    if st.HROSM_ENERGY is not None:
-        kwargs["energy"] = st.HROSM_ENERGY
-    log(f"Loading master pattern {Path(st.HROSM_MASTER_FILE).name}")
-    return kp.load(st.HROSM_MASTER_FILE, **kwargs)
-
-
-def run_hrosm(s, xmap_indexed, mp, det, st: Settings, log: Log = _print):
-    """EBSD.hrosm() on the map as indexed (without TWIST); returns (xmap with TWIST, xmap as re-indexed, seconds, warnings)."""
-    import warnings
-
-    import dask
-    import kikuchipy as kp
-
-    dask.config.set(num_workers=int(st.N_WORKERS))
-    ids = [i for i in xmap_indexed.phases_in_data.ids if i != -1]
-    if len(ids) > 1 and mp.phase.name not in [xmap_indexed.phases[i].name for i in ids]:
-        raise ValueError(
-            f"The map has the phases {[xmap_indexed.phases[i].name for i in ids]}; the master pattern's phase "
-            f"{mp.phase.name!r} must be one of them"
-        )
-    if mp.phase.point_group != xmap_indexed.phases[ids[0]].point_group:
-        log(
-            f"NB! Point group of the master pattern ({mp.phase.point_group.name}) and of the map "
-            f"({xmap_indexed.phases[ids[0]].point_group.name}) differ"
-        )
-    nav_shape = s.axes_manager.navigation_shape[::-1]
-    nav_mask = None
-    if st.HROSM_ROI is not None:
-        c0, c1, r0, r1 = st.HROSM_ROI
-        nav_mask = np.ones(nav_shape, dtype=bool)
-        nav_mask[r0:r1, c0:c1] = False
-    signal_mask = ~kp.filters.Window("circular", det.shape).astype(bool) if st.CIRCULAR_MASK else None
-    log(
-        f"HROSM: ball of {(2 * st.HROSM_N_STEPS + 1) ** 3} orientations within {st.HROSM_MAX_ANGLE} deg "
-        f"(mean spacing {kp.indexing.misorientation_ball_spacing(st.HROSM_MAX_ANGLE, st.HROSM_N_STEPS):.3f} deg)"
-    )
-    t0 = time.perf_counter()
-    with warnings.catch_warnings(record=True) as record:
-        warnings.simplefilter("always")
-        xmap_hrosm_indexed = s.hrosm(
-            xmap_indexed,
-            mp,
-            det,
-            energy=st.HROSM_ENERGY,
-            threshold=float(st.HROSM_THRESHOLD),
-            max_angle=float(st.HROSM_MAX_ANGLE),
-            n_steps=int(st.HROSM_N_STEPS),
-            keep_n=int(st.HROSM_KEEP_N),
-            n_osm=int(st.HROSM_N_OSM),
-            average=st.HROSM_AVERAGE,
-            min_pixels=int(st.HROSM_MIN_PIXELS),
-            dilate=bool(st.HROSM_DILATE),
-            signal_mask=signal_mask,
-            navigation_mask=nav_mask,
-        )
-    dt = time.perf_counter() - t0
-    messages = [str(w.message) for w in record if issubclass(w.category, UserWarning)]
-    for m in messages:
-        log("NB! " + m)
-    xmap_hrosm = apply_twist(xmap_hrosm_indexed, st.TWIST)
-    reindexed = np.asarray(xmap_hrosm.prop["reindexed"]).astype(bool)
-    n_grains = np.unique(np.asarray(xmap_hrosm.prop["grain_id"])[reindexed]).size
-    log(f"HROSM: {int(reindexed.sum())} of {reindexed.size} points re-indexed in {n_grains} grains, {dt / 60:.1f} min")
-    if reindexed.any():
-        osm = np.asarray(xmap_hrosm.prop["osm"])[reindexed]
-        log(f"Median OSM of the re-indexed points: {np.nanmedian(osm):.1f} of {st.HROSM_N_OSM}")
-    return xmap_hrosm, xmap_hrosm_indexed, dt, messages
-
-
-def hrosm_output_map(xmap_hrosm, xmap_indexed):
-    """The HROSM map with the spherical indexing score and IQ carried over, ready to save."""
-    from orix.crystal_map import CrystalMap
-
-    prop = {k: np.asarray(v) for k, v in xmap_hrosm.prop.items() if k != "simulation_indices"}
-    prop["scores_sph"] = np.asarray(xmap_indexed.prop["scores"])
-    prop["iq"] = np.asarray(xmap_indexed.prop["iq"])
-    reindexed = prop["reindexed"].astype(bool)
-    scores = prop["scores"]
-    best = scores[:, 0] if scores.ndim == 2 else scores
-    prop["best_score"] = np.where(reindexed, np.nan_to_num(best), prop["scores_sph"])
-    return CrystalMap(
-        rotations=xmap_hrosm.rotations,
-        phase_id=xmap_hrosm.phase_id,
-        phase_list=xmap_hrosm.phases,
-        prop=prop,
-        scan_unit=xmap_hrosm.scan_unit,
-        x=xmap_hrosm.x,
-        y=xmap_hrosm.y,
-    )
-
-
-def grod_of(xmap, grain_id: np.ndarray) -> np.ndarray:
-    """GROD map of a crystal map about the mean orientations of the given grains."""
-    import kikuchipy as kp
-
-    grains = kp.indexing.average_grain_orientations(xmap, grain_id)
-    return np.asarray(kp.indexing.grain_reference_orientation_deviation_map(xmap, grain_id, grains), dtype=float)
