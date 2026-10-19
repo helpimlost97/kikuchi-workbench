@@ -372,6 +372,10 @@ and the indexing of this folder into one PyQt5 window with two tabs:
 
 Workflow in the indexing tab:
 
+- **One data set at a time**: loading a file in either tab unloads the other tab's data set
+  (the processor's scan and NLPAR result, or the indexer's patterns, map and last result), so two
+  scans never sit in memory together. After `Apply && Save`, loading the processed file in the
+  indexing tab therefore empties the processor tab; the saved file and its IQ exclusion are kept.
 - **Pattern source**: always a file. **Load processed patterns** is greyed out until the
   processor's `Apply && Save` has written a file; it then puts that file into the pattern file box
   and loads it, and the patterns the processor excluded by its IQ range are not indexed (grey in

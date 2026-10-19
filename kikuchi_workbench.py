@@ -28,6 +28,7 @@ import argparse
 import ast
 import collections
 import dataclasses
+import gc
 import inspect
 import os
 import sys
@@ -533,6 +534,18 @@ class Workbench(QMainWindow):
         self.proc.apply_save_btn.clicked.disconnect()
         self.proc.apply_save_btn.clicked.connect(apply_and_save_then_register)
 
+        # Only one data set in memory at a time: loading into the processor drops the indexer's patterns
+        original_load_path = self.proc.load_path
+
+        def load_path_exclusive(path):
+            if self.worker is not None and self.worker.isRunning():
+                QMessageBox.information(self, "Busy", "Wait for the indexing tab's running step to finish before loading")
+                return
+            self.unload_indexing("a file is being loaded in the pattern processor")
+            original_load_path(path)
+
+        self.proc.load_path = load_path_exclusive
+
     def _processor_saved(self, path):
         self.processed_file = path
         mask = self.proc._get_iq_mask()
@@ -822,13 +835,39 @@ class Workbench(QMainWindow):
         # after loading must not throw the loaded data set (and the live map) away.
         return ("file", st.PATTERN_FILE, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI, st.FLIP_PATTERNS_UD)
 
+    def unload_indexing(self, why: str = ""):
+        """Drop the indexer's loaded patterns and everything derived from them (prepared signal, last run)."""
+        had = self.loaded is not None or self.prepared is not None
+        self.loaded = None
+        self.prepared = None
+        self.last_run = None
+        self._preview_rc = None
+        self.live.set_base_map(None, "")
+        self.maps.clear()
+        gc.collect()
+        if had:
+            self.log("Indexing tab: patterns unloaded" + (f" ({why})" if why else ""))
+
+    def _unload_processor(self) -> bool:
+        """Drop the processor's data set before the indexer loads one; False if the processor is busy."""
+        if self.proc is None or self.proc.f_orig is None:
+            return True
+        if not self.proc.unload():
+            QMessageBox.information(self, "Processor busy", "Wait for the NLPAR step in the pattern processor to finish before loading")
+            return False
+        self.log("Pattern processor: data set unloaded (a file is being loaded in the indexing tab)")
+        return True
+
     def load_patterns_clicked(self):
-        """Load the pattern file (or take the processor's data set), compute and show the quasi-IQ map."""
+        """Load the pattern file, compute and show the quasi-IQ map. The processor's data set is unloaded first."""
         st = self.settings()
         key = self._load_key(st)
         if self.loaded is not None and self.loaded["key"] == key:
             self._show_loaded()
             return
+        if not self._unload_processor():
+            return
+        self.unload_indexing()
 
         def work(log, emit):
             s, scan = sph_core.load_patterns(st, log=log)
