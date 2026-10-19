@@ -5,6 +5,10 @@
 !kikuchipy_local_patches.patch
 !build_notebook.py
 !update_fork.py
+!make_montage_sample.py
+!STITCH_DATASET_NOTES.md
+!example_data/
+!example_data/**
 !sph_core.py
 !kikuchi_workbench.py
 !live_view.py
