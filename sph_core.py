@@ -24,6 +24,7 @@ import ast
 import dataclasses
 import re
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
@@ -806,11 +807,31 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
         except Exception:  # noqa: BLE001  (a fork without these helpers: let every call choose)
             pass
 
+    # The fork warns once per spherical_indexing call (e.g. "estimated to need x GiB of memory, which is more
+    # than 2 GiB"), which with one call per band would repeat the same line every few seconds. Each distinct
+    # warning is logged the first time only; the repeats are counted and reported at the end.
+    seen_warnings: dict[str, list] = {}  # digit-free key -> [first text, count]
+
     def run(signal, mask, r0, r1, n):
-        with IndexingProgress(
-            lambda fi, fr: emit("progress", {"frac_index": fi, "frac_refine": fr, "r0": r0, "r1": r1, "n_patterns": n})
-        ):
-            return signal.spherical_indexing(harmonics_arg, det, navigation_mask=mask, verbose=verbose, **kwargs)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with IndexingProgress(
+                lambda fi, fr: emit("progress", {"frac_index": fi, "frac_refine": fr, "r0": r0, "r1": r1, "n_patterns": n})
+            ):
+                xmap_band = signal.spherical_indexing(harmonics_arg, det, navigation_mask=mask, verbose=verbose, **kwargs)
+        for w in caught:
+            text = str(w.message)
+            key = re.sub(r"[\d.]+", "#", text)
+            if key not in seen_warnings:
+                log(f"Warning: {text}")
+                seen_warnings[key] = [text, 0]
+            seen_warnings[key][1] += 1
+        return xmap_band
+
+    def report_repeated_warnings():
+        for text, count in seen_warnings.values():
+            if count > 1:
+                log(f"(the warning '{text[:60]}...' was raised by {count} bands; shown once)")
 
     free_gpu_memory()
     t_start = time.perf_counter()
@@ -870,6 +891,7 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
         i += 1
     total_seconds = sum(dt for _, dt in timings)
     steady = _steady_speed(timings)
+    report_repeated_warnings()
     xmap = assemble_blocks(blocks, nav_shape, _navigation_steps(s), _scan_unit(s))
     log(
         f"{total_patterns} patterns in {len(blocks)} bands, {total_seconds:.1f} s; {steady:.0f} patterns/s "

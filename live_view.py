@@ -160,8 +160,8 @@ class LiveView(QWidget):
             self._outline = Rectangle((0, 0), 1, 1, fill=False, edgecolor="#ff8c00", linewidth=1.2,
                                       visible=False)
             self.ax_map.add_patch(self._outline)
-            (self._marker,) = self.ax_map.plot([0], [0], "o", ms=7, mfc="none", mec="#00e5ff", mew=1.6,
-                                               visible=False)
+            # the same red cross as the pattern processor's scan map
+            (self._marker,) = self.ax_map.plot([0], [0], "r+", markersize=15, markeredgewidth=2, visible=False)
             if title:
                 self.ax_map.set_title(title, fontsize=10)
             if self._run_rect is not None:
@@ -527,7 +527,7 @@ class LiveView(QWidget):
             self.show_pattern(pattern, row, col)
         except Exception:
             return
-        self.set_marker(row, col)
+        # no marker during a run: the patterns swept past are indicated by the band outline only
 
     # ------------------------------------------------------------------------------------------
     # Internals: status
