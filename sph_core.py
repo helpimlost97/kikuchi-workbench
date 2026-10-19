@@ -340,6 +340,48 @@ def stretch(image: np.ndarray, lo_pct: float = 1.0, hi_pct: float = 99.0) -> np.
     return out
 
 
+def sample_mean_pattern(s, max_patterns: int = 5000) -> np.ndarray:
+    """The static background the indexing would use: the one stored with the file, else the mean of up to
+    ``max_patterns`` patterns spread over the map (float32, signal shape). Same rule as :func:`preprocess`."""
+    if getattr(s, "static_background", None) is not None:
+        return np.asarray(s.static_background, dtype=np.float32)
+    sig_shape = tuple(s.axes_manager.signal_shape[::-1])
+    n = int(np.prod(s.axes_manager.navigation_shape))
+    step = max(1, n // max_patterns)
+    flat = s.data.reshape((-1,) + sig_shape)[::step]
+    return np.asarray(flat.astype(np.float32).mean(axis=0), dtype=np.float32)
+
+
+def preview_pattern(pattern: np.ndarray, st: Settings, static_bg: np.ndarray | None = None,
+                    apply_background: bool = True) -> np.ndarray:
+    """One pattern as the indexer will see it, for the live view: kikuchipy's static background removal
+    (subtract, then the per-pattern rescale to the data type range, as ``remove_static_background`` does),
+    kikuchipy's dynamic background removal, then the indexer's own preprocessing (Gaussian background,
+    adaptive histogram equalization with N_REGIONS tiles). ``apply_background=False`` skips the two
+    background steps, for a pattern that was already corrected (a prepared signal during a run)."""
+    import kikuchipy as kp
+
+    p = np.asarray(pattern)
+    if apply_background and (st.REMOVE_STATIC_BACKGROUND or st.REMOVE_DYNAMIC_BACKGROUND):
+        dtype = p.dtype if np.issubdtype(p.dtype, np.integer) else np.dtype(np.uint8)
+        omin, omax = 0, int(np.iinfo(dtype).max)
+        if st.REMOVE_STATIC_BACKGROUND and static_bg is not None:
+            # the signal-level path stores the background in the data type of the patterns (preprocess does
+            # ``s.static_background = bg.astype(s.data.dtype)``), so the same truncation is applied here
+            bg = np.asarray(static_bg).astype(dtype).astype(np.float32)
+            q = p.astype(np.float32) - bg
+            imin, imax = float(q.min()), float(q.max())
+            if imax > imin:
+                q = (q - imin) / (imax - imin) * (omax - omin) + omin
+            p = q.astype(dtype)
+        if st.REMOVE_DYNAMIC_BACKGROUND:
+            # float input, integer output: the signal-level call does the same and the result matches it exactly
+            p = kp.pattern.remove_dynamic_background(p.astype(np.float32), operation="subtract", filter_domain="frequency", dtype_out=dtype)
+    if st.N_REGIONS or st.GAUSSIAN_BACKGROUND:
+        p = preprocess_pattern_for_preview(p, st)
+    return np.asarray(p, dtype=np.float32)
+
+
 def preprocess_pattern_for_preview(pattern: np.ndarray, st: Settings) -> np.ndarray:
     """One pattern as the indexer sees it (adaptive histogram equalization, Gaussian background)."""
     from kikuchipy.indexing._spherical._preprocessing import _preprocess_pattern

@@ -26,7 +26,7 @@ import math
 import time
 
 import numpy as np
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import pyqtSignal, QTimer
 from PyQt5.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -53,6 +53,8 @@ def _fmt_time(seconds) -> str:
 
 class LiveView(QWidget):
     """Map being indexed (left), current pattern (right), status line (bottom). GUI thread only."""
+    point_clicked = pyqtSignal(int, int)  # (row, col) of a left click on the map while idle
+
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -120,6 +122,7 @@ class LiveView(QWidget):
         self._sweep_timer.setInterval(_SWEEP_MS)
         self._sweep_timer.timeout.connect(self._on_sweep_tick)
         self.canvas.mpl_connect("resize_event", self._on_resize)
+        self.canvas.mpl_connect("button_press_event", self._on_click)
 
     # ------------------------------------------------------------------------------------------
     # Base map
@@ -446,6 +449,17 @@ class LiveView(QWidget):
         self._stride = s
         self._rebuild_display()
         return True
+
+    def _on_click(self, event):
+        """A left click on the map while no run is active emits point_clicked(row, col)."""
+        if self._running or self._map_artist is None or event.inaxes is not self.ax_map or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        h, w = self.image.shape[:2]
+        row, col = int(round(event.ydata)), int(round(event.xdata))
+        if 0 <= row < h and 0 <= col < w:
+            self.point_clicked.emit(row, col)
 
     def _on_resize(self, _event=None):
         if self._map_artist is not None and self._update_stride():

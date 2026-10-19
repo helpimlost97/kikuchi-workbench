@@ -388,6 +388,11 @@ Workflow in the indexing tab:
   always 1 here (it only scales that pixel size). Static and
   dynamic background removal are off by default (the processor already did them) and the circular
   mask is on.
+- **Click anywhere on the map** (before indexing) to see that pattern on the right exactly as the
+  indexer will see it: raw when nothing is ticked, otherwise with the static and dynamic background
+  removal, the Gaussian background and the adaptive histogram equalization (`N_REGIONS`) that are
+  ticked. Changing one of those boxes refreshes the shown pattern. During a run the same panel
+  cycles through the band being indexed, with the same processing applied.
 - **Check geometry** shows one pattern on the sphere; **Index test region** and **Index full map**
   index with the live view on by default: the map is indexed band by band (bands of whole rows
   sized to about 8 s each; identical results to one call, at a few per cent of extra time for the

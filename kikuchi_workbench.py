@@ -589,8 +589,8 @@ class Workbench(QMainWindow):
         form.add_bool("FLIP_PATTERNS_UD", "Flip patterns upside down", "Try this when the test maps look like noise")
 
         form.group("Pattern processing (off for a file the processor already processed)")
-        form.add_bool("REMOVE_STATIC_BACKGROUND", "Remove static background", "The background stored with the file, or else the mean pattern. Off by default: patterns from the processor are already corrected", False)
-        form.add_bool("REMOVE_DYNAMIC_BACKGROUND", "Remove dynamic background", "Off by default: patterns from the processor are already corrected", False)
+        self.w_static = form.add_bool("REMOVE_STATIC_BACKGROUND", "Remove static background", "The background stored with the file, or else the mean pattern. Off by default: patterns from the processor are already corrected", False)
+        self.w_dynamic = form.add_bool("REMOVE_DYNAMIC_BACKGROUND", "Remove dynamic background", "Off by default: patterns from the processor are already corrected", False)
         note = QLabel("NLPAR: use the pattern processor tab (pyebsdindex)")
         note.setStyleSheet("color: gray")
         form.add_widget(note)
@@ -619,9 +619,9 @@ class Workbench(QMainWindow):
         form.add_combo("BACKEND", "Backend:", ["gpu", "cpu"], "gpu")
         form.add_int("N_WORKERS", "Dask workers:", max(1, (os.cpu_count() or 8) // 2), 1, 256, "About the number of performance cores")
         form.add_bool("REFINE", "Newton refinement", "", True)
-        form.add_int("N_REGIONS", "AHE tiles (n_regions):", 10, 0, 64, "Adaptive histogram equalization tiles per axis; 0 = off")
+        self.w_regions = form.add_int("N_REGIONS", "AHE tiles (n_regions):", 10, 0, 64, "Adaptive histogram equalization tiles per axis; 0 = off")
         form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector", True)
-        form.add_bool("GAUSSIAN_BACKGROUND", "Gaussian background", "Fit and subtract a 2D Gaussian background (EMSphInx gausbckg)")
+        self.w_gaussian = form.add_bool("GAUSSIAN_BACKGROUND", "Gaussian background", "Fit and subtract a 2D Gaussian background (EMSphInx gausbckg)")
         form.add_bool("NORMALIZE", "Normalized cross-correlation", "", True)
         form.add_text("CHUNKSIZE", "Chunk / GPU batch size:", tip="Patterns per chunk; blank = automatic from free VRAM", placeholder="None = automatic")
         form.add_int("TEST_SIZE", "Test region side:", 50, 1, 10000, "Side length in map points of the test region")
@@ -663,6 +663,11 @@ class Workbench(QMainWindow):
         self.view_tabs = QTabWidget()
         self.live = LiveView()
         self.live.set_pattern_source(self._live_pattern)
+        self.live.point_clicked.connect(self.preview_point)
+        self._preview_rc = None
+        for w in (self.w_static, self.w_dynamic, self.w_gaussian):
+            w.toggled.connect(lambda *_: self._refresh_preview())
+        self.w_regions.valueChanged.connect(lambda *_: self._refresh_preview())
         self.maps = MapCanvas()
         self.view_tabs.addTab(self.live, "Live")
         self.view_tabs.addTab(self.maps, "Results")
@@ -827,8 +832,9 @@ class Workbench(QMainWindow):
             s, scan = sph_core.load_patterns(st, log=log)
             t0 = time.perf_counter()
             iq = sph_core.quasi_iq(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
+            static_bg = sph_core.sample_mean_pattern(s)
             log(f"Quasi-IQ map (per-pattern standard deviation) in {time.perf_counter() - t0:.1f} s")
-            return {"key": key, "signal": s, "scan": scan, "iq": sph_core.stretch(iq), "source": "file",
+            return {"key": key, "signal": s, "scan": scan, "iq": sph_core.stretch(iq), "source": "file", "static_bg": static_bg,
                     "source_file": st.PATTERN_FILE, "nav_shape": tuple(s.axes_manager.navigation_shape[::-1])}
 
         def done(loaded):
@@ -840,6 +846,35 @@ class Workbench(QMainWindow):
 
         self._start(work, done)
 
+    def preview_point(self, row, col):
+        """Show the pattern at (row, col) of the loaded file as the indexer will see it: the background
+        removals and the equalization that are ticked, nothing else (the raw pattern when none is)."""
+        loaded = self.loaded
+        if loaded is None or loaded.get("signal") is None or self.live_run is not None:
+            return
+        s = loaded["signal"]
+        nav_shape = tuple(s.axes_manager.navigation_shape[::-1])
+        if len(nav_shape) != 2 or not (0 <= row < nav_shape[0] and 0 <= col < nav_shape[1]):
+            return
+        st = self.settings()
+        try:
+            raw = np.asarray(s.data[int(row), int(col)])
+            shown = sph_core.preview_pattern(raw, st, loaded.get("static_bg"), apply_background=True)
+        except Exception as e:  # noqa: BLE001
+            self.log(f"Pattern preview failed: {type(e).__name__}: {e}")
+            return
+        self._preview_rc = (int(row), int(col))
+        self.live.show_pattern(shown, int(row), int(col))
+        self.live.set_marker(int(row), int(col))
+        steps = [name for name, on in (("static background", st.REMOVE_STATIC_BACKGROUND), ("dynamic background", st.REMOVE_DYNAMIC_BACKGROUND),
+                                       ("Gaussian background", st.GAUSSIAN_BACKGROUND), (f"AHE {st.N_REGIONS} x {st.N_REGIONS}", bool(st.N_REGIONS)))
+                 if on]
+        self.set_progress(f"Pattern ({row}, {col}): " + (", ".join(steps) if steps else "raw, no processing"))
+
+    def _refresh_preview(self):
+        if self._preview_rc is not None and self.live_run is None:
+            self.preview_point(*self._preview_rc)
+
     def _show_loaded(self):
         if self.loaded is None:
             return
@@ -850,6 +885,8 @@ class Workbench(QMainWindow):
         else:
             self.live.set_base_map(None, f"{name}: 1D map, no live view")
         self.view_tabs.setCurrentWidget(self.live)
+        if iq.ndim == 2 and self.loaded.get("signal") is not None:
+            self.preview_point(iq.shape[0] // 2, iq.shape[1] // 2)
 
     # ---------------------------------------------------------------- preparing patterns, master, detector
     def _prepare_key(self, st: Settings):
@@ -979,7 +1016,7 @@ class Workbench(QMainWindow):
             n_run = int(np.prod(nav_shape))
             log(f"Indexing the {label}: {n_run} patterns, bandwidth {st.BANDWIDTH}, {st.BACKEND}")
             emit("run_start", {"r0": offset[0], "c0": offset[1], "rows": nav_shape[0], "cols": nav_shape[-1] if len(nav_shape) == 2 else 1,
-                               "n_patterns": n_run, "signal": s_run, "label": label})
+                               "n_patterns": n_run, "signal": s_run, "label": label, "st": st})
             if live and len(nav_shape) == 2:
                 def on_event(name, data):
                     if name == "block_done":
@@ -1022,12 +1059,13 @@ class Workbench(QMainWindow):
         if run is None:
             return None
         s = run["signal"]
-        data = s.data[int(row) - run["r0"], int(col) - run["c0"]]
-        return np.asarray(data)
+        data = np.asarray(s.data[int(row) - run["r0"], int(col) - run["c0"]])
+        # the prepared signal already carries the background removals; only the indexer's own steps remain
+        return sph_core.preview_pattern(data, run["st"], None, apply_background=False)
 
     def on_run_event(self, name, data):
         if name == "run_start":
-            self.live_run = {"signal": data["signal"], "r0": data["r0"], "c0": data["c0"], "n_patterns": data["n_patterns"],
+            self.live_run = {"signal": data["signal"], "st": data["st"], "r0": data["r0"], "c0": data["c0"], "n_patterns": data["n_patterns"],
                              "done": 0, "t0": time.perf_counter(), "window": collections.deque(), "block": None}
             self.live.begin_run(data["r0"], data["c0"], data["rows"], data["cols"], data["n_patterns"])
             self.view_tabs.setCurrentWidget(self.live)
