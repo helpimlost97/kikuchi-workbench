@@ -372,11 +372,11 @@ and the indexing of this folder into one PyQt5 window with two tabs:
 
 Workflow in the indexing tab:
 
-- **Pattern source**: a file (anything kikuchipy loads), or the processor tab. With the processor
-  source, the processor's processing chain (NLPAR result, background, stretch, CLAHE, IQ exclusion)
-  is run over the whole data set in RAM, exactly as `Apply && Save` would write it, and the result
-  is indexed without a file in between; patterns excluded by the processor's IQ range are not
-  indexed. A file written by `Apply && Save` is offered to the indexing tab automatically.
+- **Pattern source**: always a file. **Load processed patterns** is greyed out until the
+  processor's `Apply && Save` has written a file; it then puts that file into the pattern file box
+  and loads it, and the patterns the processor excluded by its IQ range are not indexed (grey in
+  the maps). The browse button takes any other file kikuchipy reads, e.g. a scan that was not
+  processed. Big files are memory mapped and read chunk by chunk, so RAM is not a concern.
 - **Load patterns (quasi-IQ map)**: runs by itself after browsing for a pattern file (and when the
   source is switched to the processor, whose IQ map is reused). It loads the patterns, computes a
   quasi image quality map (the standard deviation of every raw pattern, the processor's definition),
@@ -414,18 +414,14 @@ processor's packages: `pip install pyqt5 pyebsdindex scipy scikit-image` (and `p
 on the GPU). The processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...) apply
 inside the workbench too.
 
-Memory: the in-RAM route holds the processed data set once more in RAM (the file size, so 6.5 GB
-for a 479 px RKD scan of 28 000 patterns, on top of the processor's own copies); it refuses with
-a message when that does not fit, in which case use `Apply && Save` and the file source. With the
-file source and the background removals off, the loaded patterns are indexed as they are (no
-second copy); with a removal on, the file is read again and processed. Long steps run in a worker
-thread with their console output in the log pane; the processor's chain itself runs in the GUI
-thread with a progress line, as `Apply && Save` does.
+Memory: with the background removals off (the default), the loaded patterns are indexed as they
+are, memory mapped when the file is bigger than a quarter of RAM; with a removal on, the file is
+read again and processed. Long steps run in a worker thread with their console output in the log
+pane.
 
 Verified headlessly on the nickel demo data written as a `.up1` (no GPU in that environment, CPU
-backend): processor load, chain in RAM, quasi-IQ map, band-wise test region and full map with the
-live events, save, and the same map indexed from the file, which agreed with the processor route
-to a median of 0.03 deg (every point within 1 deg; the two background corrections differ). The
+backend): processor load and `Apply && Save`, `Load processed patterns` with the IQ exclusion
+carried over, quasi-IQ map, band-wise test region and full map with the live events, save. The
 band-wise result is checked to be identical to a single call.
 
 ---

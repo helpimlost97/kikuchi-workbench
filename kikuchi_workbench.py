@@ -12,11 +12,11 @@ Two tabs:
    https://github.com/helpimlost97/kikuchi-pattern-processor), imported from its own folder. Load a UP1/UP2,
    set the aperture, IQ range, NLPAR and the processing chain as usual. "Apply && Save" still writes a file; the
    saved file is then offered to the indexing tab automatically.
-2. **Spherical indexing**: the settings of spherical_indexing_template.ipynb as a form. The patterns come either
-   from a file (anything kikuchipy loads) or straight from the processor tab: the processor's processing chain
-   (NLPAR result, background, stretch, CLAHE, IQ exclusion) is run on the whole data set in RAM, exactly as
-   "Apply && Save" would write it, and the result is indexed without touching the disk. Check the geometry on one
-   pattern, index a test region, index the full map, save .ang/.h5. Load and save notebook presets.
+2. **Spherical indexing**: the settings of spherical_indexing_template.ipynb as a form. The patterns come from a
+   file (anything kikuchipy loads, memory-mapped when big): "Load processed patterns" takes the file the
+   processor's "Apply && Save" just wrote (patterns it excluded by the IQ range are not indexed), the browse
+   button any other file. Check the geometry on one pattern, index a test region, index the full map, save
+   .ang/.h5. Load and save notebook presets.
 
 Needs the environment of README.md (the kikuchipy fork, CuPy for the GPU) plus the pattern processor's packages
 (PyQt5, pyebsdindex, scipy, scikit-image). Without the processor folder the indexing tab still works
@@ -415,94 +415,6 @@ class SettingsForm(QWidget):
 # ----------------------------------------------------------------------------------------------
 
 
-def processor_dataset_key(proc) -> tuple | None:
-    """Identifies the processor's loaded data set and its processing state, to know when to re-run the chain."""
-    if proc is None or proc.f_orig is None:
-        return None
-    return (
-        proc.orig_path, id(proc.f_nlpar), id(proc.nlpar_patterns),
-        proc.static_bg_chk.isChecked(), proc.bg_mode.currentText(), proc.dyn_bg_chk.isChecked(),
-        proc.dyn_sigma.value(), proc.normalize_chk.isChecked(), proc.global_chk.isChecked(),
-        proc.bright.value(), proc.cont.value(), proc.clahe_chk.isChecked(), proc.clahe_clip.value(),
-        proc.npar_chk.isChecked(), proc.nlpar_chk.isChecked(), proc.aperture_mode.currentText(),
-        proc.iq_min_slider.value(), proc.iq_max_slider.value(),
-    )
-
-
-def processed_patterns_from_processor(proc, status) -> tuple[np.ndarray, np.ndarray, dict]:
-    """The processor's processing chain on its whole data set, as 'Apply && Save' would write it, in RAM.
-
-    Returns (patterns (n, ph, pw) in the file's dtype, IQ mask (rows, cols) with True = kept, info dict).
-    Runs in the GUI thread, since the chain reads the processor's controls and uses its GPU code; ``status``
-    is called with progress text and may pump the event loop.
-    """
-    if proc.f_orig is None:
-        raise ValueError("Load a UP1/UP2 file in the pattern processor tab first")
-    if proc.nlpar_chk.isChecked() and proc.f_nlpar is None:
-        raise ValueError("NLPAR preview is on but NLPAR has not been applied to the full data set: click "
-                         "'Apply NLPAR to Full Dataset' in the processor tab first (or untick 'Enable Preview')")
-    ph, pw = int(proc.f_orig.patternH), int(proc.f_orig.patternW)
-    dtype = np.dtype(proc.f_orig.filedatatype)
-    ncols, nrows = int(proc.ncols), int(proc.nrows)
-    n_out = int(getattr(proc, "n_actual_pats", nrows * ncols))
-    n_rows_out = (n_out + ncols - 1) // ncols
-    n_full_rows = int(getattr(proc, "n_actual_rows", nrows))
-    need = n_out * ph * pw * dtype.itemsize
-    avail = gpv.available_ram()
-    if need > 0.8 * avail:
-        raise MemoryError(
-            f"The processed data set needs {need / 1e9:.1f} GB of RAM but {avail / 1e9:.1f} GB are available: "
-            "use 'Apply && Save' in the processor tab and index the saved file instead (pattern source = file)"
-        )
-    src_fobj = proc.f_nlpar if proc.f_nlpar is not None else proc.f_orig
-    source = "NLPAR" if proc.f_nlpar is not None else ("NPAR" if proc.npar_chk.isChecked() else "original")
-    mask = proc._get_iq_mask()
-    mask_flat = mask.reshape(-1)
-    # chunk size: the processor's own rule for 'Apply && Save'
-    if gpv.HAS_GPU:
-        import cupy as cp
-
-        mem_per_row = 3 * ncols * ph * pw * 4
-        chunk_rows = max(2, int(cp.cuda.Device(0).mem_info[1] * 0.5) // mem_per_row)
-        chunk_rows = min(chunk_rows, nrows, proc._host_chunk_rows(33), proc._host_chunk_rows(18))
-    else:
-        chunk_rows = min(nrows, proc._host_chunk_rows(42))
-    chunk_rows = max(1, int(chunk_rows))
-    out = np.empty((n_out, ph, pw), dtype=dtype)
-    dtype_max = float(proc.dtype_max)
-    t0 = time.time()
-    for row_start in range(0, n_rows_out, chunk_rows):
-        rows = min(chunk_rows, n_rows_out - row_start)
-        p0 = row_start * ncols
-        p1 = min((row_start + rows) * ncols, n_out)
-        if p1 <= n_full_rows * ncols:
-            chunk = proc._read_rows(src_fobj, row_start, rows)
-        else:
-            parts = []
-            if p0 < n_full_rows * ncols:
-                parts.append(proc._read_rows(src_fobj, row_start, n_full_rows - row_start))
-            q0 = max(p0, n_full_rows * ncols)
-            parts.append(proc._read_patterns(proc.f_orig, q0, p1 - q0))
-            chunk = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
-        mask_rows = mask_flat[p0:p1]
-
-        def chunk_progress(done, n_in_chunk, _r0=row_start, _rows=rows):
-            frac = _r0 + _rows * done / max(n_in_chunk, 1)
-            status(f"Processing patterns in RAM: row {frac:.0f}/{n_rows_out} ({time.time() - t0:.0f} s)")
-
-        result = proc._process_chunk_batch(chunk.astype(np.float64), mask_rows, progress=chunk_progress)
-        # the same conversion as pyebsdindex's write_data (method "clip"): clip, then truncate to the integer type
-        out[p0:p1] = np.clip(result, 0, dtype_max).astype(dtype)
-        del chunk, result
-        status(f"Processing patterns in RAM: row {row_start + rows}/{n_rows_out} ({time.time() - t0:.0f} s)")
-    info = {
-        "source": source, "n_patterns": n_out, "nav_shape": (nrows, ncols), "sig_shape": (ph, pw),
-        "step": (float(getattr(proc.f_orig, "xStep", 0) or 0), float(getattr(proc.f_orig, "yStep", 0) or 0)),
-        "seconds": time.time() - t0, "excluded": int((~mask).sum()), "file": proc.orig_path,
-    }
-    return out, mask, info
-
-
 # ----------------------------------------------------------------------------------------------
 # Map plots
 # ----------------------------------------------------------------------------------------------
@@ -558,7 +470,9 @@ class Workbench(QMainWindow):
         # prepared state of the indexing tab
         self.loaded = None        # dict: key, signal (raw patterns), scan, iq (stretched quasi-IQ), source, source_file
         self.prepared = None      # dict: signal, scan, key, source, nav_mask, source_file
-        self.pattern_width = None  # pixels, once a pattern file or the processor's data set is known
+        self.pattern_width = None  # pixels, once a pattern file is known
+        self.processed_file = None      # the file the processor's Apply && Save wrote last
+        self.processed_exclusion = None  # (rows, cols) True where the processor's IQ range excluded the pattern
         self.live_run = None      # state of the run shown in the live view
         self.harmonics = None     # list, with its key
         self.harmonics_key = None
@@ -619,17 +533,24 @@ class Workbench(QMainWindow):
         self.proc.apply_save_btn.clicked.disconnect()
         self.proc.apply_save_btn.clicked.connect(apply_and_save_then_register)
 
-    def _source_changed(self, index):
-        """Switching to the processor source shows its IQ map at once; the file source re-reads on demand."""
-        self.prepared = None
-        if index == 1 and self.proc is not None and self.proc.f_orig is not None:
-            self.load_patterns_clicked()
-
     def _processor_saved(self, path):
-        self.log(f"Processor saved {path}; set as the pattern file of the indexing tab")
-        self.form._fields["PATTERN_FILE"][1](path)
-        self.source_combo.setCurrentIndex(0)
+        self.processed_file = path
+        mask = self.proc._get_iq_mask()
+        self.processed_exclusion = None if mask is None or mask.all() else ~np.asarray(mask, dtype=bool)
+        n_excl = 0 if self.processed_exclusion is None else int(self.processed_exclusion.sum())
+        self.btn_load_processed.setEnabled(True)
+        self.btn_load_processed.setToolTip(f"Loads {path}" + (f"; {n_excl} patterns excluded by the IQ range will not be indexed" if n_excl else ""))
+        self.log(f"Processor saved {path}: 'Load processed patterns' in the indexing tab loads it"
+                 + (f" ({n_excl} patterns excluded by the IQ range will not be indexed)" if n_excl else ""))
+
+    def load_processed_clicked(self):
+        """Put the file Apply && Save wrote into the pattern file box and load it."""
+        if not self.processed_file or not os.path.exists(self.processed_file):
+            QMessageBox.information(self, "Processed patterns", "Run 'Apply && Save' in the pattern processor tab first")
+            return
+        self.form._fields["PATTERN_FILE"][1](self.processed_file)
         self.prepared = None
+        self.load_patterns_clicked()
 
     # ---------------------------------------------------------------- tab 2: spherical indexing
     def _build_indexing_tab(self):
@@ -638,13 +559,12 @@ class Workbench(QMainWindow):
         self.form = form = SettingsForm()
 
         form.group("Pattern source")
-        self.source_combo = QComboBox()
-        self.source_combo.addItem("Pattern file (anything kikuchipy loads: .up1/.up2, .h5, .oh5, ...)")
-        if self.proc is not None:
-            self.source_combo.addItem("Processor tab: its processed patterns, in RAM (as 'Apply && Save' writes them)")
-        self.source_combo.setToolTip("Where the patterns to index come from")
-        self.source_combo.currentIndexChanged.connect(self._source_changed)
-        form.add_row("Source:", self.source_combo)
+        self.btn_load_processed = QPushButton("Load processed patterns")
+        self.btn_load_processed.setEnabled(False)
+        self.btn_load_processed.setToolTip("Greyed out until 'Apply && Save' in the pattern processor tab has written a file; "
+                                           "then loads that file here")
+        self.btn_load_processed.clicked.connect(self.load_processed_clicked)
+        form.add_widget(self.btn_load_processed)
         self.pattern_file_edit = form.add_path(
             "PATTERN_FILE", "Pattern file:", tip="EDAX .up1/.up2 or any format kp.load() reads; blank = the nickel demo data",
             filter="Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)",
@@ -668,7 +588,7 @@ class Workbench(QMainWindow):
         form.add_text("ROI", "ROI (c0, c1, r0, r1):", tip="Index only this part of the map: (col_start, col_stop, row_start, row_stop)", placeholder="None = everything")
         form.add_bool("FLIP_PATTERNS_UD", "Flip patterns upside down", "Try this when the test maps look like noise")
 
-        form.group("Pattern processing (file source; the processor tab does its own)")
+        form.group("Pattern processing (off for a file the processor already processed)")
         form.add_bool("REMOVE_STATIC_BACKGROUND", "Remove static background", "The background stored with the file, or else the mean pattern. Off by default: patterns from the processor are already corrected", False)
         form.add_bool("REMOVE_DYNAMIC_BACKGROUND", "Remove dynamic background", "Off by default: patterns from the processor are already corrected", False)
         note = QLabel("NLPAR: use the pattern processor tab (pyebsdindex)")
@@ -806,6 +726,7 @@ class Workbench(QMainWindow):
         for b in (self.btn_geometry, self.btn_test, self.btn_full, self.btn_save, self.btn_compare,
                   self.btn_preset_load, self.btn_scan, self.btn_load):
             b.setEnabled(not busy)
+        self.btn_load_processed.setEnabled(not busy and bool(self.processed_file))
 
     def _start(self, fn, on_done, on_event=None):
         if self.worker is not None and self.worker.isRunning():
@@ -843,8 +764,6 @@ class Workbench(QMainWindow):
     def read_scan(self):
         st = self.settings()
         pattern_file = st.PATTERN_FILE
-        if self.source_combo.currentIndex() == 1 and self.proc is not None and self.proc.orig_path:
-            pattern_file = self.proc.orig_path
         if not st.SCAN_FILE and not pattern_file:
             QMessageBox.information(self, "Scan parameters", "Give a scan file (.ang / .edaxh5) and/or a pattern file first")
             return
@@ -894,8 +813,6 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- loading patterns and the quasi-IQ map
     def _load_key(self, st: Settings):
-        if self.source_combo.currentIndex() == 1:
-            return ("processor", None if self.proc is None else self.proc.orig_path, st.ROI, st.FLIP_PATTERNS_UD)
         return ("file", st.PATTERN_FILE, st.SCAN_FILE, st.EDAXH5_MAP, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI, st.FLIP_PATTERNS_UD)
 
     def load_patterns_clicked(self):
@@ -903,20 +820,6 @@ class Workbench(QMainWindow):
         st = self.settings()
         key = self._load_key(st)
         if self.loaded is not None and self.loaded["key"] == key:
-            self._show_loaded()
-            return
-        if self.source_combo.currentIndex() == 1:
-            if self.proc is None or self.proc.f_orig is None or self.proc.iq_map is None:
-                QMessageBox.information(self, "Patterns", "Load a UP1/UP2 file in the pattern processor tab first")
-                return
-            iq = np.asarray(self.proc.iq_map, dtype=np.float32)
-            if st.ROI is not None:
-                c0, c1, r0, r1 = st.ROI
-                iq = iq[r0:r1, c0:c1]
-            self.loaded = {"key": key, "signal": None, "scan": {}, "iq": sph_core.stretch(iq), "source": "processor",
-                           "source_file": self.proc.orig_path, "nav_shape": iq.shape}
-            self.set_pattern_width(int(self.proc.f_orig.patternW))
-            self.log(f"Processor data set: {os.path.basename(self.proc.orig_path)}, {iq.shape[1]} x {iq.shape[0]} points; its IQ map is shown")
             self._show_loaded()
             return
 
@@ -950,40 +853,30 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- preparing patterns, master, detector
     def _prepare_key(self, st: Settings):
-        source = self.source_combo.currentIndex()
-        if source == 1:
-            return ("processor", processor_dataset_key(self.proc), st.ROI, st.FLIP_PATTERNS_UD)
         return ("file", st.PATTERN_FILE, st.SCAN_FILE, st.EDAXH5_MAP, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI,
                 st.FLIP_PATTERNS_UD, st.REMOVE_STATIC_BACKGROUND, st.REMOVE_DYNAMIC_BACKGROUND)
 
     def prepare_patterns_in_gui(self, st: Settings):
-        """The part that must run in the GUI thread: the processor's chain. Returns a dict for the worker, or None."""
+        """The prepared patterns of the current settings when they are still valid, else None."""
         key = self._prepare_key(st)
         if self.prepared is not None and self.prepared["key"] == key:
             return self.prepared
-        if self.source_combo.currentIndex() != 1:
+        return None
+
+    def _exclusion_mask(self, st: Settings, nav_shape):
+        """The processor's IQ-range exclusion as a navigation mask (True = skip) when the pattern file is the one
+        Apply && Save wrote and the shapes agree, else None."""
+        if self.processed_exclusion is None or not st.PATTERN_FILE or not self.processed_file:
             return None
-        if self.proc is None or self.proc.f_orig is None:
-            raise ValueError("Load a UP1/UP2 file in the pattern processor tab first, or choose the file source")
-        self.log("Running the processor's processing chain on the whole data set, in RAM ...")
-        patterns, mask, info = processed_patterns_from_processor(self.proc, self.status)
-        self.log(
-            f"Processed {info['n_patterns']} patterns ({info['source']}, {info['excluded']} excluded by the IQ range) "
-            f"in {info['seconds']:.0f} s; {patterns.nbytes / 1e9:.2f} GB in RAM"
-        )
-        step = info["step"] if all(info["step"]) else None
-        s = sph_core.signal_from_array(patterns, info["nav_shape"], step)
-        s = sph_core.apply_roi_and_flip(s, st)
-        nav_mask = None
-        if info["excluded"]:
-            nav_mask = ~mask
-            if st.ROI is not None:
-                c0, c1, r0, r1 = st.ROI
-                nav_mask = nav_mask[r0:r1, c0:c1]
-        scan = ebsd_params.scan_info(st.SCAN_FILE, pattern_file=info["file"], map_filter=st.EDAXH5_MAP) if st.SCAN_FILE else {}
-        self.prepared = {"key": key, "signal": s, "scan": scan, "source": "processor", "nav_mask": nav_mask,
-                         "source_file": info["file"]}
-        return self.prepared
+        if os.path.abspath(st.PATTERN_FILE) != os.path.abspath(self.processed_file):
+            return None
+        mask = self.processed_exclusion
+        if st.ROI is not None:
+            c0, c1, r0, r1 = st.ROI
+            mask = mask[r0:r1, c0:c1]
+        if tuple(mask.shape) != tuple(nav_shape) or not mask.any():
+            return None
+        return mask
 
     def _prepare_in_worker(self, st: Settings, prepared, log):
         """Loads the patterns from a file when needed, then the harmonics and the detector."""
@@ -996,7 +889,8 @@ class Workbench(QMainWindow):
             else:
                 s, scan = sph_core.load_patterns(st, log=log)
                 sph_core.preprocess(s, st, log)
-            prepared = {"key": key, "signal": s, "scan": scan, "source": "file", "nav_mask": None,
+            nav_mask = self._exclusion_mask(st, s.axes_manager.navigation_shape[::-1])
+            prepared = {"key": key, "signal": s, "scan": scan, "source": "file", "nav_mask": nav_mask,
                         "source_file": st.PATTERN_FILE}
         demo = prepared["source"] == "file" and st.PATTERN_FILE is None
         hkey = (st.MASTER_FILE, st.MASTER_BANDWIDTH, st.MASTER_ENERGY, demo)
