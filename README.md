@@ -384,7 +384,8 @@ Workflow in the indexing tab:
   mapped file this is one read of the file.
 - **Read scan parameters** fills the projection center from the `.ang`; the scan file dialog opens in
   the pattern file's folder. The **pixel size** is filled in automatically as 30 mm / pattern width
-  for the EDAX/TSL convention (the EDAX detector is 30 mm wide) and stays editable. Static and
+  for the EDAX/TSL convention (the EDAX detector is 30 mm wide) and stays editable; binning is
+  always 1 here (it only scales that pixel size). Static and
   dynamic background removal are off by default (the processor already did them) and the circular
   mask is on.
 - **Check geometry** shows one pattern on the sphere; **Index test region** and **Index full map**

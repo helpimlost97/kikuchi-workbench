@@ -691,7 +691,6 @@ class Workbench(QMainWindow):
         self.px_size_spin = form.add_float("PX_SIZE", "Pixel size um:", 1.0, 1e-6, 1e6, 4,
                                            f"Detector pixel size. Filled automatically as {DETECTOR_WIDTH_UM / 1000:.0f} mm / pattern width "
                                            "for the EDAX/TSL convention once the pattern width is known; editable")
-        form.add_int("BINNING", "Binning:", 1, 1, 64)
         form.add_float("TWIST", "Twist deg:", 0.0, -180, 180, 2, "Rotation of the detector about its normal, e.g. 15 for RKD; applied to the orientations afterwards")
 
         form.group("Indexing")
