@@ -406,8 +406,13 @@ Workflow in the indexing tab:
   reports elapsed time, ETA, the speed over the last few seconds and the speed of the current band.
   The **Results** tab then shows the score, IQ, IPF-Z and IPF-X maps. Untick *Live view* for a
   single call without animation.
-- **Save .ang / .h5**, **Compare with reference**, and **Load/Save preset**: a preset file that
-  `build_notebook.py` accepts, so the GUI and the notebook share settings.
+- **Save .ang / .h5**, **Compare with reference**, and **Load/Save preset**. A GUI preset holds the
+  indexing parameters only: master bandwidth, PC convention, sample and camera tilt, pixel size,
+  twist, the two background removals, bandwidth, workers, refinement, AHE tiles, circular mask,
+  Gaussian background, normalization and chunk size. Files, folders and the projection center
+  values are never written to or taken from a preset. The file format is the one
+  `build_notebook.py` accepts, so a GUI preset also builds a notebook, and a notebook preset such
+  as `preset_RKD.txt` loads into the GUI with only those parameters applied.
 
 ```bash
 python kikuchi_workbench.py                                   # processor found next to this folder

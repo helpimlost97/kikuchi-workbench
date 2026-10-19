@@ -109,6 +109,12 @@ __version__ = "0.2.0"
 DETECTOR_WIDTH_UM = 30000.0
 # How the map is indexed with the live view on: bands of rows that each take about this long
 LIVE_BLOCK_SECONDS = 8.0
+# What a GUI preset holds: the indexing parameters only, never files, folders or the projection center values
+PRESET_FIELDS = [
+    "MASTER_BANDWIDTH", "PC_CONVENTION", "SAMPLE_TILT", "CAMERA_TILT", "PX_SIZE", "TWIST",
+    "REMOVE_STATIC_BACKGROUND", "REMOVE_DYNAMIC_BACKGROUND",
+    "BANDWIDTH", "N_WORKERS", "REFINE", "N_REGIONS", "CIRCULAR_MASK", "GAUSSIAN_BACKGROUND", "NORMALIZE", "CHUNKSIZE",
+]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -717,17 +723,26 @@ class Workbench(QMainWindow):
             path, _ = QFileDialog.getOpenFileName(self, "Load preset", str(HERE), "Presets (*.txt);;All files (*)")
             if not path:
                 return
-        st, ignored = sph_core.read_preset(path, self.settings())
+        current = self.settings()
+        st, ignored = sph_core.read_preset(path, current)
+        # only the indexing parameters are taken from a preset; files, folders and the PC values stay as they are
+        for name in st.names():
+            if name not in PRESET_FIELDS:
+                setattr(st, name, getattr(current, name))
         self.set_settings(st)
         self.prepared = None
-        self.log(f"Preset loaded: {path}" + (f" (ignored: {', '.join(ignored)})" if ignored else ""))
+        applied = [n for n in PRESET_FIELDS if getattr(st, n) != getattr(current, n)]
+        self.log(f"Preset loaded: {path}; changed: {', '.join(applied) if applied else 'nothing'}"
+                 + " (files, folders and the projection center are never taken from a preset)")
 
     def save_preset(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save preset", str(HERE / "preset_workbench.txt"), "Presets (*.txt)")
         if not path:
             return
-        sph_core.write_preset(path, self.settings(), header="Settings of the Kikuchi workbench")
-        self.log(f"Preset saved: {path}; build a notebook from it with: python build_notebook.py my_scan.ipynb \"{path}\"")
+        sph_core.write_preset(path, self.settings(), header="Indexing settings of the Kikuchi workbench (no files, folders or PC values)",
+                              fields=PRESET_FIELDS)
+        self.log(f"Preset saved: {path} ({len(PRESET_FIELDS)} indexing settings); a notebook can be built from it with: "
+                 f"python build_notebook.py my_scan.ipynb \"{path}\"")
 
     def log(self, text: str):
         self.log_box.appendPlainText(text)

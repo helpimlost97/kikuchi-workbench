@@ -120,11 +120,12 @@ def read_preset(path: str | Path, settings: Settings | None = None) -> tuple[Set
     return settings, ignored
 
 
-def write_preset(path: str | Path, settings: Settings, header: str = "") -> None:
-    """Write the settings as a preset file that build_notebook.py accepts (values as Python source)."""
+def write_preset(path: str | Path, settings: Settings, header: str = "", fields: Sequence[str] | None = None) -> None:
+    """Write the settings as a preset file that build_notebook.py accepts (values as Python source).
+    ``fields`` restricts it to those setting names (all of them when not given)."""
     lines = [f"# {h}" for h in header.splitlines()] if header else []
     lines.append("# Preset written by kikuchi_workbench.py; usage: python build_notebook.py my_scan.ipynb this_file.txt")
-    for name in settings.names():
+    for name in settings.names() if fields is None else fields:
         value = getattr(settings, name)
         if isinstance(value, str):
             lines.append(f"{name} = r{value!r}" if "\\" in value or "/" in value else f"{name} = {value!r}")
