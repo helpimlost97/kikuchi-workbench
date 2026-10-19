@@ -818,7 +818,9 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- loading patterns and the quasi-IQ map
     def _load_key(self, st: Settings):
-        return ("file", st.PATTERN_FILE, st.SCAN_FILE, st.EDAXH5_MAP, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI, st.FLIP_PATTERNS_UD)
+        # Only what changes the loaded patterns themselves. The scan file is deliberately not in here: setting it
+        # after loading must not throw the loaded data set (and the live map) away.
+        return ("file", st.PATTERN_FILE, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI, st.FLIP_PATTERNS_UD)
 
     def load_patterns_clicked(self):
         """Load the pattern file (or take the processor's data set), compute and show the quasi-IQ map."""
@@ -994,6 +996,8 @@ class Workbench(QMainWindow):
             # the quasi-IQ map of this data set is not there yet: the live view then shows a blank map
             self.loaded = None
             self.live.set_base_map(None, "")
+            if live:
+                self.log("NB! Click 'Load patterns (quasi-IQ map)' first to see the map fill in during indexing")
         self.live_run = None
 
         def work(log, emit):
@@ -1048,7 +1052,8 @@ class Workbench(QMainWindow):
             self._store_prepared(result)
             self.last_run = run
             self.show_indexing_maps(run)
-            self.view_tabs.setCurrentWidget(self.maps)
+            # the Live tab keeps the finished IPF map in front; the Results tab has the score, IQ and IPF maps
+            self.log("Done: the Results tab has the score, IQ, IPF-Z and IPF-X maps")
 
         self._start(work, done, on_event=self.on_run_event)
 
