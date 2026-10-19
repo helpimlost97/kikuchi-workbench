@@ -850,13 +850,60 @@ class Workbench(QMainWindow):
 
     def _unload_processor(self) -> bool:
         """Drop the processor's data set before the indexer loads one; False if the processor is busy."""
-        if self.proc is None or self.proc.f_orig is None:
+        proc = self.proc
+        if proc is None or getattr(proc, "f_orig", None) is None:
             return True
-        if not self.proc.unload():
+        if getattr(proc, "_nlpar_busy", False):
             QMessageBox.information(self, "Processor busy", "Wait for the NLPAR step in the pattern processor to finish before loading")
+            return False
+        unload = getattr(proc, "unload", None)
+        if unload is not None:
+            ok = unload()
+        else:
+            # an older pattern processor without unload(): the same resets, done from here
+            ok = self._unload_processor_fallback(proc)
+        if not ok:
+            QMessageBox.information(self, "Processor busy", "The pattern processor could not unload its data set now")
             return False
         self.log("Pattern processor: data set unloaded (a file is being loaded in the indexing tab)")
         return True
+
+    @staticmethod
+    def _unload_processor_fallback(proc) -> bool:
+        """What MainWindow.unload() does, for a processor clone that predates it (every step guarded)."""
+        try:
+            proc.f_nlpar = None
+            proc.nlpar_patterns = None
+            if hasattr(proc, "nlpar_status"):
+                proc.nlpar_status.setText("No NLPAR file loaded")
+            if hasattr(proc, "_remove_temp_files"):
+                proc._remove_temp_files()
+            for name in ("orig_path", "f_orig", "patterns", "iq_map", "iq_mask", "mean_pattern", "pixel_std", "data_max",
+                         "_nlobj", "_nlobj_key", "_nl_infile", "_aperture_cache", "_aperture_cache_key"):
+                if hasattr(proc, name):
+                    setattr(proc, name, None)
+            proc.nrows = proc.ncols = proc.current_row = proc.current_col = 0
+            for name in ("_invalidate_sigma_map", "_invalidate_global_range"):
+                if hasattr(proc, name):
+                    getattr(proc, name)()
+            proc._lambda_optimized = False
+            if hasattr(proc, "file_label"):
+                proc.file_label.setText("No file loaded")
+            if hasattr(proc, "bg_status"):
+                proc.bg_status.setText("Background: all patterns")
+            for name in ("scan_canvas", "raw_canvas", "proc_canvas"):
+                canvas = getattr(proc, name, None)
+                if canvas is not None and hasattr(canvas, "ax"):
+                    canvas.ax.clear()
+                    canvas.ax.axis("off")
+                    canvas.draw_idle()
+            if hasattr(proc, "scan_canvas"):
+                proc.scan_canvas.marker = None
+                proc.scan_canvas._mask = None
+            gc.collect()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def load_patterns_clicked(self):
         """Load the pattern file, compute and show the quasi-IQ map. The processor's data set is unloaded first."""
