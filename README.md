@@ -473,9 +473,10 @@ The **3. Montage batch** tab:
   tilts to the indexing tab* fills them from the first tile; check them). *Load selected tile in
   the indexer* puts one processed tile into tab 2 for a test region. *Index all tiles* loads each
   processed tile memory mapped, skips its zero patterns, indexes it band by band with the live view
-  of this tab, and writes its orientation matrices, score (`CI`), phase and `Valid` flag into a
-  copy of the project (the `IQ` column keeps the Hough IQ of the acquisition, the one used for
-  stitching, unless *Keep the project's (Hough) IQ* is unticked), `<project>_sph_bw<bandwidth>.edaxh5` in the output folder, right after the
+  of this tab, and writes its orientation matrices, cross-correlation (`CI`), image quality
+  (`IQ`, EMSphInx's discrete cosine measure, as EMSphInx's own .ang output; tick *Keep the
+  project's (Hough) IQ* to leave the acquisition's IQ in place), phase and `Valid` flag into a
+  copy of the project, `<project>_sph_bw<bandwidth>.edaxh5` in the output folder, right after the
   tile is done (the copy is made when the batch starts, so tiles not indexed keep their Hough
   results). The orientation matrix convention of the file was verified against the Hough results
   of a real tile. Untick *Index the processed files* to index the raw files instead.

@@ -99,11 +99,11 @@ class MontageTab(QWidget):
         self.index_processed_check = QCheckBox("Index the processed files (else the raw files)")
         self.index_processed_check.setChecked(True)
         form.add_widget(self.index_processed_check)
-        self.keep_iq_check = QCheckBox("Keep the project's (Hough) IQ in the output")
-        self.keep_iq_check.setChecked(True)
-        self.keep_iq_check.setToolTip("On: the IQ column of the output project stays the Hough IQ written at acquisition, the one OIM and MTEX use "
-                                      "for stitching. Off: it is replaced by the spherical image quality (0..1 scale). The spherical score always "
-                                      "goes into CI")
+        self.keep_iq_check = QCheckBox("Keep the project's (Hough) IQ instead of the spherical IQ")
+        self.keep_iq_check.setChecked(False)
+        self.keep_iq_check.setToolTip("Off (as EMSphInx writes its .ang): the IQ column of the output project becomes the spherical image "
+                                      "quality, EMSphInx's discrete cosine measure of each pattern (0..1 scale), and CI the cross-correlation. "
+                                      "On: the IQ column keeps the Hough IQ written at acquisition; CI is the cross-correlation either way")
         form.add_widget(self.keep_iq_check)
         self.btn_use_geometry = QPushButton("Copy the project's PC and tilts to the indexing tab")
         self.btn_use_geometry.setToolTip("Puts the first tile's pattern center (EDAX), sample tilt and camera elevation into tab 2; "
