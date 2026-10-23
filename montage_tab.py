@@ -99,6 +99,12 @@ class MontageTab(QWidget):
         self.index_processed_check = QCheckBox("Index the processed files (else the raw files)")
         self.index_processed_check.setChecked(True)
         form.add_widget(self.index_processed_check)
+        self.keep_iq_check = QCheckBox("Keep the project's (Hough) IQ in the output")
+        self.keep_iq_check.setChecked(True)
+        self.keep_iq_check.setToolTip("On: the IQ column of the output project stays the Hough IQ written at acquisition, the one OIM and MTEX use "
+                                      "for stitching. Off: it is replaced by the spherical image quality (0..1 scale). The spherical score always "
+                                      "goes into CI")
+        form.add_widget(self.keep_iq_check)
         self.btn_use_geometry = QPushButton("Copy the project's PC and tilts to the indexing tab")
         self.btn_use_geometry.setToolTip("Puts the first tile's pattern center (EDAX), sample tilt and camera elevation into tab 2; "
                                          "check them there, they are your inputs")
@@ -414,6 +420,7 @@ class MontageTab(QWidget):
         self.cancel_requested = False
         self.wb.tabs.setCurrentWidget(self)
         kw = self.kw
+        iq_prop = None if self.keep_iq_check.isChecked() else "iq"
         is_cancelled = lambda: self.cancel_requested  # noqa: E731  (read from the worker thread: a plain bool)
 
         def work(log, emit):
@@ -462,7 +469,7 @@ class MontageTab(QWidget):
                         s, harmonics, det, st_t, log, navigation_mask=nav_mask, on_event=on_event,
                         target_seconds=kw.LIVE_BLOCK_SECONDS, first_patterns=max(nav_shape[-1], min(300, max(1, n_run // 10))))
                     xmap = sph_core.apply_twist(xmap_indexed, st.TWIST)
-                    counts = montage.write_tile_result(out_project, tile, xmap, comment=comment)
+                    counts = montage.write_tile_result(out_project, tile, xmap, iq_prop=iq_prop, comment=comment)
                     emit("run_end", {"success": True})
                     log(f"  {counts['n_indexed']} patterns indexed in {time.perf_counter() - t0:.0f} s ({speed:.0f} patterns/s), written to the output project")
                     done.append(tile.name)

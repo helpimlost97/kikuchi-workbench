@@ -494,15 +494,17 @@ def _full_grid_prop(xmap, name: str, in_data: np.ndarray, fill=0.0) -> np.ndarra
     return out
 
 
-def write_tile_result(out_path: str | os.PathLike, tile: Tile, xmap, iq_prop: str = "iq", ci_prop: str = "scores",
+def write_tile_result(out_path: str | os.PathLike, tile: Tile, xmap, iq_prop: str | None = None, ci_prop: str = "scores",
                       comment: str | None = None, phase_map: dict[int, int] | None = None) -> dict:
     """Replace the orientation table of ``tile`` in the output project with the spherical indexing result.
 
     ``xmap`` is the tile's crystal map (shape (rows, cols); TWIST applied, as saved to .ang). Written: the
-    orientation matrices, ``IQ`` (``iq_prop``), ``CI`` (``ci_prop``; -1 for points not indexed), ``Phase``
-    (0-based index into the project's phase list: ``phase_map`` maps the crystal map's phase ids, default the
-    same index), ``Fit`` 0 and ``Valid`` 1 for indexed points. The other fields (SEM signal, PRIAS strips) are
-    kept. ``comment`` goes into ``EBSD/ANG/HEADER/Comments``. Returns counts.
+    orientation matrices, ``CI`` (``ci_prop``; -1 for points not indexed), ``Phase`` (0-based index into the
+    project's phase list: ``phase_map`` maps the crystal map's phase ids, default the same index), ``Fit`` 0 and
+    ``Valid`` 1 for indexed points. ``IQ`` keeps the project's (Hough) image quality unless ``iq_prop`` names a
+    property of the crystal map (e.g. "iq", the spherical image quality on a 0..1 scale) to replace it with. The
+    other fields (SEM signal, PRIAS strips) are kept. ``comment`` goes into ``EBSD/ANG/HEADER/Comments``.
+    Returns counts.
     """
     from sph_core import full_shape
 
@@ -510,7 +512,7 @@ def write_tile_result(out_path: str | os.PathLike, tile: Tile, xmap, iq_prop: st
     if shape != (tile.n_rows, tile.n_cols):
         raise ValueError(f"{tile.name}: crystal map grid {shape} is not the tile's grid ({tile.n_rows}, {tile.n_cols})")
     mats, in_data = _full_grid_matrices(xmap)
-    iq = _full_grid_prop(xmap, iq_prop, in_data, 0.0)
+    iq = None if iq_prop is None else _full_grid_prop(xmap, iq_prop, in_data, 0.0)
     ci = _full_grid_prop(xmap, ci_prop, in_data, -1.0)
     ci[~in_data] = -1.0
     phase = np.zeros(in_data.size, dtype=np.int32)
@@ -526,7 +528,8 @@ def write_tile_result(out_path: str | os.PathLike, tile: Tile, xmap, iq_prop: st
             raise ValueError(f"{tile.name}: the orientation table has {n} rows, the tile grid {in_data.size} points")
         rec = d[()]
         rec["Orientations"] = mats.reshape(n, 9)
-        rec["IQ"] = iq.astype(rec["IQ"].dtype)
+        if iq is not None:
+            rec["IQ"] = iq.astype(rec["IQ"].dtype)
         rec["CI"] = ci.astype(rec["CI"].dtype)
         rec["Phase"] = phase
         if "Fit" in rec.dtype.names:
