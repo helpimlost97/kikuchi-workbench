@@ -627,12 +627,17 @@ class IndexingProgress(Callback):
     with a smaller batch after running out of memory) its count starts over.
     """
 
-    def __init__(self, on_progress: Callable[[float, float], None], interval: float = 0.2):
+    def __init__(self, on_progress: Callable[[float, float], None], interval: float = 0.2,
+                 on_chunk: Callable[[int, np.ndarray], None] | None = None):
         super().__init__()
         self.on_progress = on_progress
+        self.on_chunk = on_chunk
         self.n_tasks = {"index": 0, "refine": 0}
         self.n_done = {"index": 0, "refine": 0}
         self._throttle = _Throttle(interval)
+        self._chunks: dict[int, np.ndarray] = {}  # finished coarse-search chunks not yet handed on
+        self._next_chunk = 0
+        self._offset = 0
 
     def _start_state(self, dsk, state):
         counts = {"index": 0, "refine": 0}
@@ -644,6 +649,8 @@ class IndexingProgress(Callback):
             if n:
                 self.n_tasks[kind] = n
                 self.n_done[kind] = 0
+        if counts["index"]:
+            self._chunks, self._next_chunk, self._offset = {}, 0, 0
 
     def fractions(self) -> tuple[float, float]:
         out = []
@@ -660,6 +667,28 @@ class IndexingProgress(Callback):
         last = self.n_done[kind] >= self.n_tasks[kind]
         if self._throttle.ready() or last:
             self.on_progress(*self.fractions())
+        if kind == "index" and self.on_chunk is not None:
+            self._hand_on_chunk(key, result)
+
+    def _hand_on_chunk(self, key, result) -> None:
+        """``on_chunk(offset, packed)`` for every finished ``_index_chunk`` task, in chunk order.
+
+        The task of chunk ``i`` (key ``(name, i, 0, 0)``) returns the packed rows ``(n_i, n_best, 7)`` of the
+        patterns ``offset_i : offset_i + n_i`` of the call, in the order they were given (zyz in columns 0:3,
+        score 3, phase id 4 (-1 = failed), image quality 5). The chunks are all the same size but the last, yet
+        that size is only known from a result, so a chunk is handed on once every chunk before it has finished:
+        with several workers a few chunks may wait for an earlier, slower one, never for long.
+        """
+        if not (isinstance(key, tuple) and len(key) >= 2 and isinstance(key[1], (int, np.integer))):
+            return
+        if not (isinstance(result, np.ndarray) and result.ndim == 3 and result.shape[2] >= 5):
+            return
+        self._chunks[int(key[1])] = result
+        while self._next_chunk in self._chunks:
+            packed = self._chunks.pop(self._next_chunk)
+            self.on_chunk(self._offset, packed)
+            self._offset += int(packed.shape[0])
+            self._next_chunk += 1
 
 
 def _navigation_steps(s) -> tuple[float, float]:
@@ -676,6 +705,41 @@ def _scan_unit(s) -> str:
     axes = s.axes_manager.navigation_axes
     unit = str(axes[0].units) if axes else ""
     return unit if unit and unit != "<undefined>" else "um"
+
+
+def ipf_color_keys(harmonics, direction: str = "z") -> list:
+    """One orix ``IPFColorKeyTSL`` per phase of ``harmonics`` (a ``MasterPatternHarmonics`` or a sequence of
+    them, in phase id order), ``None`` for a phase without a point group."""
+    from orix import plot
+    from orix.vector import Vector3d
+
+    vec = {"x": Vector3d.xvector(), "y": Vector3d.yvector(), "z": Vector3d.zvector()}[direction]
+    keys = []
+    for h in ([harmonics] if not isinstance(harmonics, (list, tuple)) else list(harmonics)):
+        phase = getattr(h, "phase", None)
+        point_group = getattr(phase, "point_group", None)
+        keys.append(None if point_group is None else plot.IPFColorKeyTSL(point_group, direction=vec))
+    return keys
+
+
+def packed_rgb(packed: np.ndarray, keys: Sequence) -> np.ndarray:
+    """IPF colours (n, 3) of the best candidate of packed indexing rows (n, n_best, 7) of the fork's
+    ``_index_chunk`` (ZYZ Euler angles in columns 0:3, phase id in column 4), with ``keys`` from
+    :func:`ipf_color_keys`. A pattern that failed (phase -1) or of a phase without a key is white, as in
+    :func:`ipf_rgb`. Refinement, when on, happens inside the chunk, so these are the refined orientations."""
+    from kikuchipy.indexing._spherical._euler import rotation_from_zyz
+    from orix.quaternion import Orientation
+
+    best = np.asarray(packed)[:, 0, :]
+    phase_id = best[:, 4].astype(int)
+    rgb = np.ones((best.shape[0], 3))
+    for pid in np.unique(phase_id):
+        if pid < 0 or pid >= len(keys) or keys[pid] is None:
+            continue
+        m = phase_id == pid
+        rot = rotation_from_zyz(np.ascontiguousarray(best[m, :3], dtype=np.float64))
+        rgb[m] = keys[pid].orientation2color(Orientation(rot, keys[pid].symmetry))
+    return rgb
 
 
 def _block_quaternions(xmap, in_data: np.ndarray) -> np.ndarray:
@@ -768,6 +832,10 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
 
     * ``"block_start"``: r0, r1, c0, c1, n_patterns (to index), index, n_blocks_estimate
     * ``"progress"``: frac_index, frac_refine (0..1, see :class:`IndexingProgress`), r0, r1, n_patterns
+    * ``"chunk_done"``: rows, cols (int arrays, map coordinates of the patterns of one or more dask chunks the
+      moment their tasks finished, in file order), rgb (float (n, 3) IPF-Z colours of their best candidates: the
+      refined orientation when refinement is on, the coarse one when it is off, as EMSphInx paints its preview),
+      n_patterns, r0, r1 (the band). At most about 10 a second; a chunk is one GPU batch or one CPU chunk.
     * ``"block_done"``: r0, r1, c0, c1, xmap (the band's crystal map as indexed, None for a band that is
       masked out completely), seconds, patterns_per_second, done_patterns, total_patterns, elapsed,
       eta_seconds
@@ -812,13 +880,52 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
     # warning is logged the first time only; the repeats are counted and reported at the end.
     seen_warnings: dict[str, list] = {}  # digit-free key -> [first text, count]
 
+    # IPF colour keys for the per-chunk preview; without them (e.g. harmonics without a phase) no chunk events
+    color_keys = None
+    if on_event is not None:
+        try:
+            color_keys = ipf_color_keys(harmonics, "z")
+            if all(k is None for k in color_keys):
+                color_keys = None
+        except Exception:  # noqa: BLE001
+            color_keys = None
+    n_cols_map = int(nav_shape[-1])
+
     def run(signal, mask, r0, r1, n):
+        # map positions (row-major within the band) of the patterns handed to the fork, in its order
+        keep = None if mask is None else np.flatnonzero(~np.asarray(mask, dtype=bool).ravel())
+        pending: list[tuple[int, np.ndarray]] = []  # (offset, packed rows) of chunks not yet painted
+        throttle = _Throttle(0.1)
+
+        def flush_chunks():
+            if not pending:
+                return
+            packed = np.concatenate([p for _, p in pending], axis=0)
+            first = pending[0][0]
+            pending.clear()
+            pos = np.arange(first, first + packed.shape[0]) if keep is None else keep[first:first + packed.shape[0]]
+            try:
+                rgb = packed_rgb(packed, color_keys)
+            except Exception:  # noqa: BLE001  (the preview must never stop the indexing)
+                return
+            emit("chunk_done", {"rows": r0 + pos // n_cols_map, "cols": pos % n_cols_map, "rgb": rgb,
+                                "n_patterns": int(packed.shape[0]), "r0": r0, "r1": r1})
+
+        def on_chunk(offset, packed):
+            if pending and pending[-1][0] + pending[-1][1].shape[0] != offset:
+                flush_chunks()  # not contiguous with what is pending (does not happen: chunks come in order)
+            pending.append((offset, packed))
+            if throttle.ready():
+                flush_chunks()
+
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             with IndexingProgress(
-                lambda fi, fr: emit("progress", {"frac_index": fi, "frac_refine": fr, "r0": r0, "r1": r1, "n_patterns": n})
+                lambda fi, fr: emit("progress", {"frac_index": fi, "frac_refine": fr, "r0": r0, "r1": r1, "n_patterns": n}),
+                on_chunk=on_chunk if color_keys is not None else None,
             ):
                 xmap_band = signal.spherical_indexing(harmonics_arg, det, navigation_mask=mask, verbose=verbose, **kwargs)
+        flush_chunks()
         for w in caught:
             text = str(w.message)
             key = re.sub(r"[\d.]+", "#", text)

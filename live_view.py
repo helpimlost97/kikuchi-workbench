@@ -7,11 +7,15 @@ label. The caller (the main window) forwards the indexing thread's events to it 
     view.set_pattern_source(lambda r, c: patterns[r, c])
     view.begin_run(r0, c0, rows, cols, n_patterns)
     view.block_started(r0, r1, c0, c1, n)      # a band of rows is being indexed: tinted orange
-    view.block_progress(frac_index, frac_refine)  # left-to-right sweep inside the band
+    view.block_progress(frac_index, frac_refine)  # left-to-right sweep inside the band (until a chunk is painted)
+    view.chunk_done(rows, cols, rgb)              # the patterns of a finished chunk painted with their IPF colours
     view.block_done(r0, r1, c0, c1, rgb, n, seconds)  # band painted with its IPF colours
     view.set_speed(pps); view.set_progress(done, total, eta)
     view.end_run(True)
 
+During a band the patterns of every finished dask chunk are painted with their IPF colours at once (``chunk_done``,
+a GPU batch or a CPU chunk at a time, the refined orientation when refinement is on), so the picture grows in file
+order a few times a second as in EMSphInx; the orange left-to-right sweep is only used when no chunk events come.
 Rendering is cheap on purpose: one RGB float32 image (``LiveView.image``) is kept and written into by slices, and the
 canvas is redrawn from a 5 Hz timer only when something changed, however many events arrive. What is pushed to the
 AxesImage is an RGBA uint8 copy of it, subsampled with a stride when the map has more pixels than the axes (a
@@ -104,6 +108,7 @@ class LiveView(QWidget):
         self._frac_index = 0.0
         self._frac_refine = 0.0
         self._sweep_col = None                    # last column painted with the bright sweep tint (absolute)
+        self._chunks_painted = 0                  # patterns painted by chunk_done in the current band
         self._sweep_pos = 0
         self._sweep_offset = 0
         self._speed_now = None
@@ -261,6 +266,7 @@ class LiveView(QWidget):
         self._block_n = int(n_patterns)
         self._frac_index = self._frac_refine = 0.0
         self._sweep_col = None
+        self._chunks_painted = 0
         self._sweep_pos = 0
         self._sweep_offset = 0
         self._paint_band_tint()
@@ -275,7 +281,33 @@ class LiveView(QWidget):
         self._frac_refine = fr
         if fi != self._frac_index:
             self._frac_index = fi
-            self._paint_sweep()
+            if not self._chunks_painted:  # the painted chunks show the progress themselves
+                self._paint_sweep()
+        self._mark_dirty()
+
+    def chunk_done(self, rows, cols, rgb):
+        """Paint the patterns at map coordinates (``rows[i]``, ``cols[i]``) with the colours ``rgb[i]`` (float
+        (n, 3), 0..1), as EMSphInx paints each pattern the moment it is indexed. Points outside the map are
+        ignored. The band's ``block_done`` repaints the whole band afterwards, so this is a preview only."""
+        if self.image is None:
+            return
+        try:
+            rows = np.asarray(rows, dtype=int).ravel()
+            cols = np.asarray(cols, dtype=int).ravel()
+            a = np.asarray(rgb, dtype=np.float32)
+        except (TypeError, ValueError):
+            return
+        if a.ndim != 2 or a.shape[1] < 3 or rows.size != cols.size or a.shape[0] != rows.size or rows.size == 0:
+            return
+        h, w = self.image.shape[:2]
+        ok = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+        if not ok.all():
+            rows, cols, a = rows[ok], cols[ok], a[ok]
+            if rows.size == 0:
+                return
+        self.image[rows, cols] = np.clip(np.nan_to_num(a[:, :3], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
+        self._touch(int(rows.min()), int(rows.max()) + 1)
+        self._chunks_painted += int(rows.size)
         self._mark_dirty()
 
     def block_done(self, r0, r1, c0, c1, rgb, n_patterns, seconds):
@@ -290,6 +322,7 @@ class LiveView(QWidget):
         if self._block is not None and band is not None and self._block == band:
             self._block = None
             self._sweep_col = None
+            self._chunks_painted = 0
         try:
             if n_patterns and seconds and seconds > 0:
                 self._speed_block = float(n_patterns) / float(seconds)

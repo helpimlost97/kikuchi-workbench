@@ -103,7 +103,7 @@ from live_view import LiveView  # noqa: E402
 from montage_tab import MontageTab  # noqa: E402
 from sph_core import Settings  # noqa: E402
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 # The EDAX detector is 30 mm wide: the pixel size of the EDAX/TSL projection center convention follows from the
 # pattern width alone, which is why the GUI fills it in (ebsd_params.py uses the same default, --det-mm 30).
@@ -1206,6 +1206,8 @@ class Workbench(QMainWindow):
                 # patterns done so far, with the coarse search of the current band counted by its fraction
                 done = run["done"] + data["frac_index"] * run["block"][2]
                 self._update_speed(run, done)
+        elif name == "chunk_done":
+            self._live_view.chunk_done(r0 + np.asarray(data["rows"]), c0 + np.asarray(data["cols"]), data["rgb"])
         elif name == "block_done":
             n_block = int(data.get("n_patterns", data["done_patterns"] - run["done"]))
             run["done"] = data["done_patterns"]

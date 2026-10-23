@@ -402,10 +402,13 @@ Workflow in the indexing tab:
 - **Check geometry** shows one pattern on the sphere; **Index test region** and **Index full map**
   index with the live view on by default: the map is indexed band by band (bands of whole rows
   sized to about 8 s each; identical results to one call, at a few per cent of extra time for the
-  per-band setup), and the Live view paints each finished
-  band with its IPF-Z colours over the grey quasi-IQ map, tints the band being indexed with a
-  left-to-right sweep, shows a pattern of that band on the right (cycling through the band), and
-  reports elapsed time, ETA, the speed over the last few seconds and the speed of the current band.
+  per-band setup), and the Live view paints the patterns of every finished chunk (a GPU batch or a CPU
+  chunk, a few times a second, in file order) with their IPF-Z colours over the grey quasi-IQ map
+  the moment the indexer returns them, as EMSphInx's preview does: the refined orientation when
+  *Refine* is ticked, the coarse grid orientation when it is not. The band being indexed is tinted
+  orange until its patterns are painted, a pattern of that band is shown on the right (cycling
+  through the band), and the status line reports elapsed time, ETA, the speed over the last few
+  seconds and the speed of the current band.
   The **Results** tab then shows the score, IQ, IPF-Z and IPF-X maps. Untick *Live view* for a
   single call without animation.
 - **Save .ang / .h5**, **Compare with reference**, and **Load/Save preset**. A GUI preset holds the
