@@ -75,11 +75,12 @@ def copy_cropped(src: h5py.Group, dst: h5py.Group, grid: tuple[int, int] | None,
             copy_cropped(obj, g, this_grid, rows, cols)
             continue
         data = obj[()]
-        if obj.shape == () or obj.size == 0:
+        if obj.shape == () or obj.size <= 1:
+            # APEX stores every scalar as a length-1 array; keep the shape and dtype
             if grid is not None and name == "Number Of Rows" and src.name.endswith("/Sample"):
-                data = type(data)(min(rows, grid[0]))
+                data = np.full_like(np.asarray(data), min(rows, grid[0]))
             elif grid is not None and name == "Number Of Columns" and src.name.endswith("/Sample"):
-                data = type(data)(min(cols, grid[1]))
+                data = np.full_like(np.asarray(data), min(cols, grid[1]))
             d = dst.create_dataset(name, data=data)
         else:
             n = obj.shape[0]

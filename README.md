@@ -19,6 +19,7 @@ only the path syntax in the examples changes.
 | `update_fork.py` | Clones or updates that clone, checks out the pinned commit, applies the patch and installs it, in one command. Also undoes an earlier patch first, so re-running it after Johan pushes new commits is safe. See step 3. |
 | `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Applied by `update_fork.py`, or by hand, see step 3. |
 | `kikuchi_workbench.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.8. `sph_core.py` holds the indexing code the GUI calls (the notebook's cells as functions, usable from scripts), `live_view.py` the animated progress view. |
+| `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.9. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's third tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
 | `build_notebook.py` | Generates the indexing notebook (sections 0 to 10 plus an optional HROSM section 11). Edit this, then regenerate; do not hand-edit the generated `.ipynb` unless you know you will not regenerate it. |
 | `build_refinement_notebook.py` | Generates the projection center drift correction notebook: corrects an indexed map for the PC moving with the beam, from the scan geometry alone, no patterns needed (minutes), see section 6.6. |
 | `spherical_indexing_template.ipynb` | Generated indexing notebook with default settings. Runs on kikuchipy's nickel demo data when no pattern file is given. |
@@ -363,12 +364,13 @@ and `.ang`. (The GUI does not do HROSM; it is pattern processing and spherical i
 ### 6.8 The GUI: pattern processor and spherical indexing in one window
 
 `kikuchi_workbench.py` puts the [Kikuchi Pattern Processor](https://github.com/helpimlost97/kikuchi-pattern-processor)
-and the indexing of this folder into one PyQt5 window with two tabs:
+and the indexing of this folder into one PyQt5 window with three tabs:
 
 1. **Pattern processor**: the unchanged `gpu_pattern_viewer.py`, imported from its own folder
    (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`).
 2. **Spherical indexing**: the settings of the notebook as a form on the left (drag the divider to
    resize it), the live view, the result maps and a log on the right.
+3. **Montage batch**: the two steps above for every tile of an EDAX APEX montage, see 6.9.
 
 Workflow in the indexing tab:
 
@@ -437,6 +439,65 @@ Verified headlessly on the nickel demo data written as a `.up1` (no GPU in that 
 backend): processor load and `Apply && Save`, `Load processed patterns` with the IQ exclusion
 carried over, quasi-IQ map, band-wise test region and full map with the live events, save. The
 band-wise result is checked to be identical to a single call.
+
+### 6.9 Montage batch: process and index every tile of an APEX montage
+
+An APEX montage ("stitch") scan is one `.edaxh5` project holding every tile as a map (`OIM Map
+1_r000c000`, `..._r000c001`, ...) with its grid, step, pattern center, phases and the Hough results,
+plus one `.up1`/`.up2` per tile. The version-4 `.up1` header carries the tile's map GUID, which is
+how the files are linked (the project never names the pattern files); `STITCH_DATASET_NOTES.md`
+describes both formats. Nothing is stitched here: every tile is processed and indexed on its own
+grid, and the stitching is done afterwards in OIM Analysis or MTEX from the output project.
+
+The **3. Montage batch** tab:
+
+- **Project**: browse for the `.edaxh5` (or type the path and *Load project*). The table lists every
+  map of the project with its grid, the raw pattern file found for it in the *raw pattern folder*
+  (default: the project's folder) and the processed file found in the *output folder* (default:
+  `processed` next to the project). Tiles without a pattern file are listed and skipped, never an
+  error. A file is matched by GUID, or by name for version-3 headers, and its grid and size are
+  checked against the map; a mismatch shows in the status column. The log prints the first tile's
+  PC, tilts and phases, and warns when tiles differ in any of them.
+- **1. Batch processing** uses the pattern processor tab's settings. *Load selected tile in the
+  processor* loads a raw tile in tab 1 to set up the processing (background, NLPAR lambda, IQ
+  range, ...). *Process all tiles* then computes one static background from the patterns of all
+  tiles together (streamed, when the processor's static background is on), and processes the tiles
+  one after the other with those settings into `<tile>_proc.up1` in the output folder (the suffix
+  is editable). The header is copied as it is, so the processed file keeps the GUID. Each tile is
+  unloaded after it is written, and the processor is empty when the batch ends. The IQ range
+  applies per tile as fractions of that tile's IQ range, as in the processor; excluded patterns are
+  written as zeros. NLPAR, when enabled, runs per tile with the lambda optimized on the preview
+  tile.
+- **2. Batch indexing** uses the indexing tab's settings: one projection center, sample tilt,
+  camera tilt and pixel size for the whole montage, as typed there (*Copy the project's PC and
+  tilts to the indexing tab* fills them from the first tile; check them). *Load selected tile in
+  the indexer* puts one processed tile into tab 2 for a test region. *Index all tiles* loads each
+  processed tile memory mapped, skips its zero patterns, indexes it band by band with the live view
+  of this tab, and writes its orientation matrices, score (`CI`), IQ, phase and `Valid` flag into a
+  copy of the project, `<project>_sph_bw<bandwidth>.edaxh5` in the output folder, right after the
+  tile is done (the copy is made when the batch starts, so tiles not indexed keep their Hough
+  results). The orientation matrix convention of the file was verified against the Hough results
+  of a real tile. Untick *Index the processed files* to index the raw files instead.
+- **Cancel batch** stops the batch: in processing the current tile is abandoned (its partial file is
+  deleted) and the tiles already written stay; in indexing after the current band, with the tiles
+  already indexed in the output project.
+
+The two steps are separate on purpose: all processed tiles are on disk and RAM is empty before the
+indexing starts. From a script, `montage.py` does the reading and writing:
+
+```python
+import montage
+project = montage.read_project("GMAW 304L 309.edaxh5")
+montage.pattern_folder_tiles(project, "processed", prefer_suffix="_proc")
+print(montage.tile_table(project))
+out = montage.copy_project(project.path, "processed/GMAW 304L 309_sph_bw68.edaxh5")
+montage.write_tile_result(out, project.tiles[0], xmap)   # xmap: the tile's crystal map, TWIST applied
+```
+
+`python montage.py project.edaxh5 --patterns FOLDER` prints the tile table from the command line.
+`make_montage_sample.py` cuts a few-MB sample (every map cropped to a few rows and columns, the
+pattern files cropped to match, GUIDs kept) out of a real montage for tests;
+`example_data/montage_sample/` is one such sample.
 
 ---
 

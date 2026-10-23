@@ -12,6 +12,8 @@
 !sph_core.py
 !kikuchi_workbench.py
 !live_view.py
+!montage.py
+!montage_tab.py
 !Open workbench.bat
 !build_refinement_notebook.py
 !spherical_indexing_template.ipynb

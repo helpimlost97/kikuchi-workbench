@@ -100,9 +100,10 @@ from matplotlib.figure import Figure  # noqa: E402
 import ebsd_params  # noqa: E402
 import sph_core  # noqa: E402
 from live_view import LiveView  # noqa: E402
+from montage_tab import MontageTab  # noqa: E402
 from sph_core import Settings  # noqa: E402
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # The EDAX detector is 30 mm wide: the pixel size of the EDAX/TSL projection center convention follows from the
 # pattern width alone, which is why the GUI fills it in (ebsd_params.py uses the same default, --det-mm 30).
@@ -488,8 +489,12 @@ class Workbench(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.proc = None
+        self.montage_tab = None
         self._build_processor_tab()
         self._build_indexing_tab()
+        self._live_view = self.live
+        self.montage_tab = MontageTab(self)
+        self.tabs.addTab(self.montage_tab, "3. Montage batch")
         self.tabs.setCurrentIndex(1 if self.proc is None else 0)
         if preset:
             self.load_preset(preset)
@@ -747,9 +752,13 @@ class Workbench(QMainWindow):
     def log(self, text: str):
         self.log_box.appendPlainText(text)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
+        if self.montage_tab is not None:
+            self.montage_tab.log(text)
 
     def set_progress(self, text: str):
         self.progress_label.setText(text[-200:])
+        if self.montage_tab is not None:
+            self.montage_tab.set_progress(text)
 
     def status(self, text: str):
         self.set_progress(text)
@@ -761,7 +770,7 @@ class Workbench(QMainWindow):
             b.setEnabled(not busy)
         self.btn_load_processed.setEnabled(not busy and bool(self.processed_file))
 
-    def _start(self, fn, on_done, on_event=None):
+    def _start(self, fn, on_done, on_event=None, on_failed=None):
         if self.worker is not None and self.worker.isRunning():
             QMessageBox.information(self, "Busy", "Wait for the running step to finish")
             return
@@ -784,8 +793,10 @@ class Workbench(QMainWindow):
             self._busy(False)
             self.set_progress("")
             if self.live_run is not None:
-                self.live.end_run(False)
+                self._live_view.end_run(False)
                 self.live_run = None
+            if on_failed is not None:
+                on_failed()
             self.log(text)
             QMessageBox.critical(self, "Error", text[-1500:])
 
@@ -1127,7 +1138,7 @@ class Workbench(QMainWindow):
                     if name == "block_done":
                         data = dict(data)
                         xb = data.pop("xmap")
-                        data["rgb"] = None if xb is None else sph_core.ipf_rgb_map(xb, "z")
+                        data["rgb"] = None if xb is None else sph_core.block_rgb(xb, data, "z")
                     emit(name, data)
 
                 # a test region is small: shorter bands, so that the animation shows several of them
@@ -1173,8 +1184,11 @@ class Workbench(QMainWindow):
         if name == "run_start":
             self.live_run = {"signal": data["signal"], "st": data["st"], "r0": data["r0"], "c0": data["c0"], "n_patterns": data["n_patterns"],
                              "done": 0, "t0": time.perf_counter(), "window": collections.deque(), "block": None}
-            self.live.begin_run(data["r0"], data["c0"], data["rows"], data["cols"], data["n_patterns"])
-            self.view_tabs.setCurrentWidget(self.live)
+            # the live view that shows this run: the indexing tab's, or the montage tab's own
+            self._live_view = data.get("live_view", self.live)
+            self._live_view.begin_run(data["r0"], data["c0"], data["rows"], data["cols"], data["n_patterns"])
+            if self._live_view is self.live:
+                self.view_tabs.setCurrentWidget(self.live)
             return
         run = self.live_run
         if run is None:
@@ -1182,12 +1196,12 @@ class Workbench(QMainWindow):
         r0, c0 = run["r0"], run["c0"]
         if name == "block_start":
             run["block"] = (data["r0"], data["r1"], data["n_patterns"])
-            self.live.block_started(r0 + data["r0"], r0 + data["r1"], c0 + data["c0"], c0 + data["c1"], data["n_patterns"])
+            self._live_view.block_started(r0 + data["r0"], r0 + data["r1"], c0 + data["c0"], c0 + data["c1"], data["n_patterns"])
         elif name == "progress":
             if data.get("what") == "iq":
                 self.set_progress(f"Quasi-IQ map: {100 * data['frac_index']:.0f} %")
                 return
-            self.live.block_progress(data["frac_index"], data["frac_refine"])
+            self._live_view.block_progress(data["frac_index"], data["frac_refine"])
             if run["block"] is not None:
                 # patterns done so far, with the coarse search of the current band counted by its fraction
                 done = run["done"] + data["frac_index"] * run["block"][2]
@@ -1196,15 +1210,15 @@ class Workbench(QMainWindow):
             n_block = int(data.get("n_patterns", data["done_patterns"] - run["done"]))
             run["done"] = data["done_patterns"]
             run["block"] = None
-            self.live.block_done(r0 + data["r0"], r0 + data["r1"], c0 + data["c0"], c0 + data["c1"], data["rgb"],
-                                 n_block, data["seconds"])
-            self.live.set_progress(data["done_patterns"], data["total_patterns"], data["eta_seconds"])
+            self._live_view.block_done(r0 + data["r0"], r0 + data["r1"], c0 + data["c0"], c0 + data["c1"], data["rgb"],
+                                       n_block, data["seconds"])
+            self._live_view.set_progress(data["done_patterns"], data["total_patterns"], data["eta_seconds"])
             self._update_speed(run, data["done_patterns"])
             self.set_progress(
                 f"{data['done_patterns']} / {data['total_patterns']} patterns, {data['patterns_per_second']:.0f} patterns/s in this band, "
                 f"ETA {data['eta_seconds'] / 60:.1f} min")
         elif name == "run_end":
-            self.live.end_run(bool(data.get("success", True)))
+            self._live_view.end_run(bool(data.get("success", True)))
             self.live_run = None
 
     def _update_speed(self, run, done_patterns, window_seconds=3.0):
@@ -1216,7 +1230,7 @@ class Workbench(QMainWindow):
             window.popleft()
         if len(window) >= 2 and now - window[0][0] > 0.5:
             speed = (window[-1][1] - window[0][1]) / (now - window[0][0])
-            self.live.set_speed(max(speed, 0.0))
+            self._live_view.set_speed(max(speed, 0.0))
 
     def show_indexing_maps(self, run):
         xmap = run["xmap"]

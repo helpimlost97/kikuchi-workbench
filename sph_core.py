@@ -933,6 +933,13 @@ def ipf_rgb_map(xmap, direction="z", background=0.6) -> np.ndarray:
     return full.reshape(tuple(xmap.shape) + (3,))
 
 
+def block_rgb(xmap, block: dict, direction="z") -> np.ndarray:
+    """IPF colours of one band of :func:`index_blocks` as a (rows, cols, 3) image. A band of one map row is a 1D
+    crystal map (orix drops the axis), whose image would be (cols, 3); the band's r0, r1, c0, c1 restore it."""
+    rgb = ipf_rgb_map(xmap, direction)
+    return rgb.reshape(int(block["r1"]) - int(block["r0"]), int(block["c1"]) - int(block["c0"]), 3)
+
+
 def map_data(xmap, name: str) -> np.ndarray:
     return np.asarray(xmap.get_map_data(name), dtype=float)
 
