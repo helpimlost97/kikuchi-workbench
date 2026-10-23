@@ -925,12 +925,38 @@ def ipf_rgb(xmap, direction="z") -> np.ndarray:
     return rgb
 
 
+def full_shape(xmap) -> tuple:
+    """The (rows, cols) of a crystal map's whole grid, masked points included. ``xmap.shape`` is the extent of the
+    points in the data only, so it shrinks when a whole edge row or column is masked out."""
+    n = int(np.asarray(xmap.is_in_data).size)
+    if int(np.prod(xmap.shape)) == n:
+        return tuple(int(v) for v in xmap.shape)
+    ys, xs = getattr(xmap, "_y", None), getattr(xmap, "_x", None)
+    if ys is not None and xs is not None and np.asarray(ys).size == n:
+        n_rows, n_cols = len(np.unique(np.asarray(ys))), len(np.unique(np.asarray(xs)))
+        if n_rows * n_cols == n:
+            return (n_rows, n_cols) if n_rows > 1 or xmap.ndim == 2 else (n_cols,)
+    return (n,)
+
+
+def full_map_data(xmap, name: str, fill=np.nan) -> np.ndarray:
+    """A property of a crystal map on its whole grid (``fill`` where not in the data), float."""
+    full = np.full(int(np.asarray(xmap.is_in_data).size), float(fill), dtype=float)
+    if name in xmap.prop:
+        values = np.asarray(xmap.prop[name], dtype=float)
+        if values.ndim > 1:
+            values = values[:, 0]
+        full[np.asarray(xmap.is_in_data, dtype=bool).ravel()] = values
+    return full.reshape(full_shape(xmap))
+
+
 def ipf_rgb_map(xmap, direction="z", background=0.6) -> np.ndarray:
-    """IPF colours as a (rows, cols, 3) image; points not in the data (e.g. masked out) are grey."""
+    """IPF colours as a (rows, cols, 3) image of the whole grid; points not in the data (e.g. masked out) are
+    grey."""
     rgb = ipf_rgb(xmap, direction)
     full = np.full((xmap.is_in_data.size, 3), float(background))
-    full[xmap.is_in_data] = rgb
-    return full.reshape(tuple(xmap.shape) + (3,))
+    full[np.asarray(xmap.is_in_data, dtype=bool).ravel()] = rgb
+    return full.reshape(full_shape(xmap) + (3,))
 
 
 def block_rgb(xmap, block: dict, direction="z") -> np.ndarray:
@@ -941,7 +967,7 @@ def block_rgb(xmap, block: dict, direction="z") -> np.ndarray:
 
 
 def map_data(xmap, name: str) -> np.ndarray:
-    return np.asarray(xmap.get_map_data(name), dtype=float)
+    return full_map_data(xmap, name)
 
 
 def save_xmap(xmap, out_dir: str | Path, stem: str, save_ang: bool = True, save_h5: bool = True,

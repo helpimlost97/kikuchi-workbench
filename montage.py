@@ -504,8 +504,11 @@ def write_tile_result(out_path: str | os.PathLike, tile: Tile, xmap, iq_prop: st
     same index), ``Fit`` 0 and ``Valid`` 1 for indexed points. The other fields (SEM signal, PRIAS strips) are
     kept. ``comment`` goes into ``EBSD/ANG/HEADER/Comments``. Returns counts.
     """
-    if tuple(int(v) for v in xmap.shape) != (tile.n_rows, tile.n_cols):
-        raise ValueError(f"{tile.name}: crystal map shape {tuple(xmap.shape)} is not the tile's grid ({tile.n_rows}, {tile.n_cols})")
+    from sph_core import full_shape
+
+    shape = full_shape(xmap)
+    if shape != (tile.n_rows, tile.n_cols):
+        raise ValueError(f"{tile.name}: crystal map grid {shape} is not the tile's grid ({tile.n_rows}, {tile.n_cols})")
     mats, in_data = _full_grid_matrices(xmap)
     iq = _full_grid_prop(xmap, iq_prop, in_data, 0.0)
     ci = _full_grid_prop(xmap, ci_prop, in_data, -1.0)
