@@ -35,6 +35,26 @@ PATCH = Path(__file__).resolve().parent / "kikuchipy_local_patches.patch"
 
 
 def run(args, cwd=None, check=True, capture=False):
+    """Run one command, echoing it first as a "$ ..." line so the output reads like a terminal session.
+
+    Parameters
+    ----------
+    args : sequence
+        The command and its arguments; every item is converted with ``str()``, so ``Path`` objects are fine.
+    cwd : path-like or None
+        Working directory of the command (None: the current one).
+    check : bool
+        When True, a non-zero exit code ends the script through ``sys.exit`` with a one-line message (the
+        captured output, if any, is printed first). When False, the caller reads ``returncode`` itself.
+    capture : bool
+        When True, stdout and stderr are captured together into ``result.stdout`` instead of going to the
+        terminal.
+
+    Returns
+    -------
+    subprocess.CompletedProcess
+        With ``stdout`` set only when ``capture`` is True.
+    """
     print("$", " ".join(str(a) for a in args), flush=True)
     result = subprocess.run(
         [str(a) for a in args], cwd=cwd, check=False, text=True,
@@ -47,7 +67,27 @@ def run(args, cwd=None, check=True, capture=False):
     return result
 
 
+def short_hash(clone, ref):
+    """The abbreviated commit hash of ``ref`` (a branch, tag or commit) in the clone at ``clone``."""
+    return run(["git", "rev-parse", "--short", ref], cwd=clone, capture=True).stdout.strip()
+
+
+def local_changes(clone):
+    """The ``git status --porcelain`` listing of the modified tracked files of the clone; empty when it is clean.
+
+    Untracked files are ignored on purpose: build output and editor files are harmless to a checkout.
+    """
+    return run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=clone, capture=True).stdout.strip()
+
+
 def main():
+    """Parse the command line and perform the five steps of the module docstring.
+
+    Side effects: network access (git clone or fetch), changes to the working tree and HEAD of the clone, and
+    unless --no-install a ``pip install -e`` into the environment of the running Python. Exits with a message
+    through ``sys.exit`` as soon as a step cannot be done safely (missing patch file, foreign local changes,
+    patch not fitting the checked-out commit, failing command).
+    """
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", default="kikuchipy", help="folder of the clone (default: ./kikuchipy)")
     ap.add_argument("--commit", default=PINNED_COMMIT, help=f"commit or branch to check out (default: {PINNED_COMMIT})")
@@ -59,6 +99,7 @@ def main():
     if not PATCH.exists():
         sys.exit(f"patch file not found: {PATCH}")
 
+    # Step 1: clone or fetch
     if not (clone / ".git").exists():
         if clone.exists() and any(clone.iterdir()):
             sys.exit(f"{clone} exists and is not a git clone; move it away or pass --dir")
@@ -66,14 +107,14 @@ def main():
     else:
         run(["git", "fetch", "origin", "develop"], cwd=clone)
 
-    latest = run(["git", "rev-parse", "--short", "origin/develop"], cwd=clone, capture=True).stdout.strip()
+    latest = short_hash(clone, "origin/develop")
     print(f"newest commit of origin/develop: {latest}")
     if a.show_latest:
         run(["git", "log", "--oneline", f"{PINNED_COMMIT}..origin/develop"], cwd=clone)
         return
 
     # Step 2: a clean tree, undoing only our own patch
-    dirty = run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=clone, capture=True).stdout.strip()
+    dirty = local_changes(clone)
     if dirty:
         reverse_ok = run(["git", "apply", "--reverse", "--check", PATCH], cwd=clone, check=False, capture=True)
         if reverse_ok.returncode != 0:
@@ -84,19 +125,19 @@ def main():
             )
         run(["git", "apply", "--reverse", PATCH], cwd=clone)
         print("reverted the previously applied local patch")
-        # the reverse-apply check only looks at the files the patch touches: anything else that is still
-        # modified is someone's own work and must not be carried through the checkout
-        dirty = run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=clone, capture=True).stdout.strip()
+        # The reverse-apply check only looks at the files the patch touches: anything else that is still
+        # modified is someone's own work and must not be carried through the checkout.
+        dirty = local_changes(clone)
         if dirty:
             print(dirty)
             sys.exit(f"{clone} has local changes besides this project's patch; commit, stash or discard them first")
 
-    # Step 3: the pinned commit
+    # Step 3: the pinned commit. "develop" means the fetched branch, not a stale local branch of that name.
     target = a.commit
     if target in ("develop", "origin/develop"):
         target = "origin/develop"
     run(["git", "-c", "advice.detachedHead=false", "checkout", "--detach", target], cwd=clone)
-    head = run(["git", "rev-parse", "--short", "HEAD"], cwd=clone, capture=True).stdout.strip()
+    head = short_hash(clone, "HEAD")
     print(f"checked out {head}")
 
     # Step 4: the patch
@@ -109,7 +150,8 @@ def main():
     changed = run(["git", "status", "--short"], cwd=clone, capture=True).stdout.strip()
     print("patched files:\n" + changed)
 
-    # Step 5: install
+    # Step 5: install. The import check runs from the home folder so that it cannot pick up a kikuchipy
+    # folder in the current directory instead of the installed package.
     if not a.no_install:
         run([sys.executable, "-m", "pip", "install", "-e", clone])
         code = "import kikuchipy as kp; print('kikuchipy', kp.__version__, 'from', kp.__file__)"

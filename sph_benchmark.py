@@ -1,10 +1,27 @@
-"""Benchmark kikuchipy spherical indexing (jwestraadt fork) on the nickel dataset.
+"""CPU vs GPU speed and parity benchmark of the fork's spherical indexing on the nickel demo data set.
 
-Usage:
-  python sph_benchmark.py --backend cpu|gpu|both [--workers N] [--repeat N]
-                          [--chunksize N] [--no-refine] [--compare] [--bandwidth 68]
+Run it after the install (README section 5) to see the throughput of each backend and to check that the GPU
+gives the same orientations as the CPU. The data set is kikuchipy's ``nickel_ebsd_large`` (4125 patterns of
+60 x 60 px, downloaded once by pooch) with its small master pattern; both background removals are applied
+first, as in the fork's tutorial.
+
+    python sph_benchmark.py --backend cpu|gpu|both [--workers N] [--repeat N]
+                            [--chunksize N] [--no-refine] [--compare] [--bandwidth 68]
+
+--backend     which backend(s) to time (default: both). --compare forces both.
+--workers     Dask threads (default: 8); about the number of performance cores.
+--repeat      index the full map this many times per backend and report the best time (default: 1).
+--chunksize   patterns per Dask chunk and, on the GPU, the device batch size (default: automatic).
+--bandwidth   spherical harmonic bandwidth of the indexing (default: 68, the EMSphInx default).
+--no-refine   skip the Newton refinement, so only the coarse grid search is timed.
+--compare     index on both backends and print the CPU vs GPU misorientation and score difference.
+
+Every backend is first run on ten patterns so that Numba compilation and CuPy kernel loading are not part of
+the timing. Prints the timing of each run and, per backend, "BEST: <s> = <patterns/s>"; writes no files.
 """
-import argparse, time, sys
+import argparse
+import time
+
 import numpy as np
 import dask
 import kikuchipy as kp
@@ -29,11 +46,15 @@ s.remove_dynamic_background()
 n_pat = int(np.prod(s.axes_manager.navigation_shape))
 print(f"  {s.axes_manager.navigation_shape} nav, {s.axes_manager.signal_shape} sig, {n_pat} patterns")
 
+# The harmonics are computed once at bandwidth 188; the indexer resizes them down to --bandwidth, so one set
+# serves every bandwidth up to 188.
 mp = kp.data.nickel_ebsd_master_pattern_small(projection="lambert", hemisphere="both")
 t0 = time.perf_counter()
 harm = mp.get_spherical_harmonics(bandwidth=188)
 print(f"  harmonics (bw 188) in {time.perf_counter()-t0:.1f} s")
-det = s.detector.deepcopy(); det.pc = det.pc_average
+# The demo detector carries a PC per pattern; the indexer needs one PC for the whole map.
+det = s.detector.deepcopy()
+det.pc = det.pc_average
 
 backends = ["cpu", "gpu"] if a.backend == "both" else [a.backend]
 if a.compare and a.backend != "both":
@@ -42,7 +63,8 @@ if a.compare and a.backend != "both":
 results = {}
 for be in backends:
     kw = dict(bandwidth=a.bandwidth, refine=refine, backend=be, verbose=0)
-    if a.chunksize: kw["chunksize"] = a.chunksize
+    if a.chunksize:
+        kw["chunksize"] = a.chunksize
     # warm-up (numba JIT / cupy kernels) on a small slice
     t0 = time.perf_counter()
     s.inav[:10, :1].spherical_indexing(harm, det, **kw)
@@ -67,6 +89,7 @@ if a.compare and "cpu" in results and "gpu" in results:
     ang = xc.orientations.angle_with(xg.orientations, degrees=True)  # symmetry-reduced
     print(f"CPU vs GPU misorientation: median {np.median(ang):.4f} deg, "
           f"max {ang.max():.4f} deg, >0.01 deg: {(ang > 0.01).sum()} / {ang.size}")
+    # The cross-correlation score is stored under whichever of these names the fork's version uses
     for name in ("scores", "score"):
         if name in xc.prop and name in xg.prop:
             d = np.abs(np.asarray(xc.prop[name]) - np.asarray(xg.prop[name]))

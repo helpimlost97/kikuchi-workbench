@@ -1,14 +1,19 @@
 """Test that GPU memory is released after a spherical indexing run.
 
-Runs the nickel demo dataset twice on the GPU and checks that
+Checks the cuFFT plan-cache patch of kikuchipy_local_patches.patch (README section 3): without it, several GB
+of VRAM stay allocated after a GPU run and the next run picks a tiny automatic batch size. Runs the nickel
+demo dataset twice on the GPU and checks that
 
-1. the free VRAM after each run is back to about what it was at the start,
+1. the free VRAM after each run is back to about what it was at the start (within TOLERANCE_GB),
 2. the automatic batch size of the second run equals that of the first,
 3. both runs give the same orientations.
 
 Usage:
     python test_gpu_memory_fix.py            # bandwidth 123
     python test_gpu_memory_fix.py 68         # another bandwidth
+
+Needs CuPy and a GPU. Prints the free VRAM and batch size before and after each run and ends with
+"RESULT: PASS" (exit code 0) or "RESULT: FAIL" (exit code 1). Writes no files.
 """
 
 import sys
@@ -16,7 +21,6 @@ import time
 
 import cupy
 import dask
-import numpy as np
 
 import kikuchipy as kp
 from kikuchipy.indexing._spherical import _gpu
@@ -26,10 +30,16 @@ TOLERANCE_GB = 0.5
 
 
 def free_gb():
+    """Free VRAM of device 0 in GB (1e9 bytes), as the CUDA runtime reports it."""
     return cupy.cuda.runtime.memGetInfo()[0] / 1e9
 
 
 def auto_batch():
+    """The device batch size the indexer would pick now for BANDWIDTH from the free VRAM.
+
+    Uses the fork's private ``_gpu._default_batch_size(bandwidth, free_bytes)`` (a pure function of the VRAM
+    model) with the current free VRAM, so a run that leaks VRAM shows up as a smaller batch size.
+    """
     return _gpu._default_batch_size(BANDWIDTH, int(cupy.cuda.runtime.memGetInfo()[0]))
 
 
@@ -42,6 +52,7 @@ s.remove_static_background()
 s.remove_dynamic_background()
 mp = kp.data.nickel_ebsd_master_pattern_small(projection="lambert", hemisphere="both")
 harmonics = mp.get_spherical_harmonics(bandwidth=188)
+# The demo detector carries a PC per pattern; the indexer needs one PC for the whole map.
 det = s.detector.deepcopy()
 det.pc = det.pc_average
 
@@ -53,7 +64,7 @@ free_start = free_gb()
 print(f"\nBandwidth {BANDWIDTH}")
 print(f"Free VRAM at start:    {free_start:.2f} GB, automatic batch size {auto_batch()}")
 
-rows = []
+batch_sizes = []
 xmaps = []
 for run in (1, 2):
     batch = auto_batch()
@@ -61,15 +72,15 @@ for run in (1, 2):
     xmap = s.spherical_indexing(harmonics, det, bandwidth=BANDWIDTH, backend="gpu", verbose=1)
     dt = time.perf_counter() - t0
     free_after = free_gb()
-    rows.append((run, batch, xmap.size / dt, free_after))
+    batch_sizes.append(batch)
     xmaps.append(xmap)
     print(
         f"Run {run}: batch size {batch}, {xmap.size / dt:.0f} patterns/s, "
         f"free VRAM after the run {free_after:.2f} GB"
     )
 
-held = free_start - rows[-1][3]
-same_batch = rows[0][1] == rows[1][1]
+held = free_start - free_after
+same_batch = batch_sizes[0] == batch_sizes[1]
 angle = xmaps[0].orientations.angle_with(xmaps[1].orientations, degrees=True)
 same_result = float(angle.max()) < 1e-6
 

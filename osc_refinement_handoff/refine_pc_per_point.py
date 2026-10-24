@@ -3,7 +3,8 @@
 CPU only (kikuchipy pattern-matching refinement, numba + dask threads, nlopt). Stand-alone script for a
 cluster, with the starting orientations read from an .ang file written by the workbench or EMSphInx. It is
 the only form of the per-point refinement in the repository (a cheaper projection center drift correction
-without patterns exists outside the repository).
+without patterns exists outside the repository). The hand-off notes next to it, OSC_REFINEMENT_HANDOFF.md,
+describe the data, the environment and the pitfalls met so far.
 
 Flow (https://kikuchipy.org/en/stable/tutorials/hybrid_indexing.html, without the Hough / dictionary parts):
 
@@ -18,7 +19,11 @@ Usage:
     python refine_pc_per_point.py test     # calibration + test region (minutes)
     python refine_pc_per_point.py full     # calibration + full map (hours)
 
-Everything is set in the SETTINGS block. Nothing below it needs editing.
+Everything is set in the SETTINGS block. Nothing below it needs editing. Both stages print the calibration
+table, the fitted PC plane and the neighbour misorientation before and after refinement; "full" also writes
+<OUTPUT_NAME>_bin<REFINE_BINNING>.h5 and .ang (the refined map; the .ang gets the starting map's IQ and the
+refinement score as CI) and <OUTPUT_NAME>_bin<REFINE_BINNING>_pc.npy (the PC per map point, Bruker
+convention) into OUTPUT_DIR. The calibration is recomputed by every run, so the stages are independent jobs.
 """
 
 import os
@@ -35,41 +40,45 @@ from orix.crystal_map import CrystalMap, PhaseList
 from orix.quaternion import Orientation, Rotation
 
 # ============================================ SETTINGS ============================================
+# Files
 DATA_DIR = Path(r"/path/to/data")  # <-- the folder on the cluster that holds the files below
 PATTERN_FILE = DATA_DIR / "MB6-103 Real Chi_New Sample_Area 1_EBSD+EDS Map 1_NLPAR1-Norm.up1"
-ANG_FILE = DATA_DIR / "SphInx_TopRefined.ang"      # EMSphInx result: the starting orientations
+ANG_FILE = DATA_DIR / "SphInx_TopRefined.ang"      # EMSphInx or workbench result: the starting orientations
 MASTER_PATTERN_FILE = DATA_DIR / "Ni-master.h5"    # EMsoft master pattern of the phase (refinement cannot use .sht)
 ENERGY = 20            # beam energy in keV of the master pattern to use (check it exists in the .h5)
-OUTPUT_DIR = DATA_DIR
-OUTPUT_NAME = "SphInx_TopRefined_kp_refined"       # output files are <OUTPUT_NAME>.h5 / .ang / _pc.npy
+OUTPUT_DIR = DATA_DIR  # where the refined map and the PC array are written (created if needed)
+OUTPUT_NAME = "SphInx_TopRefined_kp_refined"       # outputs: <OUTPUT_NAME>_bin<REFINE_BINNING>.h5 / .ang / _pc.npy
 
 # Patterns
-LAZY = True            # True needs the loader patch for .up1 (see the handoff); False loads the whole file into RAM
+LAZY = True            # True streams the file in chunks (needs the loader patch for .up1, see the handoff);
+#                        False loads the whole file into RAM (about twice the file size at peak)
 NAV_SHAPE = None       # (n_rows, n_cols). None = from the pattern file, else from the .ang header
 REMOVE_STATIC_BACKGROUND = False   # the NLPAR "Norm" file is already processed; set True for the raw file
 REMOVE_DYNAMIC_BACKGROUND = False
 
-# Detector geometry (EDAX Quattro camera, conventional EBSD). PC None = x-star, y-star, z-star of the .ang header
-PC = None
-PC_CONVENTION = "edax"
+# Detector geometry (EDAX Quattro camera, conventional EBSD)
+PC = None              # (x*, y*, z*) in PC_CONVENTION; None = x-star, y-star, z-star of the .ang header
+PC_CONVENTION = "edax"  # convention of PC and of the .ang header ("edax", "emsoft", "bruker", ...)
 SAMPLE_TILT = 70.0     # degrees
 CAMERA_TILT = 8.0      # camera elevation in degrees
-PX_SIZE = 260.87       # um per detector pixel (30 mm wide camera at 115 px); only used for a consistency print
-BINNING = 1
-TWIST = 0.0            # detector rotation about its normal; 0 for conventional EBSD (15 for the RKD setup)
+PX_SIZE = 260.87       # um per detector pixel (30 mm wide camera at 115 px); refinement works in PC fractions,
+#                        so it only matters for the consistency print of the PC change per scan step
+BINNING = 1            # binning of the patterns in the file relative to PX_SIZE (1: PX_SIZE is per file pixel)
+TWIST = 0.0            # detector rotation about its normal in degrees; 0 for conventional EBSD (15 for the RKD setup).
+#                        Must equal the TWIST the .ang was indexed with: it is removed before and re-applied after.
 
 # Refinement
-N_WORKERS = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))   # dask threads
+N_WORKERS = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count()))   # dask threads; ask for a whole node
 REFINE_BINNING = 1     # bin the patterns by this factor before refinement (patterns are 115 px, so 1)
 PC_GRID = (5, 5)       # (rows, cols) of map blocks; the best pattern of each block calibrates the PC
-PC_TRUST_REGION = 0.05 # calibration: how far each PC value may move from PC
+PC_TRUST_REGION = 0.05 # calibration: how far each PC value may move from PC (fraction of the detector width)
 REFINE_TRUST_REGION = 2.0   # how far each Euler angle may move from the starting orientation, in degrees
 REFINE_RTOL = 1e-7     # stop refining a pattern when the score changes by less than this (relative)
-REFINE_MAXEVAL = 300   # ... or after this many simulated patterns
+REFINE_MAXEVAL = 300   # ... or after this many simulated patterns (the calibration gets twice as many)
 REFINE_ROI = None      # (col_start, col_stop, row_start, row_stop) to refine only part of the map. None = all
 TEST_SIZE = 50         # side length in map points of the test region
-SAVE_ANG = True
-SAVE_H5 = True
+SAVE_ANG = True        # write <OUTPUT_NAME>_bin<REFINE_BINNING>.ang after "full"
+SAVE_H5 = True         # write <OUTPUT_NAME>_bin<REFINE_BINNING>.h5 (orix format) after "full"
 # ===================================================================================================
 
 stage = sys.argv[1] if len(sys.argv) > 1 else "test"
@@ -80,8 +89,26 @@ print(f"kikuchipy {kp.__version__}, {N_WORKERS} dask workers, stage: {stage}")
 
 
 # ---------------------------------------- helpers (as in sph_core.py) ----------------------------------------
+def indexed_phase_ids(xmap):
+    """The ids of the phases present in the data of ``xmap``, without the "not indexed" phase (id -1)."""
+    return [i for i in xmap.phases_in_data.ids if i != -1]
+
+
 def rotate_about_z(xmap, degrees):
-    """Crystal map with the orientations rotated by `degrees` about the sample normal (the workbench's TWIST)."""
+    """Crystal map with the orientations rotated by ``degrees`` about the sample normal (the workbench's TWIST).
+
+    Parameters
+    ----------
+    xmap : orix.crystal_map.CrystalMap
+        A map on its full grid (every point in the data); its phases, properties and coordinates are kept.
+    degrees : float
+        Rotation angle about the sample z axis in degrees; 0 returns ``xmap`` itself.
+
+    Returns
+    -------
+    orix.crystal_map.CrystalMap
+        A new map (or ``xmap`` for 0 degrees).
+    """
     if not degrees:
         return xmap
     twist = Rotation.from_axes_angles([0, 0, 1], degrees, degrees=True)
@@ -102,8 +129,19 @@ def neighbour_misorientation(xmap):
     """Misorientation of every map point to its right and its lower neighbour in degrees, as two 2D arrays.
 
     Inside a grain this is mostly the noise of the orientations. Points without that neighbour are NaN.
+
+    Parameters
+    ----------
+    xmap : orix.crystal_map.CrystalMap
+        A 2D map with one phase and every grid point in the data (the rotations are reshaped to the grid).
+
+    Returns
+    -------
+    right, below : numpy.ndarray
+        Two float arrays of shape ``xmap.shape`` (rows, cols): the symmetry-reduced angle to the neighbour
+        in the next column and in the next row.
     """
-    point_group = xmap.phases[[i for i in xmap.phases_in_data.ids if i != -1][0]].point_group
+    point_group = xmap.phases[indexed_phase_ids(xmap)[0]].point_group
     quat = xmap.rotations.data.reshape(xmap.shape + (4,))
     right = np.full(xmap.shape, np.nan)
     below = np.full(xmap.shape, np.nan)
@@ -117,21 +155,41 @@ def neighbour_misorientation(xmap):
 
 
 def report_refinement(xmap_ref, xmap_before, title=""):
-    """Neighbour misorientation before and after refinement, and how far refinement rotated the orientations."""
+    """Print the neighbour misorientation before and after refinement, and how far refinement rotated the orientations.
+
+    Parameters
+    ----------
+    xmap_ref : orix.crystal_map.CrystalMap
+        The refined map, with the ``scores`` and ``num_evals`` properties of kikuchipy's refinement.
+    xmap_before : orix.crystal_map.CrystalMap
+        The starting map of the same points, in the same order.
+    title : str
+        Heading of the printed block.
+
+    "Inside grains" means neighbour pairs below 1 degree, so grain boundaries do not dominate the statistics.
+    """
     before = np.nanmean(neighbour_misorientation(xmap_before), axis=0)
     after = np.nanmean(neighbour_misorientation(xmap_ref), axis=0)
     rotated = xmap_before.orientations.angle_with(xmap_ref.orientations, degrees=True)
     print(f"--- {title} ---")
     for name, values in (("before", before), ("refined", after)):
         inside = values[values < 1]
-        print(f"Neighbour misorientation inside grains, {name}: median {np.median(inside):.3f} deg, mean {inside.mean():.3f} deg")
+        print(f"Neighbour misorientation inside grains, {name}: median {np.median(inside):.3f} deg, "
+              f"mean {inside.mean():.3f} deg")
     print(f"Rotated by refinement: median {np.median(rotated):.3f} deg, p99 {np.percentile(rotated, 99):.3f} deg")
-    print(f"Score: mean {xmap_ref.scores.mean():.3f}; simulated patterns per point: mean {xmap_ref.num_evals.mean():.0f}, max {xmap_ref.num_evals.max()}")
+    print(f"Score: mean {xmap_ref.scores.mean():.3f}; simulated patterns per point: "
+          f"mean {xmap_ref.num_evals.mean():.0f}, max {xmap_ref.num_evals.max()}")
 
 
-# ---------------------------------------- 1. starting map from the .ang ----------------------------------------
+def region_size(region):
+    """Number of map points of a region ``(col_start, col_stop, row_start, row_stop)``."""
+    c0, c1, r0, r1 = region
+    return (c1 - c0) * (r1 - r0)
+
+
+# ---------------------------------------- setup: starting map from the .ang ----------------------------------------
 xmap_ang = io.load(ANG_FILE)
-ids = [i for i in xmap_ang.phases_in_data.ids if i != -1]
+ids = indexed_phase_ids(xmap_ang)
 if len(ids) != 1:
     raise ValueError("This script is written for a map with one phase")
 phase = xmap_ang.phases[ids[0]]
@@ -148,14 +206,14 @@ n_rows, n_cols = nav_shape
 n_patterns = xmap_indexed.size
 print(f"Starting map: {n_patterns} points, {nav_shape} (rows, cols), phase {phase.name} ({phase.point_group.name})")
 
-# ---------------------------------------- 2. patterns ----------------------------------------
+# ---------------------------------------- setup: patterns ----------------------------------------
 kwargs = {"lazy": LAZY}
 if NAV_SHAPE is not None:
     kwargs["nav_shape"] = tuple(NAV_SHAPE)
 s = kp.load(PATTERN_FILE, **kwargs)
 if s.axes_manager.navigation_shape[::-1] != nav_shape:
     # Old .up1 files store no map size: take it from the .ang
-    s = kp.load(PATTERN_FILE, nav_shape=nav_shape, **{k: v for k, v in kwargs.items() if k != "nav_shape"})
+    s = kp.load(PATTERN_FILE, lazy=LAZY, nav_shape=nav_shape)
 for axis, step in zip(s.axes_manager.navigation_axes, (xmap_indexed.dx, xmap_indexed.dy)):
     axis.scale = step
     axis.units = "um"
@@ -168,7 +226,7 @@ if REMOVE_STATIC_BACKGROUND:
 if REMOVE_DYNAMIC_BACKGROUND:
     s.remove_dynamic_background()
 
-# ---------------------------------------- 3. detector ----------------------------------------
+# ---------------------------------------- setup: detector ----------------------------------------
 if PC is None:
     header = [line for line in open(ANG_FILE, encoding="utf-8", errors="ignore") if line.startswith("#")]
     pc = {}
@@ -194,15 +252,16 @@ det = kp.detectors.EBSDDetector(
     binning=BINNING,
 )
 
-# ---------------------------------------- 11.1 master pattern and patterns for refinement ----------------------------------------
+# ---------------------------------------- setup: master pattern and patterns for refinement ----------------------
 mp = kp.load(MASTER_PATTERN_FILE, projection="lambert", hemisphere="both", energy=ENERGY)
 mp.phase = phase.deepcopy()  # refinement requires the phase of the map and of the master pattern to be equal
 print(mp)
 
 if REFINE_BINNING > 1:
+    # Crop to a multiple of the binning first, with kikuchipy's own crop so that the PC follows
     rows = sig_shape[0] - sig_shape[0] % REFINE_BINNING
     cols = sig_shape[1] - sig_shape[1] % REFINE_BINNING
-    det_ref = det.crop((0, rows, 0, cols))  # updates the PC for the cropped pattern
+    det_ref = det.crop((0, rows, 0, cols))
     det_ref.pc = det_ref.pc_average
     s_ref = s.isig[:cols, :rows].downsample(REFINE_BINNING, inplace=False)
     det_ref.shape = s_ref.axes_manager.signal_shape[::-1]
@@ -212,7 +271,7 @@ else:
     det_ref = det.deepcopy()
 print(f"Patterns for refinement: {det_ref.shape} px (binning {REFINE_BINNING})")
 
-# ---------------------------------------- 11.2 calibration: a PC per map point ----------------------------------------
+# ---------------------------------------- stage 1: calibration, a PC per map point ----------------------------------
 # The best pattern of each block of the map: the highest score among the points inside a grain,
 # i.e. with all four neighbours within 1 degree
 scores_indexed = xmap_indexed.get_map_data("scores")
@@ -246,6 +305,7 @@ xmap_cal = CrystalMap(
 det_cal = det_ref.deepcopy()
 det_cal.pc = np.tile(det_ref.pc_average, (len(cal_rc), 1))
 
+cal_maxeval = 2 * REFINE_MAXEVAL  # six values are searched for here, three in the refinement of the map
 t0 = time.perf_counter()
 xmap_cal_ref, det_cal_ref = s_cal.refine_orientation_projection_center(
     xmap=xmap_cal,
@@ -255,7 +315,7 @@ xmap_cal_ref, det_cal_ref = s_cal.refine_orientation_projection_center(
     method="LN_NELDERMEAD",
     trust_region=3 * [REFINE_TRUST_REGION] + 3 * [PC_TRUST_REGION],
     rtol=REFINE_RTOL,
-    maxeval=2 * REFINE_MAXEVAL,  # six values are searched for here, three in the refinement of the map
+    maxeval=cal_maxeval,
     chunk_kwargs=dict(chunk_shape=1),  # one pattern per chunk, so that all workers are used
 )
 print(f"Calibration: {time.perf_counter() - t0:.0f} s")
@@ -264,8 +324,8 @@ pc_cal = det_cal_ref.pc_flattened
 pc_shift = pc_cal - det_ref.pc_average
 angles_cal = xmap_cal.orientations.angle_with(xmap_cal_ref.orientations, degrees=True)
 # A PC is left out of the fit if its search ran into the trust region or did not finish, or if the PC
-# lies far from the others
-at_bound = (abs(pc_shift) > 0.95 * PC_TRUST_REGION).any(axis=1) | (xmap_cal_ref.num_evals >= 2 * REFINE_MAXEVAL)
+# lies far from the others (more than 5 robust standard deviations, 1.4826 * MAD, plus a floor of 0.002)
+at_bound = (abs(pc_shift) > 0.95 * PC_TRUST_REGION).any(axis=1) | (xmap_cal_ref.num_evals >= cal_maxeval)
 deviation = abs(pc_cal - np.median(pc_cal, axis=0))
 spread = 1.4826 * np.median(deviation, axis=0) + 1e-6
 is_outlier = at_bound | (deviation > 5 * spread + 0.002).any(axis=1)
@@ -280,7 +340,8 @@ print(f"PC before (Bruker convention): {np.round(det_ref.pc_average, 4)}")
 print(f"PC after, mean of those used:  {np.round(pc_cal[~is_outlier].mean(axis=0), 4)}")
 print(f"PC after, their spread (std):  {np.round(pc_cal[~is_outlier].std(axis=0), 4)}")
 
-# Plane of PCs for the whole map. The sample tilt which fit_pc() estimates from the plane is not used.
+# Plane of PCs for the whole map. fit_pc() also estimates the sample tilt from the plane and overwrites it on
+# the returned detector; the input tilt is the trusted one, so it is put back.
 det_plane = det_cal_ref.fit_pc(
     cal_rc.T,
     map_indices=np.indices(nav_shape),
@@ -290,7 +351,7 @@ det_plane = det_cal_ref.fit_pc(
 det_plane.sample_tilt = det_ref.sample_tilt
 
 pc_plane = det_plane.pc
-step_x, step_y = [a.scale for a in s.axes_manager.navigation_axes]
+step_x = s.axes_manager.navigation_axes[0].scale  # um
 detector_width = PX_SIZE * BINNING * sig_shape[1]  # um
 per_col = (pc_plane[0, -1] - pc_plane[0, 0]) / (n_cols - 1)
 per_row = (pc_plane[-1, 0] - pc_plane[0, 0]) / (n_rows - 1)
@@ -311,7 +372,7 @@ print(
 # change over the map, use more calibration patterns (PC_GRID). To go on with one PC for the whole map
 # instead: det_plane = det_ref.deepcopy()
 
-# ---------------------------------------- 11.3 / 11.4 refinement ----------------------------------------
+# ---------------------------------------- stages 2 and 3: refine the test region, then the map ---------------------
 ref_kwargs = dict(
     master_pattern=mp,
     energy=ENERGY,
@@ -323,12 +384,20 @@ ref_kwargs = dict(
 
 
 def refine_region(region):
-    """Refine the orientations of the map region (col_start, col_stop, row_start, row_stop).
+    """Refine the orientations of the map region ``(col_start, col_stop, row_start, row_stop)``.
 
-    Returns the refined map and the starting map of that region, both without TWIST.
+    The region is selected with a navigation mask on the whole map, because a sliced CrystalMap is not
+    accepted as ``xmap`` by kikuchipy's refinement (see the handoff notes); the whole map is passed without a
+    mask.
+
+    Returns
+    -------
+    xmap_region_ref, xmap_region : orix.crystal_map.CrystalMap
+        The refined map of the region (kikuchipy's ``scores`` and ``num_evals`` properties) and the starting
+        map of that region, both without TWIST.
     """
     c0, c1, r0, r1 = region
-    if (c1 - c0) * (r1 - r0) == n_patterns:
+    if region_size(region) == n_patterns:
         nav_mask = None
     else:
         nav_mask = np.ones(nav_shape, dtype=bool)  # True = do not refine
@@ -340,7 +409,7 @@ def refine_region(region):
 
 
 refine_roi = (0, n_cols, 0, n_rows) if REFINE_ROI is None else tuple(REFINE_ROI)
-n_refine = (refine_roi[1] - refine_roi[0]) * (refine_roi[3] - refine_roi[2])
+n_refine = region_size(refine_roi)
 
 # Test region in the middle of the map
 r0 = max(0, n_rows // 2 - TEST_SIZE // 2)
@@ -352,7 +421,8 @@ t0 = time.perf_counter()
 xmap_test_ref, xmap_test_before = refine_region(test_region)
 dt = time.perf_counter() - t0
 speed = xmap_test_ref.size / dt
-print(f"Test region: {xmap_test_ref.size} patterns in {dt:.1f} s = {speed:.1f} patterns/s ({det_ref.shape} px, {N_WORKERS} workers)")
+print(f"Test region: {xmap_test_ref.size} patterns in {dt:.1f} s = {speed:.1f} patterns/s "
+      f"({det_ref.shape} px, {N_WORKERS} workers)")
 print(f"Estimated time for the {n_refine} patterns to refine: {n_refine / speed / 3600:.1f} h")
 report_refinement(xmap_test_ref, xmap_test_before, "Test region")
 
@@ -383,7 +453,7 @@ xmap_refined_indexed = CrystalMap(
 report_refinement(xmap_refined_indexed, xmap_before, "Refined map")
 xmap_refined = rotate_about_z(xmap_refined_indexed, TWIST)
 
-# ---------------------------------------- 11.5 save ----------------------------------------
+# ---------------------------------------- save ----------------------------------------
 out_dir = Path(OUTPUT_DIR)
 out_dir.mkdir(parents=True, exist_ok=True)
 name = f"{OUTPUT_NAME}_bin{REFINE_BINNING}"
