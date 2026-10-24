@@ -4,6 +4,7 @@
     python kikuchi_workbench.py                              # finds the pattern processor next to this folder
     python kikuchi_workbench.py --processor-dir C:\\path\\to\\kikuchi-pattern-processor
     python kikuchi_workbench.py --preset preset_RKD.txt      # start with the indexing settings of a preset file
+    python kikuchi_workbench.py --no-processor               # the indexing and montage tabs only
     set KPP_DIR=C:\\path\\to\\kikuchi-pattern-processor       # alternative to --processor-dir (Windows cmd)
 
 Three tabs:
@@ -15,22 +16,33 @@ Three tabs:
 2. **Spherical indexing**: the settings of sph_core.Settings as a form. The patterns come from a
    file (anything kikuchipy loads, memory-mapped when big): "Load processed patterns" takes the file the
    processor's "Apply && Save" just wrote (every pattern of it is indexed, the ones outside the processor's IQ
-   range too: the processor writes them unprocessed), the browse button any other file. Check the geometry on one pattern, index a test region, index the full map, save
-   .ang/.h5. Load and save presets.
+   range too: the processor writes them unprocessed), the browse button any other file. Check the geometry on
+   one pattern, index a test region, index the full map, save .ang/.h5. Load and save presets.
+3. **Montage batch** (montage_tab.py): the two steps above for every tile of an EDAX APEX montage.
+
+Only one data set is in memory at a time: loading a file in the processor unloads the indexer's patterns and
+result, loading in the indexing tab unloads the processor. The long steps (loading, indexing, comparing) run on
+a worker thread (``Worker``) with their console output routed to the log pane; the GUI thread only refuses new
+actions while one runs.
+
+The processor's clone is looked for in ``--processor-dir``, then ``KPP_DIR``, then as ``kikuchi-pattern-processor``
+or ``kikuchi_pattern_processor`` inside this folder, next to it, in the current folder and in the home folder, and
+finally in this folder itself (``find_processor_dir``). Without it the indexing tab still works from files.
 
 Needs the environment of README.md (the kikuchipy fork, CuPy for the GPU) plus the pattern processor's packages
-(PyQt5, pyebsdindex, scipy, scikit-image). Without the processor folder the indexing tab still works
-from files.
+(PyQt5, pyebsdindex, scipy, scikit-image).
 """
 from __future__ import annotations
 
 import argparse
 import ast
 import collections
-import functools
+import contextlib
 import dataclasses
+import functools
 import gc
 import inspect
+import io
 import os
 import sys
 import time
@@ -48,6 +60,12 @@ import numpy as np  # noqa: E402
 
 
 def find_processor_dir(explicit: str | None = None) -> Path | None:
+    """The folder holding the pattern processor's gpu_pattern_viewer.py, or None.
+
+    ``explicit`` (the --processor-dir option) is tried first, then the KPP_DIR environment variable, then
+    ``kikuchi-pattern-processor`` and ``kikuchi_pattern_processor`` inside this folder, next to it, in the current
+    folder and in the home folder, and finally this folder itself. The first candidate that holds the file wins.
+    """
     candidates = []
     if explicit:
         candidates.append(Path(explicit))
@@ -64,7 +82,11 @@ def find_processor_dir(explicit: str | None = None) -> Path | None:
 
 
 def import_processor(directory: Path | None):
-    """The gpu_pattern_viewer module, or (None, reason)."""
+    """Import gpu_pattern_viewer from ``directory``: (module, folder as text), or (None, reason).
+
+    The folder is put at the front of sys.path, so the processor's own helper modules import as well. Importing
+    the module prints what it found (GPU, threads) to the console; it is done before Qt starts for that reason.
+    """
     if directory is None:
         return None, ("kikuchi-pattern-processor not found: put it next to this folder, or pass --processor-dir / "
                       "set KPP_DIR")
@@ -81,6 +103,7 @@ _args = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.Ra
 _args.add_argument("--processor-dir", default=None, help="folder of kikuchi-pattern-processor (gpu_pattern_viewer.py)")
 _args.add_argument("--preset", default=None, help="preset file (NAME = value lines) to start with")
 _args.add_argument("--no-processor", action="store_true", help="do not load the pattern processor tab")
+# parse_known_args: the scripts that import this module pass their own argv through untouched
 ARGS, _ = _args.parse_known_args()
 
 if ARGS.no_processor:
@@ -125,7 +148,15 @@ PRESET_FIELDS = [
 
 
 class _Tee:
-    """Writes to the original stream and hands complete lines (and \\r progress updates) to a callback."""
+    """A stand-in for sys.stdout / sys.stderr while a Worker runs.
+
+    Everything written still goes to the original stream; in addition, complete lines (ended by ``\\n``) are
+    handed to ``on_line`` and ``\\r``-terminated pieces (the carriage-return progress bars of tqdm and dask) to
+    ``on_progress``, both without the terminator and without blank pieces. The split lets the GUI show a progress
+    bar in one status label instead of appending every update to the log.
+
+    Used from the Worker thread; the callbacks are signal ``emit`` methods, so they are thread safe.
+    """
 
     def __init__(self, original, on_line, on_progress):
         self.original = original
@@ -134,6 +165,7 @@ class _Tee:
         self.buffer = ""
 
     def write(self, text):
+        """Write ``text`` to the original stream and dispatch every complete line or ``\\r`` piece in it."""
         try:
             self.original.write(text)
         except Exception:  # noqa: BLE001
@@ -153,18 +185,36 @@ class _Tee:
                     self.on_line(line.rstrip())
 
     def flush(self):
+        """Flush the original stream; a partial line stays in the buffer until its terminator arrives."""
         try:
             self.original.flush()
         except Exception:  # noqa: BLE001
             pass
 
     def __getattr__(self, name):
+        """Everything else (encoding, isatty, fileno, ...) is the original stream's."""
         return getattr(self.original, name)
 
 
 class Worker(QThread):
-    """Runs ``fn(log)`` or ``fn(log, emit_event)`` in a thread. ``emit_event(name, data)`` delivers typed events
-    (block_start, progress, block_done, ...) to the GUI thread through the ``event`` signal."""
+    """A long step of the GUI on its own thread, with its console output and typed events sent to the GUI thread.
+
+    ``fn`` is called as ``fn(log)`` or, when it takes two or more parameters, ``fn(log, emit)``:
+
+    - ``log(text)`` appends a line to the log pane (the ``log`` signal);
+    - ``emit(name, data)`` delivers an event (the ``event`` signal): a name such as ``run_start``, ``block_start``,
+      ``progress``, ``chunk_done``, ``block_done``, ``run_end`` and a dict payload; see ``Workbench.on_run_event``
+      for the payloads.
+
+    Everything ``fn`` (or the libraries it calls) prints goes to the ``log`` signal line by line, and
+    ``\\r``-updated progress bars to the ``progress`` signal (see ``_Tee``). ``fn``'s return value is sent with
+    ``done``; an exception is caught and its traceback sent as text with ``failed``. ``fn`` runs off the GUI thread
+    and must not touch widgets; it may read the data it was given.
+
+    A finished Worker must not be deleted (``deleteLater`` or dropping the last reference) with PyQt5 5.15: Qt then
+    raises "native Qt signal is not callable" from the connected slots. ``Workbench._drop_finished_workers``
+    detaches finished workers instead.
+    """
 
     log = pyqtSignal(str)
     progress = pyqtSignal(str)
@@ -178,6 +228,11 @@ class Worker(QThread):
         self.takes_events = len(inspect.signature(fn).parameters) >= 2
 
     def run(self):
+        """Thread body: swap the console streams for tees, call ``fn``, send ``done`` or ``failed``.
+
+        sys.stdout / sys.stderr are process-wide, so while a worker runs the GUI thread's own prints are routed
+        to the log as well; they are restored when ``fn`` returns.
+        """
         orig_out, orig_err = sys.stdout, sys.stderr
         sys.stdout = _Tee(orig_out, self.log.emit, self.progress.emit)
         sys.stderr = _Tee(orig_err, self.log.emit, self.progress.emit)
@@ -200,6 +255,8 @@ class Worker(QThread):
 
 
 def _literal(text: str, default=None):
+    """A form field's text as a Python value: a literal (number, tuple, list, None, ...) when it parses as one,
+    else the text itself (a bare path or word); blank gives ``default``."""
     text = text.strip()
     if text == "":
         return default
@@ -210,6 +267,8 @@ def _literal(text: str, default=None):
 
 
 def _to_text(value) -> str:
+    """The inverse of ``_literal`` for a form field: None is blank, a string is kept as it is, anything else is
+    its repr (so that it parses back)."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -221,7 +280,7 @@ def _fit(widget, min_width=60):
     """Let a field shrink to the width its column has, instead of demanding the width of its contents.
 
     With QSizePolicy.Ignored the layout decides the width, so long paths and long combo texts are elided or
-    scroll inside the box rather than pushing the panel wider than the pane it sits in.
+    scroll inside the box rather than pushing the panel wider than the pane it sits in. Returns the widget.
     """
     policy = widget.sizePolicy()
     policy.setHorizontalPolicy(QSizePolicy.Ignored)
@@ -248,7 +307,11 @@ def button_rows(buttons, per_row=4) -> QGridLayout:
 
 
 def side_by_side(left: QWidget, right: QWidget, left_width: int = 470) -> QSplitter:
-    """A settings panel in a scroll area and a work area next to it, with a draggable divider between them."""
+    """A settings panel in a scroll area and a work area next to it, with a draggable divider between them.
+
+    ``left_width`` is the panel's initial width in pixels; neither pane can be collapsed, and the work area takes
+    all extra width when the window grows.
+    """
     scroll = QScrollArea()
     scroll.setWidget(left)
     scroll.setWidgetResizable(True)
@@ -268,7 +331,14 @@ def side_by_side(left: QWidget, right: QWidget, left_width: int = 470) -> QSplit
 
 
 class SettingsForm(QWidget):
-    """Widgets for a subset of the Settings fields, in groups. settings()/set_settings() convert both ways."""
+    """Widgets for a subset of the ``Settings`` fields, in titled groups.
+
+    Each ``add_*`` method adds one field under its ``Settings`` name and records a ``(getter, setter)`` pair in
+    ``_fields`` (``getter()`` gives the field's value as a Python object, ``setter(value)`` fills the widget).
+    ``settings(base)`` and ``set_settings(st)`` convert the whole form from and to a ``Settings`` object; other
+    modules and scripts reach single fields through ``_fields[name]``. Fields are added to the group opened by the
+    last ``group()`` call.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -281,13 +351,17 @@ class SettingsForm(QWidget):
         self._form = None
 
     def minimumSizeHint(self):  # noqa: N802 (Qt name)
-        # The scroll area never makes the panel narrower than this; the layout's own minimum (the longest
-        # row) would pin the panel at that width and let the splitter clip it behind the right pane.
+        """Qt override: a fixed 200 px minimum width.
+
+        The scroll area never makes the panel narrower than this hint; the layout's own minimum (the longest
+        row) would pin the panel at that width and let the splitter clip it behind the right pane.
+        """
         hint = super().minimumSizeHint()
         hint.setWidth(200)
         return hint
 
     def group(self, title: str) -> QFormLayout:
+        """Open a new titled group; the following ``add_*`` calls put their rows into it."""
         box = QGroupBox(title)
         self._form = QFormLayout(box)
         self._form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
@@ -298,20 +372,20 @@ class SettingsForm(QWidget):
         return self._form
 
     def finish(self):
+        """Close the form: the groups stay at the top when the panel is taller than they are."""
         self._layout.addStretch()
 
     def add_widget(self, widget):
+        """Add a widget that is not a setting (a button, a note) as a full row of the current group."""
         if isinstance(widget, (QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox)):
             _fit(widget)
         elif isinstance(widget, QLabel):
             widget.setWordWrap(True)
         self._form.addRow(widget)
 
-    def add_row(self, label, widget):
-        self._form.addRow(label, _fit(widget))
-
     # one line of a group per setting
     def add_bool(self, name, label, tip="", default=False):
+        """A checkbox for a bool setting; returns the QCheckBox."""
         w = QCheckBox(label)
         w.setChecked(bool(default))
         w.setToolTip(tip)
@@ -320,6 +394,7 @@ class SettingsForm(QWidget):
         return w
 
     def add_int(self, name, label, default, lo=0, hi=100000, tip=""):
+        """A spin box for an int setting in ``lo..hi``; returns the QSpinBox."""
         w = QSpinBox()
         w.setRange(lo, hi)
         w.setValue(int(default))
@@ -329,6 +404,7 @@ class SettingsForm(QWidget):
         return w
 
     def add_float(self, name, label, default, lo=-1e9, hi=1e9, decimals=4, tip=""):
+        """A spin box for a float setting in ``lo..hi`` with ``decimals`` places; returns the QDoubleSpinBox."""
         w = QDoubleSpinBox()
         w.setRange(lo, hi)
         w.setDecimals(decimals)
@@ -340,7 +416,8 @@ class SettingsForm(QWidget):
 
     def add_text(self, name, label, default=None, tip="", placeholder="", literal=True):
         """Free text, parsed as a Python literal (blank = None): numbers, tuples such as (0, 100, 0, 50), paths.
-        ``literal=False`` keeps the text as it is (blank = None), e.g. for a name filter such as '8'."""
+        ``literal=False`` keeps the text as it is (blank = None), e.g. for a name filter such as '8'.
+        Returns the QLineEdit."""
         w = QLineEdit(_to_text(default))
         w.setToolTip(tip)
         w.setPlaceholderText(placeholder)
@@ -350,20 +427,31 @@ class SettingsForm(QWidget):
         return w
 
     def add_combo(self, name, label, options, default, tip=""):
+        """A combo box over ``options``; the value has the type of the first option (so a list of ints gives an
+        int, a list of strings the text). Returns the QComboBox."""
         w = QComboBox()
         w.addItems([str(o) for o in options])
         w.setCurrentText(str(default))
         w.setToolTip(tip)
         self._form.addRow(label, _fit(w))
-        self._fields[name] = (lambda: type(options[0])(w.currentText()) if options and not isinstance(options[0], str) else w.currentText(),
-                              lambda v: w.setCurrentText(str(v)))
+        kind = type(options[0]) if options and not isinstance(options[0], str) else None
+
+        def get():
+            return w.currentText() if kind is None else kind(w.currentText())
+
+        self._fields[name] = (get, lambda v: w.setCurrentText(str(v)))
         return w
 
     def add_path(self, name, label, default=None, tip="", filter="All files (*)", save=False, directory=False, multi=False,
                  start_dir=None, on_chosen=None):
-        """A path field with a browse button. ``start_dir`` is a callable returning the folder the dialog opens in
-        when the field is still empty (e.g. the folder of another field's file); ``on_chosen(path)`` is called
-        after a file was picked in the dialog."""
+        """A path field with a browse button; returns the QLineEdit.
+
+        ``directory`` browses for a folder, ``save`` for a file to write, ``multi`` for several files (the field
+        then holds a Python list when more than one was picked, so the value is a list or a single path).
+        ``start_dir`` is a callable returning the folder the dialog opens in when the field is still empty (e.g. the
+        folder of another field's file); ``on_chosen(path)`` is called after a file was picked in the dialog, not
+        when the field is typed into or set from code.
+        """
         row = QWidget()
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -397,6 +485,7 @@ class SettingsForm(QWidget):
         self._form.addRow(label, _fit(row, 100))
 
         def get():
+            # a path is kept as text even when it would parse as a literal; only a list of files is parsed
             text = edit.text().strip()
             if text == "":
                 return None
@@ -408,16 +497,23 @@ class SettingsForm(QWidget):
         return edit
 
     def settings(self, base: Settings) -> Settings:
+        """A copy of ``base`` with every field of the form set from its widget."""
         st = dataclasses.replace(base)
         for name, (get, _) in self._fields.items():
             setattr(st, name, get())
         return st
 
     def set_settings(self, st: Settings):
+        """Fill every field of the form from ``st``."""
         for name, (_, set_) in self._fields.items():
             set_(getattr(st, name))
 
+    def set_value(self, name: str, value):
+        """Fill the one field ``name`` with ``value``."""
+        self._fields[name][1](value)
+
     def has(self, name):
+        """True when the form has a field for the setting ``name``."""
         return name in self._fields
 
 
@@ -427,6 +523,8 @@ class SettingsForm(QWidget):
 
 
 class MapCanvas(QWidget):
+    """A matplotlib figure with its navigation toolbar: the Results tab and the geometry check panels."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.figure = Figure(figsize=(9, 4), facecolor="w")
@@ -438,11 +536,16 @@ class MapCanvas(QWidget):
         lay.addWidget(self.canvas)
 
     def clear(self):
+        """Empty the figure."""
         self.figure.clear()
         self.canvas.draw_idle()
 
     def show_panels(self, panels, title=""):
-        """panels: list of (title, 2D array or RGB image, imshow kwargs, colorbar label or None)."""
+        """Replace the figure by a grid of images, up to three per row.
+
+        ``panels``: list of ``(title, image, imshow kwargs, colorbar label or None)``; an image is a 2D array or an
+        RGB array. ``title`` is the figure's suptitle.
+        """
         self.figure.clear()
         n = len(panels)
         ncols = min(n, 3)
@@ -467,31 +570,57 @@ class MapCanvas(QWidget):
 
 
 class Workbench(QMainWindow):
+    """The main window: the three tabs and the state of the indexing tab.
+
+    State of the indexing tab (all on the GUI thread; the worker closures read the dicts they were given):
+
+    - ``loaded``: the pattern file as loaded by 'Load patterns', or None. Keys: ``key`` (``_load_key`` of the
+      settings it was loaded with), ``signal`` (the kikuchipy EBSD signal, raw or, once ``preprocessed`` is set,
+      with the background removals done in place), ``scan`` (the scan file's parameters, dict or None), ``iq``
+      (the stretched quasi-IQ map, 2D float array or 1D for a line scan), ``static_bg`` (the sample mean pattern,
+      for the click preview), ``source`` (always "file"), ``source_file`` (the pattern file path, None for the
+      demo), ``nav_shape`` ((rows, cols)) and ``preprocessed`` ((static, dynamic) once a removal was done in place).
+    - ``prepared``: the signal a step indexed, with keys ``key`` (``_prepare_key``), ``signal``, ``scan``, ``source``
+      and ``source_file``; None when the next step must prepare again.
+    - ``harmonics`` / ``harmonics_key``: the expanded master pattern(s) (list) and the settings they belong to
+      (``(MASTER_FILE, MASTER_BANDWIDTH, MASTER_ENERGY, demo)``), shared with the montage tab.
+    - ``last_run``: the result of the last 'Index test region' / 'Index full map', see ``run_indexing``.
+    - ``live_run``: the run the live view shows while it runs, see ``on_run_event``; None otherwise.
+    - ``worker``: the last Worker started (scripts poll ``worker.isRunning()``); ``batch_running``: the montage
+      tab's batch processing, which runs on the GUI thread, is in progress.
+    - ``pattern_width``: pixels, once a pattern file is known; ``processed_file``: the file the processor's
+      'Apply && Save' wrote last.
+
+    Only one data set is in memory at a time: ``_unload_processor`` and ``unload_indexing`` empty the other tab
+    before a file is loaded. The busy guards (``_refuse_while_busy`` for actions, ``_busy`` for the buttons) keep
+    the loaded data from being changed under a running worker.
+    """
+
     def __init__(self, preset: str | None = None):
+        """Build the window; ``preset`` is a preset file to load into the indexing form at start."""
         super().__init__()
         self.setWindowTitle(f"Kikuchi workbench v{__version__}: pattern processor + spherical indexing")
         self.setGeometry(60, 60, 1500, 950)
         self.worker: Worker | None = None
-        self._workers: list[Worker] = []  # workers not yet finished (dropped by _drop_finished_workers)
-        self.batch_running = False        # the montage tab's batch processing runs on the GUI thread
+        self._workers: list[Worker] = []  # workers not yet finished (detached by _drop_finished_workers)
+        self.batch_running = False
         self.base = Settings()
-        # prepared state of the indexing tab
-        self.loaded = None        # dict: key, signal (raw patterns), scan, iq (stretched quasi-IQ), source, source_file
-        self.prepared = None      # dict: signal, scan, key, source, source_file
-        self.pattern_width = None  # pixels, once a pattern file is known
-        self.processed_file = None      # the file the processor's Apply && Save wrote last
-        self.live_run = None      # state of the run shown in the live view
-        self.harmonics = None     # list, with its key
+        self.loaded = None
+        self.prepared = None
+        self.pattern_width = None
+        self.processed_file = None
+        self.live_run = None
+        self.harmonics = None
         self.harmonics_key = None
-        self.det = None
-        self.last_run = None      # dict: label, signal, xmap, xmap_indexed, det, seconds, offset
+        self.last_run = None
+        self._preview_rc = None   # (row, col) of the pattern shown by the click preview, for refreshes
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.proc = None
-        self.montage_tab = None
+        self.montage_tab = None   # log() is called before the montage tab exists
         self._build_processor_tab()
         self._build_indexing_tab()
-        self._live_view = self.live
+        self._live_view = self.live   # the live view of the current run: this tab's or the montage tab's
         self.montage_tab = MontageTab(self)
         self.tabs.addTab(self.montage_tab, "3. Montage batch")
         self.tabs.setCurrentIndex(1 if self.proc is None else 0)
@@ -501,10 +630,16 @@ class Workbench(QMainWindow):
         self.log(f"kikuchi_workbench {__version__}; pattern processor: {PROCESSOR_INFO}")
         self.log(f"GPU for spherical indexing: {gpu_text}")
         if not gpu_ok and self.form.has("BACKEND"):
-            self.form._fields["BACKEND"][1]("cpu")
+            self.form.set_value("BACKEND", "cpu")
 
     # ---------------------------------------------------------------- tab 1: the processor
     def _build_processor_tab(self):
+        """Add the processor's own MainWindow as tab 1, or a note when it was not found.
+
+        Two of the processor's entry points are wrapped without changing its code: the file its 'Apply && Save'
+        writes is captured (to offer it to the indexing tab), and its ``load_path`` first unloads the indexer's
+        data set.
+        """
         if gpv is None:
             w = QWidget()
             lay = QVBoxLayout(w)
@@ -518,7 +653,8 @@ class Workbench(QMainWindow):
         self.proc = gpv.MainWindow()
         self.tabs.addTab(self.proc, "1. Pattern processor")
 
-        # Capture the path 'Apply && Save' writes, to offer it to the indexing tab
+        # The processor asks for the output path with its module's QFileDialog.getSaveFileName; a subclass that
+        # records the answer is put in its place, since the processor does not report the path it wrote.
         base_dialog = gpv.QFileDialog
         recorder = {"path": None}
 
@@ -537,6 +673,7 @@ class Workbench(QMainWindow):
             original_apply_and_save()
             path = recorder["path"]
             if path:
+                # the processor writes with the extension of the source file, whatever the dialog's answer had
                 path = os.path.splitext(path)[0] + self.proc.src_ext
                 if os.path.exists(path):
                     self._processor_saved(path)
@@ -548,6 +685,8 @@ class Workbench(QMainWindow):
         original_load_path = self.proc.load_path
 
         def load_path_exclusive(path):
+            # Only a running worker refuses, not worker_running(): the montage batch processing itself loads
+            # every tile through load_path while batch_running is set.
             if self.worker is not None and self.worker.isRunning():
                 QMessageBox.information(self, "Busy", "Wait for the indexing tab's running step to finish before loading")
                 return
@@ -565,18 +704,19 @@ class Workbench(QMainWindow):
         self.log(f"Processor saved {path}: 'Load processed patterns' in the indexing tab loads it")
 
     def load_processed_clicked(self):
-        """Put the file Apply && Save wrote into the pattern file box and load it."""
+        """Put the file Apply && Save wrote into the pattern file box and load it (refused while a step runs)."""
         if self._refuse_while_busy():
             return
         if not self.processed_file or not os.path.exists(self.processed_file):
             QMessageBox.information(self, "Processed patterns", "Run 'Apply && Save' in the pattern processor tab first")
             return
-        self.form._fields["PATTERN_FILE"][1](self.processed_file)
+        self.form.set_value("PATTERN_FILE", self.processed_file)
         self.prepared = None
         self.load_patterns_clicked()
 
     # ---------------------------------------------------------------- tab 2: spherical indexing
     def _build_indexing_tab(self):
+        """Build tab 2: the settings form on the left, the buttons, live view, result maps and log on the right."""
         tab = QWidget()
         outer = QHBoxLayout(tab)
         self.form = form = SettingsForm()
@@ -599,7 +739,7 @@ class Workbench(QMainWindow):
         form.add_text("EDAXH5_MAP", "edaxh5 map filter:", tip="Only for .edaxh5 files with several maps: part of the map's name, e.g. 'Area 8'",
                       placeholder="None", literal=False)
         self.btn_load = QPushButton("Load patterns (quasi-IQ map)")
-        self.btn_load.setToolTip("Loads the pattern file (or takes the processor's data set), shows its quasi image quality map "
+        self.btn_load.setToolTip("Loads the pattern file, shows its quasi image quality map "
                                  "in the Live view and fills the pixel size; done automatically after browsing for a file")
         self.btn_load.clicked.connect(self.load_patterns_clicked)
         form.add_widget(self.btn_load)
@@ -610,7 +750,7 @@ class Workbench(QMainWindow):
         form.add_text("NAV_SHAPE", "Map (rows, cols):", tip="Only when the pattern file does not store the map size; blank = from the file or the scan file", placeholder="None")
         form.add_text("STEP_SIZE", "Step (x, y) um:", tip="Only when the pattern file does not store it", placeholder="None")
         form.add_combo("LAZY", "Lazy loading:", ["auto", "True", "False"], "auto",
-                       tip="auto = memory-map files bigger than 25 % of RAM. The in-RAM processor source is never lazy")
+                       tip="auto = memory-map files bigger than 25 % of RAM")
         form.add_text("ROI", "ROI (c0, c1, r0, r1):", tip="Index only this part of the map: (col_start, col_stop, row_start, row_stop)", placeholder="None = everything")
         form.add_bool("FLIP_PATTERNS_UD", "Flip patterns upside down", "Try this when the test maps look like noise")
 
@@ -691,7 +831,7 @@ class Workbench(QMainWindow):
         self.live.error.connect(self.log)
         self.live.set_pattern_source(self._live_pattern)
         self.live.point_clicked.connect(self.preview_point)
-        self._preview_rc = None
+        # the click preview shows the pattern as the indexer will see it, so it follows these boxes
         for w in (self.w_static, self.w_dynamic, self.w_gaussian):
             w.toggled.connect(lambda *_: self._refresh_preview())
         self.w_regions.valueChanged.connect(lambda *_: self._refresh_preview())
@@ -716,6 +856,11 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- settings, presets, log
     def settings(self) -> Settings:
+        """The indexing settings as the form holds them now, as a ``Settings`` object.
+
+        The LAZY combo's "True"/"False" texts become bools ("auto" stays a string) and a 3-tuple PC becomes a
+        tuple of floats, as sph_core expects them.
+        """
         st = self.form.settings(self.base)
         if isinstance(st.LAZY, str) and st.LAZY != "auto":
             st.LAZY = st.LAZY == "True"
@@ -723,10 +868,12 @@ class Workbench(QMainWindow):
             st.PC = tuple(float(v) for v in st.PC)
         return st
 
-    def set_settings(self, st: Settings):
-        self.form.set_settings(st)
-
     def load_preset(self, path=None):
+        """Load the indexing parameters of a preset file (``PRESET_FIELDS``) into the form.
+
+        ``path`` None opens a file dialog. Files, folders and the projection center values are never taken from a
+        preset; the names that changed are listed in the log. Refused while a step runs.
+        """
         if self._refuse_while_busy():
             return
         if not path:
@@ -735,16 +882,16 @@ class Workbench(QMainWindow):
                 return
         current = self.settings()
         st, ignored = sph_core.read_preset(path, current)
-        # only the indexing parameters are taken from a preset; files, folders and the PC values stay as they are
         for name in st.names():
             if name not in PRESET_FIELDS:
                 setattr(st, name, getattr(current, name))
-        self.set_settings(st)
+        self.form.set_settings(st)
         applied = [n for n in PRESET_FIELDS if getattr(st, n) != getattr(current, n)]
         self.log(f"Preset loaded: {path}; changed: {', '.join(applied) if applied else 'nothing'}"
                  + " (files, folders and the projection center are never taken from a preset)")
 
     def save_preset(self):
+        """Write the ``PRESET_FIELDS`` of the current settings to a preset file chosen in a dialog."""
         path, _ = QFileDialog.getSaveFileName(self, "Save preset", str(HERE / "preset_workbench.txt"), "Presets (*.txt)")
         if not path:
             return
@@ -753,17 +900,23 @@ class Workbench(QMainWindow):
         self.log(f"Preset saved: {path} ({len(PRESET_FIELDS)} indexing settings)")
 
     def log(self, text: str):
+        """Append a line to the log pane (and the montage tab's), scrolled to the end. GUI thread; the workers
+        reach it through their ``log`` signal."""
         self.log_box.appendPlainText(text)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
         if self.montage_tab is not None:
             self.montage_tab.log(text)
 
     def set_progress(self, text: str):
+        """Show ``text`` (its last 200 characters) in the status line under the views, and in the montage tab's."""
         self.progress_label.setText(text[-200:])
         if self.montage_tab is not None:
             self.montage_tab.set_progress(text)
 
     def _busy(self, busy: bool):
+        """Disable (``busy``) or enable the action buttons of the indexing tab. 'Load processed patterns' is only
+        enabled when the processor has written a file. The browse buttons stay enabled; ``_refuse_while_busy``
+        guards what they trigger."""
         for b in (self.btn_geometry, self.btn_test, self.btn_full, self.btn_save, self.btn_compare,
                   self.btn_preset_load, self.btn_scan, self.btn_load):
             b.setEnabled(not busy)
@@ -775,7 +928,7 @@ class Workbench(QMainWindow):
             return True
         try:
             return self.worker is not None and self.worker.isRunning()
-        except RuntimeError:  # the QThread was deleted (deleteLater after it finished)
+        except RuntimeError:  # the Worker's Qt object is gone (the window is closing)
             self.worker = None
             return False
 
@@ -802,7 +955,14 @@ class Workbench(QMainWindow):
         self._workers = still
 
     def _start(self, fn, on_done, on_event=None, on_failed=None) -> bool:
-        """Run ``fn`` on a worker thread; False (after telling the user) when one is already running."""
+        """Run ``fn`` on a Worker thread; False (after telling the user) when a step is already running.
+
+        ``fn(log)`` or ``fn(log, emit)`` runs on the worker thread (see ``Worker``). On the GUI thread afterwards:
+        ``on_done(result)`` with its return value, or on an exception ``on_failed()`` (if given) after the live view
+        of a running run was ended, then the traceback in the log and a message box. ``on_event(name, data)``
+        receives the events ``fn`` emits; default ``on_run_event``. The buttons are disabled while the worker runs
+        and the status line is cleared when it ends. An exception in ``on_done`` is logged and shown as well.
+        """
         if self._refuse_while_busy():
             return False
         self._busy(True)
@@ -810,7 +970,7 @@ class Workbench(QMainWindow):
         worker.log.connect(self.log)
         worker.progress.connect(self.set_progress)
         worker.event.connect(on_event or self.on_run_event)
-        # a finished worker is deleted, and its function (whose closure holds the data set) dropped at once: as
+        # a finished worker is detached and its function (whose closure holds the data set) dropped at once: as
         # children of the window the old workers would otherwise keep every run's patterns alive
         self._workers.append(worker)
         worker.finished.connect(self._drop_finished_workers)
@@ -845,6 +1005,12 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- scan parameters
     def read_scan(self):
+        """'Read scan parameters': print the scan and pattern file headers in the log and fill the projection
+        center (edax convention) and the pattern width (hence the pixel size) from them.
+
+        The camera elevation of the scan file is only reported, never copied into CAMERA_TILT. The prepared signal
+        is dropped, since the detector it was built for may have changed. GUI thread; refused while a step runs.
+        """
         if self._refuse_while_busy():
             return
         st = self.settings()
@@ -857,19 +1023,13 @@ class Workbench(QMainWindow):
         except Exception as e:  # noqa: BLE001
             QMessageBox.critical(self, "Scan parameters", f"{type(e).__name__}: {e}")
             return
-        import io
-
         buf = io.StringIO()
-        old = sys.stdout
-        sys.stdout = buf
-        try:
+        with contextlib.redirect_stdout(buf):
             ebsd_params.print_scan_info(scan)
-        finally:
-            sys.stdout = old
         self.log(buf.getvalue().rstrip())
         if scan.get("pc"):
-            self.form._fields["PC"][1](tuple(round(float(v), 6) for v in scan["pc"]))
-            self.form._fields["PC_CONVENTION"][1]("edax")
+            self.form.set_value("PC", tuple(round(float(v), 6) for v in scan["pc"]))
+            self.form.set_value("PC_CONVENTION", "edax")
             self.log(f"Projection center set to {tuple(scan['pc'])} (edax convention)")
         if scan.get("camera_elevation") is not None:
             self.log(f"Camera elevation in the scan file: {scan['camera_elevation']} deg (CAMERA_TILT is not changed automatically)")
@@ -884,11 +1044,15 @@ class Workbench(QMainWindow):
         return os.path.dirname(text) if text else None
 
     def set_pattern_width(self, width: int):
+        """Record the pattern width in pixels and fill the pixel size from it."""
         self.pattern_width = int(width)
         self.auto_px_size()
 
     def auto_px_size(self):
-        """Pixel size = 30 mm / pattern width for the EDAX/TSL convention (the EDAX detector is 30 mm wide)."""
+        """Pixel size = 30 mm / pattern width for the EDAX/TSL convention (the EDAX detector is 30 mm wide).
+
+        Nothing happens for the other conventions or before the pattern width is known; a change is logged.
+        """
         if not self.pattern_width or self.pc_convention_combo.currentText() not in ("edax", "tsl"):
             return
         px = DETECTOR_WIDTH_UM / self.pattern_width
@@ -898,13 +1062,20 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- loading patterns and the quasi-IQ map
     def _load_key(self, st: Settings):
-        # Only what changes the loaded patterns themselves. The scan file is deliberately not in here: setting it
-        # after loading must not throw the loaded data set (and the live map) away.
+        """What identifies the loaded patterns: the settings that change the patterns themselves.
+
+        The scan file is deliberately not in here: setting it after loading must not throw the loaded data set
+        (and the live map) away.
+        """
         return ("file", st.PATTERN_FILE, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI, st.FLIP_PATTERNS_UD)
 
     def unload_indexing(self, why: str = "", keep_run=None):
         """Drop the indexer's loaded patterns and everything derived from them (prepared signal, last run;
-        ``keep_run`` is a run of the data set about to be loaded again, which stays)."""
+        ``keep_run`` is a run of the data set about to be loaded again, which stays).
+
+        Clears the live view's base map and, unless a run is kept, the result maps; logs it with ``why`` when
+        there was something to unload. Used by the processor's load and the montage tab as well.
+        """
         had = self.loaded is not None or self.prepared is not None
         self.loaded = None
         self.prepared = None
@@ -918,7 +1089,9 @@ class Workbench(QMainWindow):
             self.log("Indexing tab: patterns unloaded" + (f" ({why})" if why else ""))
 
     def _unload_processor(self) -> bool:
-        """Drop the processor's data set before the indexer loads one; False if the processor is busy."""
+        """Drop the processor's data set before the indexer loads one; False (after telling the user) if the
+        processor is busy with NLPAR or could not unload. True at once without a processor or with nothing loaded.
+        """
         proc = self.proc
         if proc is None or getattr(proc, "f_orig", None) is None:
             return True
@@ -929,7 +1102,6 @@ class Workbench(QMainWindow):
         if unload is not None:
             ok = unload()
         else:
-            # an older pattern processor without unload(): the same resets, done from here
             ok = self._unload_processor_fallback(proc)
         if not ok:
             QMessageBox.information(self, "Processor busy", "The pattern processor could not unload its data set now")
@@ -939,7 +1111,9 @@ class Workbench(QMainWindow):
 
     @staticmethod
     def _unload_processor_fallback(proc) -> bool:
-        """What MainWindow.unload() does, for a processor clone that predates it (every step guarded)."""
+        """What MainWindow.unload() does, for a processor clone that predates it: drop its files, arrays and
+        caches, reset its labels and empty its canvases. Every step is guarded by hasattr, since the attribute
+        names differ between processor versions; False when anything raised."""
         try:
             proc.f_nlpar = None
             proc.nlpar_patterns = None
@@ -975,7 +1149,14 @@ class Workbench(QMainWindow):
             return False
 
     def load_patterns_clicked(self):
-        """Load the pattern file, compute and show the quasi-IQ map. The processor's data set is unloaded first."""
+        """'Load patterns (quasi-IQ map)': load the pattern file on a worker, compute and show its quasi-IQ map.
+
+        Nothing is done when the same data set (``_load_key``) is already loaded, except showing it again. The
+        processor's data set is unloaded first (one data set at a time), then the indexer's own; a result of this
+        very data set is kept, so it can still be saved. On the worker: ``sph_core.load_patterns``, the quasi-IQ map
+        (progress events ``what="iq"``) and the sample mean pattern for the click preview. Done: ``loaded`` is set,
+        the pattern width taken from the signal and the map shown in the Live view. Refused while a step runs.
+        """
         if self._refuse_while_busy():
             return
         st = self.settings()
@@ -990,6 +1171,7 @@ class Workbench(QMainWindow):
         self.unload_indexing(keep_run=keep_run)
 
         def work(log, emit):
+            # worker thread
             s, scan = sph_core.load_patterns(st, log=log)
             t0 = time.perf_counter()
             iq = sph_core.quasi_iq(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
@@ -1009,7 +1191,12 @@ class Workbench(QMainWindow):
 
     def preview_point(self, row, col):
         """Show the pattern at (row, col) of the loaded file as the indexer will see it: the background
-        removals and the equalization that are ticked, nothing else (the raw pattern when none is)."""
+        removals and the equalization that are ticked, nothing else (the raw pattern when none is).
+
+        Slot of the live view's ``point_clicked``; ignored while a run is shown or nothing is loaded, or when
+        (row, col) is outside the map. Reads one pattern from the signal on the GUI thread (one slice of a memory
+        map), marks the point on the map and names the applied steps in the status line.
+        """
         loaded = self.loaded
         if loaded is None or loaded.get("signal") is None or self.live_run is not None:
             return
@@ -1035,10 +1222,13 @@ class Workbench(QMainWindow):
         self.set_progress(f"Pattern ({row}, {col}): " + (", ".join(steps) if steps else "raw, no processing"))
 
     def _refresh_preview(self):
+        """Show the clicked pattern again with the processing boxes as they are now (not during a run)."""
         if self._preview_rc is not None and self.live_run is None:
             self.preview_point(*self._preview_rc)
 
     def _show_loaded(self):
+        """Put the loaded data set's quasi-IQ map into the Live view, bring that view to the front and preview the
+        centre pattern. A 1D map (a line scan) gets a note instead of a map."""
         if self.loaded is None:
             return
         iq = self.loaded["iq"]
@@ -1053,26 +1243,51 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- preparing patterns, master, detector
     def _prepare_key(self, st: Settings):
+        """What identifies a prepared signal: the load key's settings plus the scan file and the background
+        removals (done in place on the signal)."""
         return ("file", st.PATTERN_FILE, st.SCAN_FILE, st.EDAXH5_MAP, st.NAV_SHAPE, st.STEP_SIZE, st.LAZY, st.ROI,
                 st.FLIP_PATTERNS_UD, st.REMOVE_STATIC_BACKGROUND, st.REMOVE_DYNAMIC_BACKGROUND)
 
-    def prepare_patterns_in_gui(self, st: Settings):
-        """The prepared patterns of the current settings when they are still valid, else None."""
-        key = self._prepare_key(st)
-        if self.prepared is not None and self.prepared["key"] == key:
-            return self.prepared
-        return None
+    def _begin_prepared_step(self):
+        """Common start of 'Check geometry' and the indexing runs, on the GUI thread.
+
+        Returns ``(st, prepared)``: the current settings and the prepared signal when it is still valid for them,
+        else None (the worker then prepares again, see ``_prepare_in_worker``). Returns None instead when a step is
+        running (after telling the user) or when the pattern file would have to be read and the processor, whose
+        data set must leave memory first, cannot unload now.
+        """
+        if self._refuse_while_busy():
+            return None
+        st = self.settings()
+        prepared = self.prepared
+        if prepared is not None and prepared["key"] != self._prepare_key(st):
+            prepared = None
+        loaded = self.loaded
+        will_load_file = prepared is None and (loaded is None or loaded.get("signal") is None
+                                               or loaded["key"] != self._load_key(st))
+        if will_load_file and not self._unload_processor():
+            return None  # one data set in memory at a time, as 'Load patterns' does
+        return st, prepared
 
     def _prepare_in_worker(self, st: Settings, prepared, log):
-        """Loads the patterns from a file when needed, then the harmonics and the detector."""
+        """Worker thread: the signal, harmonics and detector a step needs. Returns ``(prepared, harmonics, hkey, det)``.
+
+        ``prepared`` not None (still valid for ``st``) is used as it is. Otherwise the loaded data set is reused
+        when it is the one ``st`` asks for and its background removals are either not done yet or exactly the ones
+        wanted: the removals are then done in place on it (one copy of the patterns in memory, not a raw and a
+        prepared one; ``loaded["preprocessed"]`` records it for the click preview). Else the file is read and
+        preprocessed again, and that signal replaces the loaded one when it is the same data set. The harmonics
+        are reused when ``harmonics_key`` matches, else loaded; the detector is always built anew (cheap).
+        Reads ``self.loaded`` / ``self.harmonics`` but touches no widget; the GUI thread stores the result with
+        ``_store_prepared`` when the step is done.
+        """
         key = self._prepare_key(st)
         if prepared is None:
             loaded = self.loaded
             wanted = (bool(st.REMOVE_STATIC_BACKGROUND), bool(st.REMOVE_DYNAMIC_BACKGROUND))
-            if loaded is not None and loaded["source"] == "file" and loaded["key"] == self._load_key(st) and loaded["signal"] is not None \
+            same_data_set = loaded is not None and loaded["key"] == self._load_key(st)
+            if same_data_set and loaded["signal"] is not None \
                     and loaded.get("preprocessed", (False, False)) in ((False, False), wanted):
-                # the data set already in memory: the background removals are done in place on it (one copy of
-                # the patterns, not a raw one and a prepared one), and the click preview knows that
                 s, scan = loaded["signal"], loaded["scan"]
                 if wanted != (False, False) and loaded.get("preprocessed", (False, False)) != wanted:
                     sph_core.preprocess(s, st, log)
@@ -1080,50 +1295,40 @@ class Workbench(QMainWindow):
             else:
                 s, scan = sph_core.load_patterns(st, log=log)
                 sph_core.preprocess(s, st, log)
-                if loaded is not None and loaded["source"] == "file" and loaded["key"] == self._load_key(st):
+                if same_data_set:
                     # the raw copy was preprocessed differently before: replace it rather than keep two
                     loaded["signal"] = s
                     loaded["preprocessed"] = wanted
             prepared = {"key": key, "signal": s, "scan": scan, "source": "file", "source_file": st.PATTERN_FILE}
-        demo = prepared["source"] == "file" and st.PATTERN_FILE is None
+        demo = st.PATTERN_FILE is None
         hkey = (st.MASTER_FILE, st.MASTER_BANDWIDTH, st.MASTER_ENERGY, demo)
         if self.harmonics is None or self.harmonics_key != hkey:
             harmonics = sph_core.load_harmonics(st, log, demo=demo)
         else:
             harmonics = self.harmonics
         det = sph_core.make_detector(st, prepared["signal"], harmonics, log, demo=demo)
-        return prepared, harmonics, hkey, det, demo
+        return prepared, harmonics, hkey, det
 
     def _store_prepared(self, result):
-        prepared, harmonics, hkey, det, demo = result
+        """GUI thread: keep the prepared signal and the harmonics of a finished step for the next one."""
+        prepared, harmonics, hkey, _det = result
         self.prepared = prepared
         self.harmonics, self.harmonics_key = harmonics, hkey
-        self.det = det
 
     # ---------------------------------------------------------------- actions
-    def _will_load_file(self, st: Settings, prepared) -> bool:
-        """True when the worker is going to read the pattern file (nothing usable is in memory)."""
-        if prepared is not None:
-            return False
-        loaded = self.loaded
-        return loaded is None or loaded.get("signal") is None or loaded["key"] != self._load_key(st)
-
     def check_geometry(self):
-        if self._refuse_while_busy():
+        """'Check geometry': prepare the patterns, master and detector on a worker and show the centre pattern raw,
+        as the indexer sees it, back-projected onto the sphere (north) and the sphere window, in the Results tab.
+        The detector and the pattern's image quality go to the log."""
+        begun = self._begin_prepared_step()
+        if begun is None:
             return
-        st = self.settings()
-        try:
-            prepared = self.prepare_patterns_in_gui(st)
-        except Exception as e:  # noqa: BLE001
-            self.log(f"{type(e).__name__}: {e}")
-            QMessageBox.critical(self, "Patterns", f"{type(e).__name__}: {e}")
-            return
-        if self._will_load_file(st, prepared) and not self._unload_processor():
-            return  # one data set in memory at a time, as 'Load patterns' does
+        st, prepared = begun
 
         def work(log):
+            # worker thread
             result = self._prepare_in_worker(st, prepared, log)
-            prepared_, harmonics, hkey, det, demo = result
+            prepared_, _harmonics, _hkey, det = result
             s = prepared_["signal"]
             nav_shape = s.axes_manager.navigation_shape[::-1]
             idx = np.unravel_index(int(np.prod(nav_shape)) // 2, nav_shape)
@@ -1147,17 +1352,32 @@ class Workbench(QMainWindow):
         self._start(work, done)
 
     def run_indexing(self, test: bool):
-        if self._refuse_while_busy():
+        """'Index test region' (``test``) or 'Index full map': index on a worker, with the live view when ticked.
+
+        On the worker: ``_prepare_in_worker``, then ``sph_core.index_blocks`` (band by band, events to the live
+        view: ``run_start``, ``block_start``, ``progress``, ``chunk_done``, ``block_done``, ``run_end``) when the
+        live view is ticked and the map is 2D, else one ``sph_core.index`` call. The twist is applied afterwards
+        and the result maps are computed on the worker (seconds for a large map). The result dict, kept as
+        ``last_run``:
+
+        - ``label``: "test region" or "full map"; ``signal``: the indexed signal (the ROI'd or test-region signal);
+        - ``xmap``: the CrystalMap with TWIST applied (what is saved); ``xmap_indexed``: before the twist (what is
+          compared with a reference); ``det``: the detector; ``seconds``: indexing time;
+        - ``offset``: (row, col) of the indexed region in the loaded map;
+        - ``source_file``: the pattern file (None = demo); ``load_key``: ``_load_key`` of the settings, so that
+          'Load patterns' of the same file keeps the result;
+        - ``full_nav_shape``: (rows, cols) of the whole scan (the signal's without an ROI, else the scan file's,
+          else None), for cropping a reference map to the ROI;
+        - ``maps``: {"scores", "iq", "ipf_z", "ipf_x"} arrays of the Results tab, None for a non-2D map;
+        - ``settings``: the Settings the run used.
+
+        Without the data set loaded by 'Load patterns' the live view shows a blank map (a note says so). Done: the
+        result is stored and the Results tab filled. Refused while a step runs.
+        """
+        begun = self._begin_prepared_step()
+        if begun is None:
             return
-        st = self.settings()
-        try:
-            prepared = self.prepare_patterns_in_gui(st)
-        except Exception as e:  # noqa: BLE001
-            self.log(f"{type(e).__name__}: {e}")
-            QMessageBox.critical(self, "Patterns", f"{type(e).__name__}: {e}")
-            return
-        if self._will_load_file(st, prepared) and not self._unload_processor():
-            return  # one data set in memory at a time, as 'Load patterns' does
+        st, prepared = begun
 
         live = self.live_check.isChecked()
         if self.loaded is None or self.loaded["key"] != self._load_key(st):
@@ -1169,8 +1389,9 @@ class Workbench(QMainWindow):
         self.live_run = None
 
         def work(log, emit):
+            # worker thread
             result = self._prepare_in_worker(st, prepared, log)
-            prepared_, harmonics, hkey, det, demo = result
+            prepared_, harmonics, _hkey, det = result
             s = prepared_["signal"]
             if test:
                 s_run, s_warm, (c0, r0) = sph_core.test_region(s, int(st.TEST_SIZE))
@@ -1184,6 +1405,7 @@ class Workbench(QMainWindow):
                                "n_patterns": n_run, "signal": s_run, "label": label, "st": st})
             if live and len(nav_shape) == 2:
                 def on_event(name, data):
+                    # the band's IPF colours are computed here, on the worker, not on the GUI thread
                     if name == "block_done":
                         data = dict(data)
                         xb = data.pop("xmap")
@@ -1214,7 +1436,7 @@ class Workbench(QMainWindow):
             else:
                 full_nav_shape = None
             maps = None
-            if xmap.ndim == 2:  # the result maps, made here rather than on the GUI thread (seconds for a large map)
+            if xmap.ndim == 2:
                 maps = {"scores": sph_core.full_map_data(xmap, "scores"), "iq": sph_core.full_map_data(xmap, "iq"),
                         "ipf_z": sph_core.ipf_rgb_map(xmap, "z"), "ipf_x": sph_core.ipf_rgb_map(xmap, "x")}
             return result, dict(label=label, signal=s_run, xmap=xmap, xmap_indexed=xmap_indexed, det=det, seconds=dt, offset=offset,
@@ -1233,7 +1455,11 @@ class Workbench(QMainWindow):
 
     # ---------------------------------------------------------------- live view plumbing
     def _live_pattern(self, row, col):
-        """One pattern of the running region, for the live view (called in the GUI thread, a few times per second)."""
+        """One pattern of the running region, for the live view (called in the GUI thread, a few times per second).
+
+        (row, col) are map coordinates of the whole map; the run's offset is subtracted. The montage tab's live
+        view uses this too. None when no run is shown.
+        """
         run = self.live_run
         if run is None:
             return None
@@ -1246,6 +1472,26 @@ class Workbench(QMainWindow):
         return sph_core.preview_pattern(data, run["st"], None, apply_background=False)
 
     def on_run_event(self, name, data):
+        """GUI thread slot for the worker's events: drives the live view, the status line and the speed estimate.
+
+        Events and their payloads (``data`` dicts; row and column numbers of a band or chunk are relative to the
+        run's region and offset by the run's ``r0``/``c0`` before they reach the live view):
+
+        - ``run_start``: ``r0``, ``c0`` (offset of the region in the map), ``rows``, ``cols``, ``n_patterns``,
+          ``signal`` (the region's signal, for ``_live_pattern``), ``label``, ``st`` (the Settings) and optionally
+          ``live_view`` (the montage tab's view instead of this tab's). Starts ``live_run`` and the view's run.
+        - ``progress``: ``frac_index``, ``frac_refine`` (0..1 of the current band), ``what`` ("iq" during the
+          quasi-IQ map: only the status line is updated).
+        - ``block_start``: ``r0``, ``r1``, ``c0``, ``c1``, ``n_patterns`` of the band being indexed.
+        - ``chunk_done``: ``rows``, ``cols`` (arrays), ``packed`` orientations and the ``keys`` to colour them (done
+          by the live view at its next redraw, not here).
+        - ``block_done``: the band's ``r0``, ``r1``, ``c0``, ``c1``, ``rgb`` (its IPF-Z image or None),
+          ``n_patterns``, ``seconds``, ``done_patterns``, ``total_patterns``, ``patterns_per_second``,
+          ``eta_seconds``.
+        - ``run_end``: ``success`` (default True). Ends the view's run and clears ``live_run``.
+
+        Events other than ``run_start`` and the quasi-IQ progress are ignored when no run is shown.
+        """
         if name == "run_start":
             self.live_run = {"signal": data["signal"], "st": data["st"], "r0": data["r0"], "c0": data["c0"], "n_patterns": data["n_patterns"],
                              "done": 0, "t0": time.perf_counter(), "window": collections.deque(), "block": None}
@@ -1291,7 +1537,11 @@ class Workbench(QMainWindow):
             self.live_run = None
 
     def _update_speed(self, run, done_patterns, window_seconds=3.0):
-        """The 'now' speed: patterns completed over the last few seconds."""
+        """The 'now' speed shown by the live view: patterns completed over the last ``window_seconds``.
+
+        ``run["window"]`` holds (time, patterns done) samples; the oldest beyond the window are dropped and the
+        speed is the slope over what remains, once it spans more than half a second.
+        """
         now = time.perf_counter()
         window = run["window"]
         window.append((now, float(done_patterns)))
@@ -1302,6 +1552,8 @@ class Workbench(QMainWindow):
             self._live_view.set_speed(max(speed, 0.0))
 
     def show_indexing_maps(self, run):
+        """Fill the Results tab with the run's score, IQ, IPF-Z and IPF-X maps (``run["maps"]``); a note in the
+        log for a map that is not 2D."""
         xmap = run["xmap"]
         maps = run.get("maps")
         if xmap.ndim != 2 or maps is None:
@@ -1315,11 +1567,13 @@ class Workbench(QMainWindow):
         ], f"{run['label'].capitalize()}: {xmap.size} patterns in {run['seconds']:.1f} s = {xmap.size / run['seconds']:.0f} patterns/s")
 
     def save_result(self):
+        """'Save .ang / .h5': write ``last_run["xmap"]`` with the current output settings (folder, name, which
+        formats), named after the file the result came from, whatever has been loaded or read since; a test
+        region gets the suffix ``_test``. On the GUI thread (writing is quick); errors go to the log and a box."""
         if self.last_run is None:
             QMessageBox.information(self, "Save", "Nothing indexed yet")
             return
         st = self.settings()
-        # the file the result came from, whatever has been loaded or read since
         out_dir, stem = sph_core.output_location(st, self.last_run.get("source_file"))
         if self.last_run["label"] == "test region":
             stem += "_test"
@@ -1330,17 +1584,20 @@ class Workbench(QMainWindow):
             QMessageBox.critical(self, "Save", f"{type(e).__name__}: {e}")
 
     def compare_reference(self):
+        """'Compare with reference': the misorientation of the last run's (untwisted) orientations to the reference
+        map of the REFERENCE_FILE, computed on a worker; the statistics go to the log and the 2D angle map to the
+        Results tab. The run's own ROI and the whole scan's shape are used, so a reference of the whole scan is
+        cropped to the indexed region. A run with no indexed point fails."""
         st = self.settings()
         if self.last_run is None or not st.REFERENCE_FILE:
             QMessageBox.information(self, "Compare", "Index the full map and give a reference file first")
             return
         run = self.last_run
-        # the run's own ROI and the whole scan's shape (not the ROI'd signal's), so a reference of the whole scan
-        # is cropped to the indexed region
-        roi = run["settings"].ROI if run.get("settings") is not None else st.ROI
+        roi = run["settings"].ROI
         full_nav_shape = run.get("full_nav_shape")
 
         def work(log):
+            # worker thread
             ang = sph_core.compare_with_reference(run["xmap_indexed"], st.REFERENCE_FILE, roi, full_nav_shape)
             good = ang[np.isfinite(ang)]
             if good.size == 0:
@@ -1356,6 +1613,7 @@ class Workbench(QMainWindow):
         self._start(work, done)
 
     def closeEvent(self, event):
+        """Qt override: ask before quitting while a step runs, and remove the processor's temporary files."""
         if self.worker_running():
             if QMessageBox.question(self, "Quit", "A step is still running. Quit anyway?") != QMessageBox.Yes:
                 event.ignore()
@@ -1369,6 +1627,8 @@ class Workbench(QMainWindow):
 
 
 def main():
+    """Start the application with the command line options (``ARGS``); uncaught exceptions of the GUI thread go
+    to the log, stderr and a message box instead of ending the program."""
     app = QApplication(sys.argv)
     win = Workbench(preset=ARGS.preset)
 
