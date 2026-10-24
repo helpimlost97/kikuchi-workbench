@@ -96,7 +96,17 @@ class Settings:
         return [f.name for f in dataclasses.fields(self)]
 
 
-_PRESET_LINE = re.compile(r"^([A-Z][A-Z0-9_]*) = (.*?)(\s+#.*)?$")
+_PRESET_LINE = re.compile(r"^([A-Z][A-Z0-9_]*) = (.*)$")
+_PRESET_COMMENT = re.compile(r"\s+#.*$")
+
+
+def _preset_value(text: str):
+    """The Python literal of a preset value; a trailing ``  # comment`` is only stripped when the whole text is
+    not a literal, so a path containing ' #' survives."""
+    try:
+        return ast.literal_eval(text.strip())
+    except (ValueError, SyntaxError):
+        return ast.literal_eval(_PRESET_COMMENT.sub("", text).strip())
 
 
 def read_preset(path: str | Path, settings: Settings | None = None) -> tuple[Settings, list[str]]:
@@ -115,7 +125,7 @@ def read_preset(path: str | Path, settings: Settings | None = None) -> tuple[Set
             ignored.append(name)
             continue
         try:
-            setattr(settings, name, ast.literal_eval(value))
+            setattr(settings, name, _preset_value(value))
         except (ValueError, SyntaxError):
             ignored.append(f"{name} (value not understood: {value})")
     return settings, ignored
@@ -127,13 +137,9 @@ def write_preset(path: str | Path, settings: Settings, header: str = "", fields:
     lines = [f"# {h}" for h in header.splitlines()] if header else []
     lines.append("# Preset written by kikuchi_workbench.py; usage: python build_notebook.py my_scan.ipynb this_file.txt")
     for name in settings.names() if fields is None else fields:
-        value = getattr(settings, name)
-        if isinstance(value, str):
-            lines.append(f"{name} = r{value!r}" if "\\" in value or "/" in value else f"{name} = {value!r}")
-        elif isinstance(value, list):
-            lines.append(f"{name} = [" + ", ".join(f"r{v!r}" for v in value) + "]")
-        else:
-            lines.append(f"{name} = {value!r}")
+        # repr escapes backslashes, and ast.literal_eval reads them back as they were (a raw-string prefix on a
+        # repr would double every backslash of a Windows path at each round trip)
+        lines.append(f"{name} = {getattr(settings, name)!r}")
     Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -174,6 +180,11 @@ def load_patterns(st: Settings, scan: dict | None = None, log: Log = _print):
         lazy = _lazy_decision(pattern_file, st.LAZY)
         kwargs = {"lazy": lazy}
         nav_shape_in, step_size = st.NAV_SHAPE, st.STEP_SIZE
+        h5_group = None
+        if pattern_file.suffix.lower() in _HDF5_SUFFIXES:
+            h5_group = _h5_scan_group(pattern_file, st.EDAXH5_MAP)
+            if h5_group is not None:
+                kwargs["scan_group_names"] = h5_group
         if pattern_file.suffix.lower() in (".up1", ".up2"):
             if not scan.get("up_has_map_size"):
                 if nav_shape_in is None and scan.get("n_rows") and scan.get("grid") != "HexGrid":
@@ -182,8 +193,8 @@ def load_patterns(st: Settings, scan: dict | None = None, log: Log = _print):
                     step_size = (scan["step_x"], scan["step_y"])
             if nav_shape_in is not None:
                 kwargs["nav_shape"] = tuple(int(v) for v in nav_shape_in)
-        log(f"Loading {pattern_file.name} (lazy: {lazy})")
-        s = kp.load(pattern_file, **kwargs)
+        log(f"Loading {pattern_file.name} (lazy: {lazy})" + (f", scan group {h5_group!r}" if h5_group else ""))
+        s = _load_h5ebsd(pattern_file, **kwargs) if pattern_file.suffix.lower() in _HDF5_SUFFIXES else kp.load(pattern_file, **kwargs)
         if step_size is not None:
             for axis, step in zip(s.axes_manager.navigation_axes, step_size):
                 axis.scale = float(step)
@@ -195,29 +206,66 @@ def load_patterns(st: Settings, scan: dict | None = None, log: Log = _print):
     return s, scan
 
 
-def signal_from_array(patterns: np.ndarray, nav_shape: tuple[int, int], step_size=None, static_background=None):
-    """A kikuchipy EBSD signal from an in-RAM (n_patterns, rows, cols) array, e.g. the Kikuchi Pattern
-    Processor's processed patterns. ``patterns`` is reshaped (no copy) to the map; missing patterns of a map
-    that was stopped early are padded with zeros."""
-    import kikuchipy as kp
+_HDF5_SUFFIXES = (".h5", ".hdf5", ".h5ebsd", ".edaxh5", ".oh5")
 
-    n_rows, n_cols = (int(v) for v in nav_shape)
-    ph, pw = patterns.shape[-2:]
-    n = n_rows * n_cols
-    if patterns.shape[0] < n:
-        padded = np.zeros((n, ph, pw), dtype=patterns.dtype)
-        padded[: patterns.shape[0]] = patterns
-        patterns = padded
-    s = kp.signals.EBSD(patterns[:n].reshape(n_rows, n_cols, ph, pw))
-    for axis, name in zip(s.axes_manager.navigation_axes, ("x", "y")):
-        axis.name = name
-        axis.units = "um"
-    if step_size is not None:
-        for axis, step in zip(s.axes_manager.navigation_axes, step_size):
-            axis.scale = float(step) if step else 1.0
-    if static_background is not None:
-        s.static_background = np.asarray(static_background).astype(patterns.dtype)
-    return s
+
+def _h5_scan_group(path: Path, map_filter: str | None) -> str | None:
+    """The top-level scan group of an h5ebsd pattern file selected by ``map_filter`` (part of its name, case
+    insensitive), or None for the reader's default (the first scan) when there is no filter or no match."""
+    if not map_filter:
+        return None
+    import h5py
+
+    try:
+        with h5py.File(path, "r") as f:
+            groups = [k for k in f if isinstance(f[k], h5py.Group) and "EBSD" in f[k]]
+    except OSError:
+        return None
+    wanted = str(map_filter).lower()
+    matches = [g for g in groups if wanted in g.lower()]
+    return matches[0] if matches else None
+
+
+def _load_h5ebsd(path: Path, lazy: bool = False, **kwargs):
+    """A kikuchipy signal from an HDF5 pattern file whatever its extension: ``kp.load`` only knows the extensions
+    h5/hdf5/h5ebsd, so a ``.edaxh5``/``.oh5`` file (the extensions EDAX uses for the same layout) is handed to
+    the reader matched by the file's content. EDAX APEX projects keep their patterns in ``.up1``/``.up2``
+    files, which is what to give as the pattern file; the error says so when no reader fits."""
+    import importlib
+
+    import h5py
+    import kikuchipy as kp
+    from kikuchipy.io._io import PLUGINS, _dict2signal, _plugin_from_footprints
+
+    if path.suffix.lower() in (".h5", ".hdf5", ".h5ebsd"):
+        return kp.load(path, lazy=lazy, **kwargs)
+    if not h5py.is_hdf5(path):
+        raise ValueError(f"{path.name} is not an HDF5 file")
+    plugins = [p for p in PLUGINS if "h5" in p["file_extensions"] or "h5ebsd" in p["file_extensions"]]
+    reader = _plugin_from_footprints(str(path), plugins=plugins)
+    if reader is None:
+        raise ValueError(
+            f"{path.name}: no kikuchipy reader matches the layout of this HDF5 file. An EDAX APEX project "
+            "(.edaxh5) keeps its patterns in a .up1/.up2 file next to it: give that file as the pattern file "
+            "and the project as the scan file"
+        )
+    signal_dicts = importlib.import_module(reader["api"]).file_reader(str(path), lazy=lazy, **kwargs)
+    signals = [_dict2signal(d, lazy=lazy) for d in signal_dicts]
+    return signals[0] if len(signals) == 1 else signals
+
+
+def _sample_patterns(data, nav_shape: tuple, max_patterns: int) -> np.ndarray:
+    """Up to ``max_patterns`` patterns spread evenly over the map as an (k, h, w) array, gathered by index so a
+    non-contiguous map (a column ROI) is not copied whole; works for numpy and dask data, 1D and 2D maps."""
+    n = int(np.prod(nav_shape))
+    step = max(1, n // max_patterns)
+    idx = np.arange(0, n, step)
+    if len(nav_shape) == 2:
+        rows, cols = np.unravel_index(idx, tuple(int(v) for v in nav_shape))
+        picked = data.vindex[rows, cols] if hasattr(data, "vindex") else data[rows, cols]
+    else:
+        picked = data[idx]
+    return np.asarray(picked)
 
 
 def apply_roi_and_flip(s, st: Settings):
@@ -233,13 +281,10 @@ def preprocess(s, st: Settings, log: Log = _print) -> None:
     """Static and dynamic background removal, in place, like section 3 of the notebook. NLPAR is the
     Kikuchi Pattern Processor's job (pyebsdindex) and is not done here."""
     nav_shape = s.axes_manager.navigation_shape[::-1]
-    sig_shape = tuple(s.axes_manager.signal_shape[::-1])
-    n_patterns = int(np.prod(nav_shape))
     if st.REMOVE_STATIC_BACKGROUND:
         if s.static_background is None:
-            step = max(1, n_patterns // 5000)
-            flat = s.data.reshape((-1,) + sig_shape)[::step]
-            bg = np.asarray(flat.mean(axis=0))
+            flat = _sample_patterns(s.data, nav_shape, 5000)
+            bg = flat.astype(np.float64).mean(axis=0)
             s.static_background = bg.astype(s.data.dtype)
             log(f"Static background: mean of {flat.shape[0]} patterns")
         s.remove_static_background()
@@ -314,9 +359,12 @@ def quasi_iq(s, progress: Callable[[float], None] | None = None) -> np.ndarray:
     try:  # one flat list of patterns, if that needs no copy (it does for e.g. a column ROI)
         data = data.reshape((n,) + sig_shape, copy=False)
         slabs = [(slice(i0, min(n, i0 + slab)),) for i0 in range(0, n, slab)]
-    except (ValueError, TypeError):  # 2D map that is not contiguous: slabs within rows
+    except (ValueError, TypeError):  # map that is not contiguous: slabs within rows (or along a line scan)
         n_cols = nav_shape[-1]
-        slabs = [(r, slice(c0, min(n_cols, c0 + slab))) for r in range(nav_shape[0]) for c0 in range(0, n_cols, slab)]
+        if len(nav_shape) == 2:
+            slabs = [(r, slice(c0, min(n_cols, c0 + slab))) for r in range(nav_shape[0]) for c0 in range(0, n_cols, slab)]
+        else:
+            slabs = [(slice(i0, min(n, i0 + slab)),) for i0 in range(0, n, slab)]
     out = np.empty(nav_shape if data.ndim > 3 else (n,), dtype=np.float32)
     throttle = _Throttle()
     for k, idx in enumerate(slabs):
@@ -347,10 +395,7 @@ def sample_mean_pattern(s, max_patterns: int = 5000) -> np.ndarray:
     ``max_patterns`` patterns spread over the map (float32, signal shape). Same rule as :func:`preprocess`."""
     if getattr(s, "static_background", None) is not None:
         return np.asarray(s.static_background, dtype=np.float32)
-    sig_shape = tuple(s.axes_manager.signal_shape[::-1])
-    n = int(np.prod(s.axes_manager.navigation_shape))
-    step = max(1, n // max_patterns)
-    flat = s.data.reshape((-1,) + sig_shape)[::step]
+    flat = _sample_patterns(s.data, tuple(s.axes_manager.navigation_shape[::-1]), max_patterns)
     return np.asarray(flat.astype(np.float32).mean(axis=0), dtype=np.float32)
 
 
@@ -539,23 +584,35 @@ def index_kwargs(st: Settings) -> dict:
 
 def apply_twist(xmap, twist: float):
     """Crystal map with the orientations rotated by ``twist`` degrees about the sample normal."""
-    from orix.crystal_map import CrystalMap
     from orix.quaternion import Rotation
 
     if not twist:
         return xmap
     rot = Rotation.from_axes_angles([0, 0, 1], float(twist), degrees=True)
-    coordinates = {"x": xmap.x}
-    if xmap.y is not None:
-        coordinates["y"] = xmap.y
-    return CrystalMap(
-        rotations=xmap.rotations * rot,
-        phase_id=xmap.phase_id,
-        phase_list=xmap.phases,
-        prop={name: xmap.prop[name] for name in xmap.prop},
+    # Every grid point's stored rotation is rotated: the public ``xmap.rotations`` (and x, y, phase_id, prop)
+    # hold the points in the data only, so a map rebuilt from them would lose the masked points and its grid
+    return copy_map(xmap, rotations=xmap._rotations * rot)
+
+
+def copy_map(xmap, rotations=None, phase_id=None, is_in_data=None, phase_list=None):
+    """A new crystal map with the whole grid of ``xmap`` (masked points included, the mask kept) and its
+    properties, with any of the rotations, phase ids, mask or phase list replaced by full-grid values. (orix
+    0.15's ``CrystalMap.deepcopy`` fails on a map with masked points.)"""
+    from orix.crystal_map import CrystalMap
+
+    props = {name: np.array(dict.__getitem__(xmap._prop, name)) for name in xmap._prop.keys()}  # full grid
+    kw = dict(
+        rotations=xmap._rotations if rotations is None else rotations,
+        phase_id=np.array(xmap._phase_id) if phase_id is None else np.asarray(phase_id),
+        x=np.array(xmap._x),
+        phase_list=xmap.phases if phase_list is None else phase_list,
+        prop=props,
         scan_unit=xmap.scan_unit,
-        **coordinates,
+        is_in_data=np.array(xmap.is_in_data) if is_in_data is None else np.asarray(is_in_data, dtype=bool),
     )
+    if xmap._y is not None:
+        kw["y"] = np.array(xmap._y)
+    return CrystalMap(**kw)
 
 
 def test_region(s, test_size: int):
@@ -582,7 +639,6 @@ def index(s, harmonics: Sequence, det, st: Settings, log: Log = _print, navigati
     harmonics_arg = harmonics[0] if len(harmonics) == 1 else list(harmonics)
     if warm_up is not None:
         warm_up.spherical_indexing(harmonics_arg, det, verbose=0, **kwargs)
-        free_gpu_memory()
     free_gpu_memory()
     t0 = time.perf_counter()
     xmap_indexed = s.spherical_indexing(harmonics_arg, det, navigation_mask=navigation_mask, verbose=verbose, **kwargs)
@@ -711,9 +767,8 @@ def ipf_color_keys(harmonics, direction: str = "z") -> list:
     """One orix ``IPFColorKeyTSL`` per phase of ``harmonics`` (a ``MasterPatternHarmonics`` or a sequence of
     them, in phase id order), ``None`` for a phase without a point group."""
     from orix import plot
-    from orix.vector import Vector3d
 
-    vec = {"x": Vector3d.xvector(), "y": Vector3d.yvector(), "z": Vector3d.zvector()}[direction]
+    vec = _ipf_direction(direction)
     keys = []
     for h in ([harmonics] if not isinstance(harmonics, (list, tuple)) else list(harmonics)):
         phase = getattr(h, "phase", None)
@@ -723,23 +778,20 @@ def ipf_color_keys(harmonics, direction: str = "z") -> list:
 
 
 def packed_rgb(packed: np.ndarray, keys: Sequence) -> np.ndarray:
-    """IPF colours (n, 3) of the best candidate of packed indexing rows (n, n_best, 7) of the fork's
-    ``_index_chunk`` (ZYZ Euler angles in columns 0:3, phase id in column 4), with ``keys`` from
-    :func:`ipf_color_keys`. A pattern that failed (phase -1) or of a phase without a key is white, as in
-    :func:`ipf_rgb`. Refinement, when on, happens inside the chunk, so these are the refined orientations."""
+    """IPF colours (n, 3) of the best candidate of packed indexing rows of the fork's ``_index_chunk``: (n,
+    n_best, 7) as returned, or (n, >= 5) rows of the best candidates (ZYZ Euler angles in columns 0:3, phase
+    id in column 4), with ``keys`` from :func:`ipf_color_keys`. A pattern that failed (phase -1) or of a phase
+    without a key is white, as in :func:`ipf_rgb`. Refinement, when on, happens inside the chunk, so these are
+    the refined orientations."""
     from kikuchipy.indexing._spherical._euler import rotation_from_zyz
-    from orix.quaternion import Orientation
 
-    best = np.asarray(packed)[:, 0, :]
-    phase_id = best[:, 4].astype(int)
-    rgb = np.ones((best.shape[0], 3))
-    for pid in np.unique(phase_id):
-        if pid < 0 or pid >= len(keys) or keys[pid] is None:
-            continue
-        m = phase_id == pid
-        rot = rotation_from_zyz(np.ascontiguousarray(best[m, :3], dtype=np.float64))
-        rgb[m] = keys[pid].orientation2color(Orientation(rot, keys[pid].symmetry))
-    return rgb
+    best = np.asarray(packed, dtype=np.float64)
+    if best.ndim == 3:
+        best = best[:, 0, :]
+    if best.shape[0] == 0:
+        return np.ones((0, 3))
+    rot = rotation_from_zyz(np.ascontiguousarray(best[:, :3]))
+    return _color_points(rot, best[:, 4], {i: k for i, k in enumerate(keys)})
 
 
 def _block_quaternions(xmap, in_data: np.ndarray) -> np.ndarray:
@@ -785,8 +837,10 @@ def assemble_blocks(blocks: Sequence, nav_shape: tuple[int, int], step_size: tup
     prop = {}
     for name in first.prop:
         values = np.asarray(first.prop[name])
-        dtype = values.dtype if np.issubdtype(values.dtype, np.floating) else np.float64
-        prop[name] = np.full((n_all,) + values.shape[1:], np.nan, dtype=dtype)
+        if np.issubdtype(values.dtype, np.integer):  # e.g. nbest_phase_id, pseudo_symmetry_index: fill -1 as the fork
+            prop[name] = np.full((n_all,) + values.shape[1:], -1, dtype=values.dtype)
+        else:
+            prop[name] = np.full((n_all,) + values.shape[1:], np.nan, dtype=values.dtype if np.issubdtype(values.dtype, np.floating) else np.float64)
     phases = {}
     for r0, r1, xmap in present:
         block_in_data = np.asarray(xmap.is_in_data, dtype=bool).ravel()
@@ -832,10 +886,12 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
 
     * ``"block_start"``: r0, r1, c0, c1, n_patterns (to index), index, n_blocks_estimate
     * ``"progress"``: frac_index, frac_refine (0..1, see :class:`IndexingProgress`), r0, r1, n_patterns
-    * ``"chunk_done"``: rows, cols (int arrays, map coordinates of the patterns of one or more dask chunks the
-      moment their tasks finished, in file order), rgb (float (n, 3) IPF-Z colours of their best candidates: the
-      refined orientation when refinement is on, the coarse one when it is off, as EMSphInx paints its preview),
-      n_patterns, r0, r1 (the band). At most about 10 a second; a chunk is one GPU batch or one CPU chunk.
+    * ``"chunk_done"``: rows, cols (int arrays, map coordinates of the patterns of one dask chunk, emitted the
+      moment its task finished, in file order), packed (float (n, 5) rows of their best candidates: ZYZ Euler
+      angles, score, phase id; the refined orientation when refinement is on, the coarse one when it is off, as
+      EMSphInx paints its preview), keys (the IPF-Z colour keys, see :func:`packed_rgb`), n_patterns, r0, r1
+      (the band). A chunk is one GPU batch or one CPU chunk; colouring is left to the receiver (cheap on the
+      dask scheduler thread, which emits this between two tasks).
     * ``"block_done"``: r0, r1, c0, c1, xmap (the band's crystal map as indexed, None for a band that is
       masked out completely), seconds, patterns_per_second, done_patterns, total_patterns, elapsed,
       eta_seconds
@@ -887,46 +943,37 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
             color_keys = ipf_color_keys(harmonics, "z")
             if all(k is None for k in color_keys):
                 color_keys = None
-        except Exception:  # noqa: BLE001
+                log("No point group for the IPF colours: the live view paints the map band by band only")
+        except Exception as e:  # noqa: BLE001
             color_keys = None
+            log(f"IPF colour keys for the live preview could not be made ({type(e).__name__}: {e}); painting band by band only")
     n_cols_map = int(nav_shape[-1])
 
     def run(signal, mask, r0, r1, n):
         # map positions (row-major within the band) of the patterns handed to the fork, in its order
         keep = None if mask is None else np.flatnonzero(~np.asarray(mask, dtype=bool).ravel())
-        pending: list[tuple[int, np.ndarray]] = []  # (offset, packed rows) of chunks not yet painted
-        throttle = _Throttle(0.1)
-
-        def flush_chunks():
-            if not pending:
-                return
-            packed = np.concatenate([p for _, p in pending], axis=0)
-            first = pending[0][0]
-            pending.clear()
-            pos = np.arange(first, first + packed.shape[0]) if keep is None else keep[first:first + packed.shape[0]]
-            try:
-                rgb = packed_rgb(packed, color_keys)
-            except Exception:  # noqa: BLE001  (the preview must never stop the indexing)
-                return
-            emit("chunk_done", {"rows": r0 + pos // n_cols_map, "cols": pos % n_cols_map, "rgb": rgb,
-                                "n_patterns": int(packed.shape[0]), "r0": r0, "r1": r1})
 
         def on_chunk(offset, packed):
-            if pending and pending[-1][0] + pending[-1][1].shape[0] != offset:
-                flush_chunks()  # not contiguous with what is pending (does not happen: chunks come in order)
-            pending.append((offset, packed))
-            if throttle.ready():
-                flush_chunks()
+            # Runs on the dask scheduler thread between two tasks: only a slice and a signal, no colouring
+            k = int(packed.shape[0])
+            pos = np.arange(offset, offset + k) if keep is None else keep[offset:offset + k]
+            emit("chunk_done", {"rows": r0 + pos // n_cols_map, "cols": pos % n_cols_map,
+                                "packed": np.array(packed[:, 0, :5], dtype=np.float64), "keys": color_keys,
+                                "n_patterns": k, "r0": r0, "r1": r1})
 
+        # Only the fork's own UserWarnings are recorded (the memory estimate, patterns that failed): the filter
+        # is process-wide while the band runs, and "always" for every category would also collect and report
+        # third-party DeprecationWarnings that are silent everywhere else
         with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+            warnings.simplefilter("always", UserWarning)
             with IndexingProgress(
                 lambda fi, fr: emit("progress", {"frac_index": fi, "frac_refine": fr, "r0": r0, "r1": r1, "n_patterns": n}),
                 on_chunk=on_chunk if color_keys is not None else None,
             ):
                 xmap_band = signal.spherical_indexing(harmonics_arg, det, navigation_mask=mask, verbose=verbose, **kwargs)
-        flush_chunks()
         for w in caught:
+            if not issubclass(w.category, UserWarning):
+                continue
             text = str(w.message)
             key = re.sub(r"[\d.]+", "#", text)
             if key not in seen_warnings:
@@ -962,13 +1009,19 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
     blocks = []
     timings = []  # (patterns indexed, seconds) of every band that was indexed
     done_patterns = 0
-    grid_rate = None  # best map points per second of a band so far, masked points included
+    rate = None  # best indexed patterns per second of a band so far
+    # patterns to index per map row: a band is sized by the patterns it holds, not by its grid points, so that
+    # rows which are mostly masked out neither inflate the speed nor shrink the band
+    row_patterns = (~navigation_mask).sum(axis=1) if navigation_mask is not None else np.full(n_rows, n_cols)
+    cum_patterns = np.concatenate([[0], np.cumsum(row_patterns)])
     r0 = 0
     i = 0
     while r0 < n_rows:
-        wanted = first_patterns if grid_rate is None else target_seconds * grid_rate
-        rows = int(min(n_rows - r0, max(1, round(wanted / n_cols))))
-        r1 = r0 + rows
+        wanted = first_patterns if rate is None else target_seconds * rate
+        # the fewest rows from r0 holding at least ``wanted`` patterns (at least one row)
+        r1 = int(np.searchsorted(cum_patterns, cum_patterns[r0] + wanted, side="left"))
+        r1 = max(r0 + 1, min(n_rows, r1))
+        rows = r1 - r0
         estimate = i + 1 + int(np.ceil((n_rows - r1) / rows))
         mask = navigation_mask[r0:r1] if navigation_mask is not None else None
         n = rows * n_cols - (int(mask.sum()) if mask is not None else 0)
@@ -985,7 +1038,7 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
             timings.append((n, dt))
             if dt > 0:
                 # the best rate so far: a band slowed down by something else must not shrink the next one
-                grid_rate = max(grid_rate or 0.0, rows * n_cols / dt)
+                rate = max(rate or 0.0, n / dt)
         blocks.append((r0, r1, xmap))
         done_patterns += n
         steady = _steady_speed(timings)
@@ -1015,21 +1068,39 @@ def _steady_speed(timings: Sequence[tuple[int, float]]) -> float:
     return n / dt if dt > 0 else 0.0
 
 
-def ipf_rgb(xmap, direction="z") -> np.ndarray:
-    """IPF colours (n, 3) of a crystal map for the sample direction "x", "y" or "z"."""
-    from orix import plot
-    from orix.quaternion import Orientation
+def _ipf_direction(direction: str):
     from orix.vector import Vector3d
 
-    vec = {"x": Vector3d.xvector(), "y": Vector3d.yvector(), "z": Vector3d.zvector()}[direction]
-    rgb = np.ones((xmap.size, 3))
-    for phase_id, phase in xmap.phases_in_data:
-        if phase_id == -1:
+    return {"x": Vector3d.xvector(), "y": Vector3d.yvector(), "z": Vector3d.zvector()}[direction]
+
+
+def _color_points(rotations, phase_id: np.ndarray, keys: dict) -> np.ndarray:
+    """IPF colours (n, 3) of ``rotations`` (an orix Rotation of n points) with ``keys`` a dict phase id ->
+    ``IPFColorKeyTSL`` (or None). Points of phase -1 (not indexed) or of a phase without a key are white."""
+    from orix.quaternion import Orientation
+
+    phase_id = np.asarray(phase_id).astype(int).ravel()
+    rgb = np.ones((phase_id.size, 3))
+    for pid in np.unique(phase_id):
+        key = keys.get(int(pid))
+        if pid < 0 or key is None:
             continue
-        mask = xmap.phase_id == phase_id
-        ckey = plot.IPFColorKeyTSL(phase.point_group, direction=vec)
-        rgb[mask] = ckey.orientation2color(Orientation(xmap.rotations[mask], phase.point_group))
+        m = phase_id == pid
+        rgb[m] = key.orientation2color(Orientation(rotations[m], key.symmetry))
     return rgb
+
+
+def ipf_rgb(xmap, direction="z") -> np.ndarray:
+    """IPF colours (n, 3) of a crystal map's points in the data for the sample direction "x", "y" or "z"."""
+    from orix import plot
+
+    vec = _ipf_direction(direction)
+    keys = {int(pid): (plot.IPFColorKeyTSL(phase.point_group, direction=vec) if phase.point_group is not None else None)
+            for pid, phase in xmap.phases_in_data if pid != -1}
+    rot = xmap.rotations
+    if rot.ndim > 1:
+        rot = rot[:, 0]
+    return _color_points(rot, xmap.phase_id, keys)
 
 
 def full_shape(xmap) -> tuple:
@@ -1073,8 +1144,17 @@ def block_rgb(xmap, block: dict, direction="z") -> np.ndarray:
     return rgb.reshape(int(block["r1"]) - int(block["r0"]), int(block["c1"]) - int(block["c0"]), 3)
 
 
-def map_data(xmap, name: str) -> np.ndarray:
-    return full_map_data(xmap, name)
+def on_full_grid(xmap):
+    """The crystal map with every grid point in the data: points that were masked out become not indexed
+    (phase -1, identity rotation as stored). The map itself is returned when nothing is masked."""
+    in_data = np.asarray(xmap.is_in_data, dtype=bool).ravel()
+    if in_data.all():
+        return xmap
+    phases = xmap.phases.deepcopy()
+    if -1 not in phases.ids:
+        phases.add_not_indexed()
+    return copy_map(xmap, phase_id=np.where(in_data, np.asarray(xmap._phase_id), -1), is_in_data=np.ones_like(in_data),
+                    phase_list=phases)
 
 
 def save_xmap(xmap, out_dir: str | Path, stem: str, save_ang: bool = True, save_h5: bool = True,
@@ -1090,7 +1170,10 @@ def save_xmap(xmap, out_dir: str | Path, stem: str, save_ang: bool = True, save_
         written.append(path)
     if save_ang:
         path = out_dir / f"{stem}.ang"
-        io.save(path, xmap, overwrite=True, image_quality_prop=iq_prop, confidence_index_prop=ci_prop)
+        # orix sizes the .ang grid by the extent of the points in the data, so a map whose first or last rows
+        # (or columns) are masked out would be written cropped and shifted: write every grid point, the masked
+        # ones as not indexed (phase -1: CI -1 in the file, as OIM marks them)
+        io.save(path, on_full_grid(xmap), overwrite=True, image_quality_prop=iq_prop, confidence_index_prop=ci_prop)
         written.append(path)
     for path in written:
         log(f"Saved {path}")
@@ -1109,8 +1192,11 @@ def output_location(st: Settings, source_file: str | None) -> tuple[Path, str]:
     return out_dir, stem
 
 
-def compare_with_reference(xmap_indexed, reference_file: str | Path, roi=None, full_nav_shape=None):
-    """Misorientation per point to a reference map of the same points (EMSphInx/OIM .ang/.h5/.ctf)."""
+def compare_with_reference(xmap_indexed, reference_file: str | Path, roi=None, full_nav_shape=None) -> np.ndarray:
+    """Misorientation in degrees to a reference map of the same grid (EMSphInx/OIM .ang/.h5/.ctf), as an array
+    of the map's full grid (``full_shape``), NaN at points that were not indexed (masked out). ``roi``
+    (c0, c1, r0, r1) with ``full_nav_shape`` (rows, cols) of the whole scan crops a reference of the whole
+    scan to the indexed region."""
     import h5py
     from orix import io
     from orix.quaternion import Orientation, Rotation
@@ -1131,8 +1217,15 @@ def compare_with_reference(xmap_indexed, reference_file: str | Path, roi=None, f
         c0, c1, r0, r1 = roi
         quat = rot_ref.data.reshape(tuple(full_nav_shape) + (4,))[r0:r1, c0:c1]
         rot_ref = type(rot_ref)(quat.reshape(-1, 4))
-    if rot_ref.size != xmap_indexed.size:
-        raise ValueError(f"Reference has {rot_ref.size} points, this map has {xmap_indexed.size}")
+    in_data = np.asarray(xmap_indexed.is_in_data, dtype=bool).ravel()
+    if rot_ref.size != in_data.size:
+        raise ValueError(f"Reference has {rot_ref.size} points, this map has {in_data.size} grid points")
     ids = [i for i in xmap_indexed.phases_in_data.ids if i != -1]
     pg = xmap_indexed.phases[ids[0]].point_group
-    return Orientation(xmap_indexed.rotations, pg).angle_with(Orientation(rot_ref.flatten(), pg), degrees=True)
+    rot = xmap_indexed.rotations
+    if rot.ndim > 1:
+        rot = rot[:, 0]
+    ref = rot_ref.flatten()[in_data]
+    out = np.full(in_data.size, np.nan)
+    out[in_data] = Orientation(rot, pg).angle_with(Orientation(ref, pg), degrees=True)
+    return out.reshape(full_shape(xmap_indexed))

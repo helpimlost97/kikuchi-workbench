@@ -16,6 +16,7 @@ montage.py and STITCH_DATASET_NOTES.md).
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import gc
 import importlib
@@ -60,7 +61,8 @@ class MontageTab(QWidget):
                                               directory=True, start_dir=self._project_dir)
         self.output_dir_edit = form.add_path("OUTPUT_DIR", "Output folder:", tip="Where the processed tiles and the output project go; blank = 'processed' next to the project",
                                              directory=True, start_dir=self._project_dir)
-        self.suffix_edit = form.add_text("SUFFIX", "Processed file suffix:", DEFAULT_SUFFIX, "Appended to the tile's file name: <tile>_proc.up1")
+        self.suffix_edit = form.add_text("SUFFIX", "Processed file suffix:", DEFAULT_SUFFIX,
+                                         "Appended to the tile's file name: <tile>_proc.up1 (must not be blank)", literal=False)
         self.btn_rescan = QPushButton("Rescan folders")
         self.btn_rescan.clicked.connect(self.rescan)
         form.add_widget(self.btn_rescan)
@@ -105,6 +107,17 @@ class MontageTab(QWidget):
                                       "quality, EMSphInx's discrete cosine measure of each pattern (0..1 scale), and CI the cross-correlation. "
                                       "On: the IQ column keeps the Hough IQ written at acquisition; CI is the cross-correlation either way")
         form.add_widget(self.keep_iq_check)
+        self.phase_edit = form.add_text(
+            "PHASE_MAP", "Project phase of each master:", None,
+            "The project's phase number (1-based, as listed when the project is loaded) for each master pattern of the indexing tab, "
+            "comma separated, e.g. '2' or '2,1'. Blank = matched by name, else by order when the counts agree; the batch refuses to "
+            "run when no match can be made, so that the Phase column of the output is never wrong", placeholder="by name", literal=False)
+        self.resume_check = QCheckBox("Resume: keep tiles already indexed in an existing output project")
+        self.resume_check.setChecked(True)
+        self.resume_check.setToolTip("On: an output project that already exists is kept and the tiles it already holds spherical results "
+                                     "for are skipped (a cancelled or failed batch continues where it stopped). Off: a fresh copy of the "
+                                     "project is made and every tile is indexed again")
+        form.add_widget(self.resume_check)
         self.btn_use_geometry = QPushButton("Copy the project's PC and tilts to the indexing tab")
         self.btn_use_geometry.setToolTip("Puts the first tile's pattern center (EDAX), sample tilt and camera elevation into tab 2; "
                                          "check them there, they are your inputs")
@@ -131,6 +144,7 @@ class MontageTab(QWidget):
         rl.addLayout(kw.button_rows([self.btn_cancel], per_row=4))
         split = QSplitter(Qt.Vertical)
         self.live = kw.LiveView()
+        self.live.error.connect(self.wb.log)
         self.live.set_pattern_source(wb._live_pattern)
         split.addWidget(self.live)
         bottom = QWidget()
@@ -176,7 +190,7 @@ class MontageTab(QWidget):
 
     def suffix(self) -> str:
         value = self._get("SUFFIX")
-        return DEFAULT_SUFFIX if value is None else str(value)
+        return "" if value is None else str(value).strip()
 
     def _set_batch_buttons(self, have_project: bool):
         for b in (self.btn_load_proc, self.btn_process, self.btn_load_index, self.btn_index, self.btn_use_geometry, self.btn_rescan):
@@ -187,11 +201,18 @@ class MontageTab(QWidget):
             self.btn_process.setToolTip("The pattern processor is not available")
 
     def _busy(self, busy: bool):
+        """Lock the tab (and the other tabs' entry points) while a batch runs. The batch processing runs on the GUI
+        thread pumping events, so every control that could change the project, the folders or the processor's
+        data set must be disabled, not just the batch buttons."""
         self.processing = busy
+        self.wb.batch_running = busy
+        self.form.setEnabled(not busy)  # project, folders, suffix, table, the browse buttons and both batch groups
         self._set_batch_buttons(not busy and self.project is not None)
         self.btn_project.setEnabled(not busy)
         self.btn_cancel.setEnabled(busy)
         self.wb._busy(busy)
+        if self.wb.proc is not None:
+            self.wb.tabs.setTabEnabled(0, not busy)
 
     def cancel(self):
         self.cancel_requested = True
@@ -211,19 +232,35 @@ class MontageTab(QWidget):
             return
         p = self.project
         self.log(f"Project {p.name}: {len(p.tiles)} tiles ({os.path.basename(p.path)})")
+        for note in p.skipped:
+            self.log(f"  map group skipped (not an EBSD scan): {note}")
         if p.tiles:
             t = p.tiles[0]
             self.log(f"  first tile {t.name}: grid {t.n_cols} x {t.n_rows}, step {t.step_x} x {t.step_y} um, PC (EDAX) {t.pc}, "
                      f"sample tilt {t.sample_tilt}, camera elevation {t.camera_elevation}, {t.kv} kV; phases: "
                      + ", ".join(ph.name for ph in t.phases))
             self.log("  The indexing uses the PC, sample tilt and camera tilt of the indexing tab for every tile; compare them with these")
-        self.rescan()
+            self.log("  Phases of the project, by number: " + ", ".join(f"{i + 1}: {ph.name}" for i, ph in enumerate(t.phases)))
+        try:
+            self.rescan()
+        except Exception as e:  # noqa: BLE001
+            self.log(f"Rescan failed: {type(e).__name__}: {e}")
         self._set_batch_buttons(True)
+
+    def _fresh_project(self) -> montage.Project:
+        """A copy of the loaded project to match files against (the file is read once, when it is loaded)."""
+        return copy.deepcopy(self.project)
 
     def _raw_tiles(self) -> list[montage.Tile]:
         """The tiles matched with their raw files (a fresh match; the processed suffix is never preferred)."""
-        project = montage.read_project(self.project.path)
-        montage.pattern_folder_tiles(project, self.pattern_dir(), prefer_suffix=None, log=self.log)
+        project = self._fresh_project()
+        folder = self.pattern_dir()
+        if folder and os.path.isdir(folder):
+            montage.pattern_folder_tiles(project, folder, prefer_suffix=None, log=self.log)
+        else:
+            self.log(f"Raw pattern folder not found: {folder}")
+            for t in project.tiles:
+                t.pattern, t.status = None, "pattern folder not found"
         suffix = self.suffix()
         for t in project.tiles:  # a processed copy in the raw folder is not a raw file
             if t.pattern is not None and os.path.splitext(t.pattern.name)[0].endswith(suffix) and suffix:
@@ -231,7 +268,7 @@ class MontageTab(QWidget):
         return project.tiles
 
     def _processed_tiles(self) -> list[montage.Tile]:
-        project = montage.read_project(self.project.path)
+        project = self._fresh_project()
         out_dir = self.output_dir()
         if out_dir and os.path.isdir(out_dir):
             montage.pattern_folder_tiles(project, out_dir, prefer_suffix=self.suffix(), log=self.log)
@@ -249,10 +286,18 @@ class MontageTab(QWidget):
         self.raw_tiles, self.processed_tiles = raw, processed
         self.table.setRowCount(len(raw))
         for i, (t, tp) in enumerate(zip(raw, processed)):
-            status = t.status if t.ok or tp.pattern is None else ("ok" if tp.ok else tp.status)
+            if tp.pattern is not None and not tp.ok:
+                status = f"processed file: {tp.status}"  # a bad processed file is what 'Index all' would skip
+            elif t.ok or tp.pattern is None:
+                status = t.status
+            else:
+                status = "ok"
             cells = [t.name, f"{t.n_cols} x {t.n_rows}", t.pattern.name if t.pattern else "-", tp.pattern.name if tp.pattern else "-", status]
             for j, text in enumerate(cells):
                 item = QTableWidgetItem(text)
+                if j == 0:
+                    item.setData(Qt.UserRole, t.h5_path)  # rows are told apart by the map's path, not its name
+                    item.setToolTip(t.h5_path)
                 if j == 4 and status != "ok":
                     item.setForeground(Qt.darkRed if t.pattern is not None or tp.pattern is not None else Qt.gray)
                 self.table.setItem(i, j, item)
@@ -305,8 +350,7 @@ class MontageTab(QWidget):
         proc = self.wb.proc
         if proc is None or self.project is None:
             return
-        if self.wb.worker is not None and self.wb.worker.isRunning():
-            QMessageBox.information(self, "Busy", "Wait for the running step to finish")
+        if self.wb._refuse_while_busy():
             return
         if getattr(proc, "_nlpar_busy", False):
             QMessageBox.information(self, "Busy", "Wait for the pattern processor's NLPAR step to finish")
@@ -322,6 +366,9 @@ class MontageTab(QWidget):
         if not suffix:
             QMessageBox.information(self, "Suffix", "The processed file suffix must not be blank, or the output would overwrite the raw files")
             return
+        skipped = [t for t in self._raw_tiles() if not t.ok]
+        for t in skipped:
+            self.log(f"  {t.name} is skipped: {t.status}")
         os.makedirs(out_dir, exist_ok=True)
         jobs = [(t.pattern.path, montage.output_name(t, suffix, out_dir)) for t in tiles]
         self.wb.unload_indexing("the batch processing starts")
@@ -338,6 +385,8 @@ class MontageTab(QWidget):
                 def bg_progress(done, total, path):
                     self.set_progress(f"Shared background: {done} / {total} patterns ({os.path.basename(path)})")
                     QApplication.processEvents()
+                    if self.cancel_requested:  # stops the pass over the tiles at once, not after all of them
+                        raise _Cancelled()
 
                 shared = proc.compute_shared_background([t.pattern.path for t in tiles], progress=bg_progress)
                 if self.cancel_requested:
@@ -350,7 +399,8 @@ class MontageTab(QWidget):
                 self.set_progress(f"Tile {i + 1} / {n}: {stage} {os.path.basename(path)} ({(time.perf_counter() - t_start) / 60:.1f} min)")
                 if stage == "load":
                     self.log(f"Tile {i + 1} / {n}: {os.path.basename(path)}")
-                self._mark_row(i, stage)
+                if 0 <= i < len(tiles):
+                    self._mark_row_by_path(tiles[i].h5_path, stage)
                 QApplication.processEvents()
 
             results = proc.batch_process(jobs, shared_background=shared, progress=progress, cancel=lambda: self.cancel_requested)
@@ -376,22 +426,24 @@ class MontageTab(QWidget):
                          + (f", {r['n_excluded']} excluded (zeros)" if r.get("n_excluded") else ""))
             else:
                 self.log(f"  {os.path.basename(r.get('source', '?'))}: FAILED: {r.get('error')}")
-        self.log(f"Batch processing: {n_ok} of {len(jobs)} tiles written to {out_dir} in {(time.perf_counter() - t_start) / 60:.1f} min; "
-                 "the processor is unloaded")
+        self.log(f"Batch processing: {n_ok} of {len(jobs)} tiles written to {out_dir} in {(time.perf_counter() - t_start) / 60:.1f} min"
+                 + (f" ({len(skipped)} tiles without a usable raw file skipped)" if skipped else "") + "; the processor is unloaded")
         self.set_progress("")
         self.rescan()
-
-    def _mark_row(self, i, text):
-        if 0 <= i < self.table.rowCount():
-            self.table.setItem(i, 4, QTableWidgetItem(text))
 
     # ------------------------------------------------------------------------------------------ 2. indexing
     def load_selected_in_indexer(self):
         t = self.selected_tile(processed=self.index_processed_check.isChecked())
         if t is None:
             return
-        self.wb.form._fields["PATTERN_FILE"][1](t.pattern.path)
-        self.wb.form._fields["SCAN_FILE"][1](None)
+        if self.wb._refuse_while_busy():
+            return
+        fields = self.wb.form._fields
+        fields["PATTERN_FILE"][1](t.pattern.path)
+        # the tile's grid and step come from its header; an ROI, map shape, step or map filter left over from
+        # another data set would otherwise be applied to it
+        for name in ("SCAN_FILE", "EDAXH5_MAP", "NAV_SHAPE", "STEP_SIZE", "ROI"):
+            fields[name][1](None)
         self.wb.prepared = None
         self.wb.tabs.setCurrentIndex(1)
         self.wb.load_patterns_clicked()
@@ -400,8 +452,12 @@ class MontageTab(QWidget):
         wb = self.wb
         if self.project is None:
             return
+        if wb._refuse_while_busy():  # before anything is unloaded or locked
+            return
         processed = self.index_processed_check.isChecked()
-        tiles = [t for t in (self._processed_tiles() if processed else self._raw_tiles()) if t.ok]
+        all_tiles = self._processed_tiles() if processed else self._raw_tiles()
+        tiles = [t for t in all_tiles if t.ok]
+        skipped = [t for t in all_tiles if not t.ok]
         if not tiles:
             QMessageBox.information(self, "Tiles", "No tile has a " + ("processed" if processed else "raw") + " pattern file")
             return
@@ -421,38 +477,60 @@ class MontageTab(QWidget):
         self.wb.tabs.setCurrentWidget(self)
         kw = self.kw
         iq_prop = None if self.keep_iq_check.isChecked() else "iq"
+        resume = self.resume_check.isChecked()
+        phase_spec = self._get("PHASE_MAP")
         is_cancelled = lambda: self.cancel_requested  # noqa: E731  (read from the worker thread: a plain bool)
+        for t in skipped:
+            self.log(f"  {t.name} is skipped: {t.status}")
 
         def work(log, emit):
             t_all = time.perf_counter()
             hkey = (st.MASTER_FILE, st.MASTER_BANDWIDTH, st.MASTER_ENERGY, False)
             harmonics = wb.harmonics if wb.harmonics is not None and wb.harmonics_key == hkey else sph_core.load_harmonics(st, log)
-            montage.copy_project(project.path, out_project, overwrite=True)
-            log(f"Output project: {out_project} (a copy of the project; each tile's orientation table is replaced as it is indexed)")
+            # which project phase each master is: refused when it cannot be told, so the Phase column is never wrong
+            master_names = [str(getattr(getattr(h, "phase", None), "name", "") or "") for h in harmonics]
+            phase_map = montage.phase_mapping(master_names, tiles[0].phases, phase_spec, log)
+            already = set()
+            if resume and os.path.exists(out_project):
+                already = montage.indexed_tiles(out_project, tiles)
+                log(f"Output project: {out_project} exists and is kept; {len(already)} of its tiles already hold spherical results "
+                    "and are skipped (untick Resume to start afresh)")
+            else:
+                montage.copy_project(project.path, out_project, overwrite=True)
+                log(f"Output project: {out_project} (a copy of the project; each tile's orientation table is replaced as it is indexed)")
             comment = (f"Spherical indexing (kikuchipy fork), bandwidth {st.BANDWIDTH}, PC {tuple(st.PC)} ({st.PC_CONVENTION}), "
                        f"sample tilt {st.SAMPLE_TILT}, camera tilt {st.CAMERA_TILT}, master {os.path.basename(str(st.MASTER_FILE))}, "
                        f"{time.strftime('%Y-%m-%d %H:%M')}")
             done, failed = [], []
+            skipped_done = [t.name for t in tiles if t.h5_path in already]
             det = None
             for i, tile in enumerate(tiles):
                 if is_cancelled():
                     log("Batch indexing cancelled")
                     break
+                if tile.h5_path in already:
+                    continue
                 log(f"Tile {i + 1} / {len(tiles)}: {tile.name} ({tile.pattern.name})")
                 try:
                     st_t = dataclasses.replace(st, PATTERN_FILE=tile.pattern.path, SCAN_FILE=None, EDAXH5_MAP=None, NAV_SHAPE=None,
                                                STEP_SIZE=None, ROI=None)
                     s, _ = sph_core.load_patterns(st_t, scan=montage.scan_dict(tile), log=log)
-                    sph_core.preprocess(s, st_t, log)
+                    # the zero patterns (excluded by the processor) are found on the raw data: the background
+                    # removal rescales every pattern, zeros included, so afterwards they are no longer zero
                     iq, nav_mask = montage.tile_stats(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
                     if nav_mask is not None:
                         log(f"  {int(nav_mask.sum())} zero patterns (excluded by the processor) are not indexed")
+                    sph_core.preprocess(s, st_t, log)
                     quiet = (lambda _msg: None) if det is not None else log
                     det = sph_core.make_detector(st_t, s, harmonics, quiet)
                     nav_shape = tuple(int(v) for v in s.axes_manager.navigation_shape[::-1])
                     n_run = int(np.prod(nav_shape)) - (0 if nav_mask is None else int(nav_mask.sum()))
-                    emit("tile_start", {"index": i, "n_tiles": len(tiles), "tile": tile.name, "iq": sph_core.stretch(iq)})
-                    emit("run_start", {"r0": 0, "c0": 0, "rows": nav_shape[0], "cols": nav_shape[-1] if len(nav_shape) == 2 else 1,
+                    iq_map = sph_core.stretch(iq)
+                    if iq_map.ndim == 1:  # a tile of one row or one column: shown as one row
+                        iq_map = iq_map.reshape(1, -1)
+                    emit("tile_start", {"index": i, "n_tiles": len(tiles), "tile": tile.name, "h5_path": tile.h5_path, "iq": iq_map,
+                                        "one_line": len(nav_shape) == 1})
+                    emit("run_start", {"r0": 0, "c0": 0, "rows": nav_shape[0] if len(nav_shape) == 2 else 1, "cols": nav_shape[-1],
                                        "n_patterns": n_run, "signal": s, "label": tile.name, "st": st_t, "live_view": live})
 
                     def on_event(name, data):
@@ -469,7 +547,7 @@ class MontageTab(QWidget):
                         s, harmonics, det, st_t, log, navigation_mask=nav_mask, on_event=on_event,
                         target_seconds=kw.LIVE_BLOCK_SECONDS, first_patterns=max(nav_shape[-1], min(300, max(1, n_run // 10))))
                     xmap = sph_core.apply_twist(xmap_indexed, st.TWIST)
-                    counts = montage.write_tile_result(out_project, tile, xmap, iq_prop=iq_prop, comment=comment)
+                    counts = montage.write_tile_result(out_project, tile, xmap, iq_prop=iq_prop, comment=comment, phase_map=phase_map)
                     emit("run_end", {"success": True})
                     log(f"  {counts['n_indexed']} patterns indexed in {time.perf_counter() - t0:.0f} s ({speed:.0f} patterns/s), written to the output project")
                     done.append(tile.name)
@@ -486,35 +564,51 @@ class MontageTab(QWidget):
                     gc.collect()
                     sph_core.free_gpu_memory()
             minutes = (time.perf_counter() - t_all) / 60
-            return {"done": done, "failed": failed, "n_tiles": len(tiles), "minutes": minutes, "output": out_project}
+            return {"done": done, "failed": failed, "already": skipped_done, "n_tiles": len(tiles), "n_skipped": len(skipped),
+                    "minutes": minutes, "output": out_project, "harmonics": harmonics, "hkey": hkey, "cancelled": is_cancelled()}
 
         def on_done(result):
             self._busy(False)
+            # the expanded master pattern(s) are kept for the indexing tab and the next batch
+            wb.harmonics, wb.harmonics_key = result["harmonics"], result["hkey"]
             self.last_output_project = result["output"]
-            self.log(f"Batch indexing: {len(result['done'])} of {result['n_tiles']} tiles indexed in {result['minutes']:.1f} min")
+            n_have = len(result["done"]) + len(result["already"])
+            self.log(f"Batch indexing: {len(result['done'])} tiles indexed in {result['minutes']:.1f} min"
+                     + (f", {len(result['already'])} kept from the earlier run" if result["already"] else "")
+                     + (f"; {len(result['failed'])} failed" if result["failed"] else "")
+                     + ("; cancelled" if result["cancelled"] else "")
+                     + (f"; {result['n_skipped']} tiles without a usable pattern file were skipped" if result["n_skipped"] else ""))
             for name, err in result["failed"]:
                 self.log(f"  {name}: {err}")
             self.output_label.setText(f"Output project: {result['output']}")
-            self.log(f"Output project: {result['output']}" + (" (tiles that failed or were skipped keep their Hough results)"
-                                                              if len(result["done"]) < result["n_tiles"] else ""))
+            partial = n_have < result["n_tiles"] + result["n_skipped"]
+            self.log(f"Output project: {result['output']}" + (" (tiles that failed or were skipped keep their Hough results)" if partial else ""))
+            if partial and iq_prop is not None:
+                self.log("NB! The IQ column of the indexed tiles is the spherical IQ (0..1) while the other tiles keep the Hough IQ: "
+                         "two scales in one project until every tile is indexed (or tick 'Keep the project's (Hough) IQ')")
             self.set_progress("")
+            self.rescan()
+
+        def on_failed():
+            self._busy(False)
+            self.rescan()
 
         def on_event(name, data):
             if name == "tile_start":
-                self.live.set_base_map(data["iq"], f"{data['tile']} ({data['index'] + 1} / {data['n_tiles']})")
-                self._mark_row_by_name(data["tile"], "indexing")
+                title = f"{data['tile']} ({data['index'] + 1} / {data['n_tiles']})" + (" shown as one row" if data.get("one_line") else "")
+                self.live.set_base_map(data["iq"], title)
+                self._mark_row_by_path(data["h5_path"], "indexing")
                 return
             wb.on_run_event(name, data)
-            if name == "run_end":
-                self._mark_row_by_name(None, "")
 
+        if not wb._start(work, on_done, on_event, on_failed=on_failed):
+            return
         self._busy(True)
-        wb._start(work, on_done, on_event, on_failed=lambda: self._busy(False))
 
-    def _mark_row_by_name(self, name, text):
+    def _mark_row_by_path(self, h5_path, text):
         for i in range(self.table.rowCount()):
             item = self.table.item(i, 0)
-            if item is not None and name is not None and item.text() == name:
+            if item is not None and item.data(Qt.UserRole) == h5_path:
                 self.table.setItem(i, 4, QTableWidgetItem(text))
 
 

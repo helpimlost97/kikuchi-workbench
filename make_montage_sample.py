@@ -44,7 +44,13 @@ def map_groups(f: h5py.File) -> list[str]:
 def copy_attrs(src, dst):
     for k, v in src.attrs.items():
         if k.startswith("User"):
-            v = "" if isinstance(v, (str, bytes)) else np.zeros_like(np.asarray(v))
+            a = np.asarray(v)
+            if isinstance(v, (str, bytes)):
+                v = ""
+            elif a.dtype.kind in "OSU":  # APEX stores user names as string arrays: blank strings of the same shape
+                v = np.array([""] * a.size, dtype=h5py.string_dtype()).reshape(a.shape)
+            else:
+                v = np.zeros_like(a)
         try:
             dst.attrs[k] = v
         except Exception as e:  # noqa: BLE001

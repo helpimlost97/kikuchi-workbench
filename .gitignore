@@ -15,19 +15,14 @@
 !montage.py
 !montage_tab.py
 !Open workbench.bat
-!build_refinement_notebook.py
 !spherical_indexing_template.ipynb
 !spherical_indexing_RKD.ipynb
-!spherical_refinement_template.ipynb
-!spherical_refinement_RKD.ipynb
 !preset_RKD.txt
 !ebsd_params.py
 !sph_benchmark.py
 !test_gpu_memory_fix.py
 !Open RKD notebook.bat
 !Open template notebook.bat
-!Open refinement notebook.bat
-!Open RKD refinement notebook.bat
 !osc_refinement_handoff/
 osc_refinement_handoff/*
 !osc_refinement_handoff/OSC_REFINEMENT_HANDOFF.md

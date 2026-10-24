@@ -80,11 +80,9 @@ def fmt(v):
     return f"<{v.shape} {v.dtype}>"
 
 def read_up_dims(path):
-    """(width, height) in pixels from a .up1/.up2 header (v1..v4: uint32 version, w, h, offset)."""
-    import struct
-    with open(os.path.expanduser(path), "rb") as f:
-        v, w, h, off = struct.unpack("<iiii", f.read(16))
-    return int(w), int(h)
+    """(width, height) in pixels of the patterns of a .up1/.up2 file (from its header)."""
+    h = read_up_header(path)
+    return int(h["pattern_width"]), int(h["pattern_height"])
 
 def read_up_header(path):
     """Header of an EDAX .up1/.up2 file as a dict: version, pattern_width, pattern_height,

@@ -21,10 +21,8 @@ only the path syntax in the examples changes.
 | `kikuchi_workbench.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.8. `sph_core.py` holds the indexing code the GUI calls (the notebook's cells as functions, usable from scripts), `live_view.py` the animated progress view. |
 | `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.9. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's third tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
 | `build_notebook.py` | Generates the indexing notebook (sections 0 to 10 plus an optional HROSM section 11). Edit this, then regenerate; do not hand-edit the generated `.ipynb` unless you know you will not regenerate it. |
-| `build_refinement_notebook.py` | Generates the projection center drift correction notebook: corrects an indexed map for the PC moving with the beam, from the scan geometry alone, no patterns needed (minutes), see section 6.6. |
 | `spherical_indexing_template.ipynb` | Generated indexing notebook with default settings. Runs on kikuchipy's nickel demo data when no pattern file is given. |
-| `spherical_refinement_template.ipynb` | Generated PC drift correction notebook for conventional EBSD. Starts from the `.h5` the indexing notebook writes; also runs on the demo data. |
-| `spherical_indexing_RKD.ipynb`, `spherical_refinement_RKD.ipynb`, `preset_RKD.txt` | Example of the two notebooks generated with a preset file (an RKD data set, detector parallel to the sample). The paths in all three are placeholders, see section 6.1. |
+| `spherical_indexing_RKD.ipynb`, `preset_RKD.txt` | Example of the notebook generated with a preset file (an RKD data set, detector parallel to the sample). The paths in all three are placeholders, see section 6.1. |
 | `ebsd_params.py` | Reads acquisition parameters (pattern size, projection center, map size, step) from an EDAX `.ang` or `.edaxh5` file and a `.up1`/`.up2` file. Used by the notebook's first cell and usable from the command line. |
 | `sph_benchmark.py` | CPU vs GPU speed and parity benchmark on the nickel demo data set. Use it to verify the install. |
 | `test_gpu_memory_fix.py` | Checks that VRAM is released between two GPU runs (tests one of the local patches). |
@@ -153,8 +151,7 @@ Then run the benchmark on the nickel demo data set (4125 patterns of 60 x 60 px,
 once, a few MB):
 
 ```bash
-cd ..                          # back to this folder
-python sph_benchmark.py --backend both --workers 8 --compare
+python sph_benchmark.py --backend both --workers 8 --compare    # from this folder
 ```
 
 `--workers` should be about your number of performance cores. The first call of each backend
@@ -209,8 +206,7 @@ python build_notebook.py my_scan.ipynb my_preset.txt  # with a preset
 
 A preset is a text file of `NAME = value` lines that overwrite settings in the notebook's
 first two cells. `value` is Python source, so paths are written as raw strings. Names that
-are not settings of the notebook being built are listed and ignored, so one preset can serve
-both the indexing and the refinement notebook. A notebook built earlier can be given in the
+are not settings of the notebook being built are listed and ignored. A notebook built earlier can be given in the
 place of a preset; its settings are then copied. `preset_RKD.txt` is a complete example; a
 minimal one for conventional EBSD looks like
 
@@ -279,6 +275,8 @@ python ebsd_params.py "scan.ang" --up1 "scan.up1"            # EDAX and EMsoft p
 python ebsd_params.py "scan.edaxh5" --map "Area 1" --px 115
 ```
 
+The docstring at the top of `ebsd_params.py` lists all options.
+
 ### 6.6 Correct the projection center drift
 
 Spherical indexing (like EMSphInx) uses one projection center (PC) for the whole map, but the
@@ -288,53 +286,12 @@ a detector distance of 18 mm it is 10 degrees edge to edge, and about 0.1 degree
 grain. Point-to-point noise is unaffected, but grain reference orientation deviations and
 orientation gradients within grains are.
 
-`spherical_refinement_template.ipynb` (built by `build_refinement_notebook.py`) removes that
-error from an indexed map without re-indexing and without the pattern file, in minutes:
-
-1. The PC of every map point is extrapolated from one anchor PC and the scan geometry (the
-   model of `EBSDDetector.extrapolate_pc()`, generalised to a twisted detector).
-2. The rotation a PC offset imposes on an indexed orientation is linearised once for the
-   detector geometry, and every orientation is rotated back by its local correction.
-
-Checked against patterns simulated with the true PC and refined with the anchor PC: a fixed-PC
-error of 1.3 / 3.4 / 4.7 degrees becomes 0.03 / 0.1 / 0.2 degrees. Gradients within grains are
-right to second order everywhere. Build it with the settings of the indexing notebook of the
-same scan, so that the geometry matches:
-
-```bash
-python build_refinement_notebook.py my_scan_pccorr.ipynb my_scan.ipynb
-python build_refinement_notebook.py my_scan_pccorr.ipynb my_scan.ipynb my_preset.txt   # plus a preset
-```
-
-1. **Section 0, files.** `INDEXED_FILE`, the `.h5` the indexing notebook wrote (its `.ang`
-   works too, but carries no image quality and only the proper point group; an EMSphInx or OIM
-   result of the same points works as well), and `SCAN_FILE` for the PC and pattern size.
-2. **Section 1, settings.** The detector geometry the map was indexed with: `PC` (the anchor),
-   `PC_POSITION` (the map point that PC belongs to, default the centre), `PATTERN_SHAPE` (needed
-   when the scan file does not give it), `SAMPLE_TILT`, `CAMERA_TILT`, the detector size via
-   `PX_SIZE` or `DETECTOR_WIDTH_UM` (the drift scales with 1 / detector size, so check the
-   printed width and distance), `TWIST` and `CIRCULAR_MASK`.
-3. **Section 4** shows where in the map the single PC fitted best (indexing score over image
-   quality per band), which is where `PC_POSITION` should point. **Section 5** prints the PC
-   change over the map and checks the plane against `extrapolate_pc`. **Section 6** prints the
-   apparent rotation per millimetre of beam travel.
-4. **Section 7** measures on the map itself how much of the geometric drift is really there:
-   the mean rotation between points k steps apart within grains, which real gradients average
-   out of and the artefact does not. Expect about 1 for a beam-scanned map indexed with one PC
-   and about 0 for a map acquired by stage movement (the source then never moves relative to
-   the detector) or already indexed with a PC per point. The correction is scaled by the
-   measured fraction (`DRIFT_FACTOR = "measured"`, or give a number). **Section 8** corrects
-   the orientations and shows the correction angle over the map; the neighbour misorientation
-   inside grains must not change. **Section 9** (optional, `SELF_CHECK = True`, a minute)
-   verifies the correction on simulated patterns for your geometry. **Section 10** saves
-   `<name>_pccorr.h5` / `.ang` with the correction angle as an extra property.
-
-For a twisted detector (RKD, `TWIST != 0`) the drift direction follows kikuchipy's detector
-twist, whose sign equivalence with the indexing notebook's `TWIST` is not verified. The full
-pattern-matching refinement with a PC per point, which also removes the band limit, remains
-available as a cluster script in `osc_refinement_handoff/`; it costs hours to days.
-
-The docstring at the top of `ebsd_params.py` lists all options.
+A projection center drift correction (every point's PC extrapolated from one anchor PC and the scan
+geometry, and each orientation rotated back by its local correction, without re-indexing and without the
+pattern file) was built as a separate notebook, but that builder and its notebooks are **not part of this
+repository** (they were never committed). What the repository holds for this is the cluster script in
+`osc_refinement_handoff/` (`refine_pc_per_point.py`, with its handoff notes): the full pattern-matching
+refinement with a PC per point, which also removes the band limit; it costs hours to days.
 
 ### 6.7 HROSM: re-index every grain on a fine misorientation ball
 
@@ -480,12 +437,25 @@ The **3. Montage batch** tab:
   (`IQ`, EMSphInx's discrete cosine measure, as EMSphInx's own .ang output; tick *Keep the
   project's (Hough) IQ* to leave the acquisition's IQ in place), phase and `Valid` flag into a
   copy of the project, `<project>_sph_bw<bandwidth>.edaxh5` in the output folder, right after the
-  tile is done (the copy is made when the batch starts, so tiles not indexed keep their Hough
-  results). The orientation matrix convention of the file was verified against the Hough results
-  of a real tile. Untick *Index the processed files* to index the raw files instead.
-- **Cancel batch** stops the batch: in processing the current tile is abandoned (its partial file is
-  deleted) and the tiles already written stay; in indexing after the current band, with the tiles
-  already indexed in the output project.
+  tile is done (tiles not indexed keep their Hough results). The zero patterns are found on the raw
+  data, before the background removal, which would rescale them. The orientation matrix convention
+  of the file was verified against the Hough results of a real tile. Untick *Index the processed
+  files* to index the raw files instead. Tiles without a usable file are named in the log and
+  skipped, and a bad processed file shows in the table's status column.
+  - *Project phase of each master*: the `Phase` column of the output must point into the project's
+    phase list (printed with its numbers when the project is loaded). Blank = each master pattern is
+    matched to a project phase by name (whole name or whole word, so "ferrite" matches "Ferrite (bcc)"),
+    and by order when the names do not match but the counts agree; otherwise the batch refuses to
+    start. Type the numbers to decide yourself, e.g. `2` or `2,1`.
+  - *Resume* (on by default): an output project that already exists is kept and the tiles it already
+    holds spherical results for are skipped, so a batch that was cancelled or had a failed tile
+    continues where it stopped. Untick it for a fresh copy of the project and every tile again. While
+    the output is partial, the log says so (the indexed tiles' IQ is on the spherical 0..1 scale, the
+    others' on the Hough scale, unless the Hough IQ is kept).
+- **Cancel batch** stops the batch: in processing during the shared background pass or after the
+  current tile (its partial file is deleted; the tiles already written stay); in indexing after the
+  current band, with the tiles already indexed in the output project. While a batch runs the tab's
+  fields and the processor tab are locked, and the indexing tab refuses to load or run.
 
 The two steps are separate on purpose: all processed tiles are on disk and RAM is empty before the
 indexing starts. From a script, `montage.py` does the reading and writing:
@@ -557,8 +527,9 @@ patterns per Dask chunk and, on the GPU, the device batch size.
 - **Accuracy vs the EMSphInx binary:** the author reports a median refined disagreement of
   about 0.3 deg, due to a pixel-stretch quirk in EMSphInx that was deliberately not copied.
   On an RKD data set the notebook matched an EMSphInx result to a median of 0.03 deg.
-- **Old `.up1` files** (header version 3) do not store the map size or step; the notebook
-  takes them from the `.ang` file. Hexagonal grids are not handled by that fallback.
+- **Old `.up1` files** (header version 1) do not store the map size or step; the notebook
+  takes them from the `.ang` file (version 3 and later store both). Hexagonal grids are not
+  handled by that fallback.
 - **Dask version.** Tested with dask 2026.1.2, numba 0.64, numpy 2.3, orix 0.14, hyperspy 2.4 on
   the laptop (commit `71a1b2f`); the re-pin to `4c7a0035` was verified with dask 2026.8, numba 0.68,
   numpy 2.5, orix 0.15, hyperspy 2.5, pyebsdindex 0.3.10.1 (CPU only).

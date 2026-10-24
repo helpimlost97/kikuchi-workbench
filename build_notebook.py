@@ -88,7 +88,7 @@ MASTER_FILE = None
 # MASTER_BANDWIDTH: only for .h5 masters, the bandwidth of the harmonics computed from the master pattern. Keep it
 # >= 384 (the mp2sht default) even when BANDWIDTH below is much lower: the transform aliases at a low bandwidth and
 # the aliasing is not cubic, so the symmetry copies of the correlation peak become unequal and the KAM map fills
-# with variant-hop lines and rings (NOTES_master_pattern_symmetry.md).
+# with variant-hop lines and rings.
 MASTER_BANDWIDTH = 384
 MASTER_ENERGY = None       # only for .h5 masters with several energies: beam energy in keV to load. None = all (weighted)
 # The master pattern carries the sample tilt it was simulated for, and indexing refuses to run if it differs
@@ -121,9 +121,6 @@ GAUSSIAN_BACKGROUND = False  # fit and subtract a 2D Gaussian background (EMSphI
 NORMALIZE = True           # normalized cross-correlation (EMSphInx "normed")
 CHUNKSIZE = None           # patterns per chunk = GPU batch size. None = automatic
 TEST_SIZE = 50             # side length in map points of the test region indexed in section 6
-
-# Refinement of the orientations with a projection center per map point has its own notebook, built by
-# build_refinement_notebook.py from the .h5 that section 9 writes.
 
 # ======================= HROSM (section 11, optional) =======================
 # High angular resolution orientation similarity map: every grain of the indexed map is re-indexed by dictionary
@@ -512,9 +509,9 @@ for phase_id, phase in xmap.phases_in_data:
 md(r"""
 ## 9. Save
 
-The `.h5` written here is the starting point of the projection center drift correction notebook
-(`spherical_refinement_template.ipynb`, built by `build_refinement_notebook.py`), which corrects these orientations
-for the projection center moving with the beam. Section 11 below (HROSM) also starts from the indexed map.
+The `.h5` written here holds the full crystal map (orientations, scores, image quality, the mask) and is what
+section 11 below (HROSM) and the per-point projection center refinement script in `osc_refinement_handoff/` start
+from.
 """)
 
 code(r'''
@@ -634,6 +631,8 @@ if hrosm_master:
     # Only the points of HROSM_ROI are assigned to grains and re-indexed
     nav_mask = None
     if HROSM_ROI is not None:
+        if len(nav_shape) != 2:
+            raise ValueError("HROSM_ROI needs a 2D map; this map has one navigation dimension (set HROSM_ROI = None)")
         c0, c1, r0, r1 = HROSM_ROI
         nav_mask = np.ones(nav_shape, dtype=bool)  # True = leave out
         nav_mask[r0:r1, c0:c1] = False
@@ -757,7 +756,7 @@ if hrosm_master:
 
 def read_settings(source):
     """NAME -> value (Python source) from a preset file of "NAME = value" lines, or from the settings cells
-    (tagged "files" / "parameters") of a notebook built by this script or build_refinement_notebook.py."""
+    (tagged "files" / "parameters") of a notebook built by this script."""
     source = Path(source)
     if source.suffix.lower() == ".ipynb":
         cells = nbf.read(source, as_version=4).cells
@@ -795,6 +794,8 @@ def apply_settings(settings):
         print("ignored (not settings of this notebook):", ", ".join(ignored))
 
 
+if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    sys.exit("usage: python build_notebook.py OUTPUT.ipynb [preset.txt | built_notebook.ipynb ...]")
 # Optional: settings from preset files ("NAME = value" lines) and/or notebooks, applied in the order given
 for source in sys.argv[2:]:
     apply_settings(read_settings(source))

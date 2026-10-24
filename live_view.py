@@ -8,14 +8,17 @@ label. The caller (the main window) forwards the indexing thread's events to it 
     view.begin_run(r0, c0, rows, cols, n_patterns)
     view.block_started(r0, r1, c0, c1, n)      # a band of rows is being indexed: tinted orange
     view.block_progress(frac_index, frac_refine)  # left-to-right sweep inside the band (until a chunk is painted)
-    view.chunk_done(rows, cols, rgb)              # the patterns of a finished chunk painted with their IPF colours
+    view.chunk_done(rows, cols, packed=p, colour=fn)  # a finished chunk: its patterns are coloured (fn(p) -> rgb)
+                                                  # and painted at the next redraw tick; or pass rgb= directly
     view.block_done(r0, r1, c0, c1, rgb, n, seconds)  # band painted with its IPF colours
     view.set_speed(pps); view.set_progress(done, total, eta)
     view.end_run(True)
 
-During a band the patterns of every finished dask chunk are painted with their IPF colours at once (``chunk_done``,
-a GPU batch or a CPU chunk at a time, the refined orientation when refinement is on), so the picture grows in file
-order a few times a second as in EMSphInx; the orange left-to-right sweep is only used when no chunk events come.
+During a band the patterns of every finished dask chunk are painted with their IPF colours (``chunk_done``, a GPU
+batch or a CPU chunk at a time, the refined orientation when refinement is on), so the picture grows in file order
+several times a second as in EMSphInx. The chunks arrive as packed rows with a colouring function and are coloured
+in one go at the next 5 Hz redraw tick, so the indexing thread does no colouring and the GUI colours at most five
+times a second. The orange left-to-right sweep is only used in a band in which no chunk has been painted.
 Rendering is cheap on purpose: one RGB float32 image (``LiveView.image``) is kept and written into by slices, and the
 canvas is redrawn from a 5 Hz timer only when something changed, however many events arrive. What is pushed to the
 AxesImage is an RGBA uint8 copy of it, subsampled with a stride when the map has more pixels than the axes (a
@@ -58,6 +61,7 @@ def _fmt_time(seconds) -> str:
 class LiveView(QWidget):
     """Map being indexed (left), current pattern (right), status line (bottom). GUI thread only."""
     point_clicked = pyqtSignal(int, int)  # (row, col) of a left click on the map while idle
+    error = pyqtSignal(str)               # a problem while fetching or colouring (once per run), for the log
 
 
     def __init__(self, parent=None):
@@ -109,6 +113,8 @@ class LiveView(QWidget):
         self._frac_refine = 0.0
         self._sweep_col = None                    # last column painted with the bright sweep tint (absolute)
         self._chunks_painted = 0                  # patterns painted by chunk_done in the current band
+        self._queued = []                         # (rows, cols, packed, colour) of chunks not yet coloured and painted
+        self._errors_reported = 0
         self._sweep_pos = 0
         self._sweep_offset = 0
         self._speed_now = None
@@ -141,11 +147,15 @@ class LiveView(QWidget):
         self.ax_map.set_yticks([])
         self._map_artist = self._outline = self._marker = None
         self._sweep_col = None
+        self._queued.clear()
+        if not self._running:
+            self._run_rect = None  # the outline of an earlier run belongs to the map it was run on
         if iq is None:
             self._base = None
             self.image = None
             self._disp = None
             self._dirty_rows = None
+            self._clear_pattern()
             if title:
                 self.ax_map.set_title(title, fontsize=10)
             self.status.setText("No map")
@@ -222,6 +232,17 @@ class LiveView(QWidget):
         self.ax_pat.set_title(f"({row}, {col})" if row is not None else "Pattern", fontsize=10)
         self._mark_dirty()
 
+    def _clear_pattern(self):
+        """Empty the pattern panel (the pattern of a file that is no longer loaded must not stay there)."""
+        if self._pat_artist is not None:
+            self._pat_artist.remove()
+            self._pat_artist = None
+        self._pat_shape = None
+        self.ax_pat.clear()
+        self.ax_pat.set_xticks([])
+        self.ax_pat.set_yticks([])
+        self.ax_pat.set_title("Pattern", fontsize=10)
+
     def set_marker(self, row, col):
         """Mark the map point whose pattern is displayed (no-op without a base map)."""
         if self._marker is None:
@@ -251,6 +272,8 @@ class LiveView(QWidget):
         self._done, self._total, self._eta = 0, int(n_patterns), None
         self._blocks_done_patterns = 0
         self._final_text = None
+        self._queued.clear()
+        self._errors_reported = 0
         self._show_outline()
         if self._marker is not None:
             self._marker.set_visible(False)
@@ -285,19 +308,35 @@ class LiveView(QWidget):
                 self._paint_sweep()
         self._mark_dirty()
 
-    def chunk_done(self, rows, cols, rgb):
-        """Paint the patterns at map coordinates (``rows[i]``, ``cols[i]``) with the colours ``rgb[i]`` (float
-        (n, 3), 0..1), as EMSphInx paints each pattern the moment it is indexed. Points outside the map are
-        ignored. The band's ``block_done`` repaints the whole band afterwards, so this is a preview only."""
+    def chunk_done(self, rows, cols, rgb=None, packed=None, colour=None):
+        """The patterns at map coordinates (``rows[i]``, ``cols[i]``) of a finished chunk, as EMSphInx paints
+        each pattern the moment it is indexed. Either ``rgb`` (float (n, 3), 0..1) is painted now, or ``packed``
+        (the chunk's result rows) is queued and ``colour(packed) -> rgb`` is called for all queued chunks at the
+        next redraw tick, so colouring costs the GUI at most one call per tick and the indexing thread nothing.
+        Points outside the map are ignored. The band's ``block_done`` repaints the whole band afterwards."""
         if self.image is None:
             return
         try:
             rows = np.asarray(rows, dtype=int).ravel()
             cols = np.asarray(cols, dtype=int).ravel()
+        except (TypeError, ValueError):
+            return
+        if rows.size != cols.size or rows.size == 0:
+            return
+        if rgb is None:
+            if packed is None or colour is None:
+                return
+            self._queued.append((rows, cols, np.asarray(packed), colour))
+            self._mark_dirty()
+            return
+        self._paint_points(rows, cols, rgb)
+
+    def _paint_points(self, rows, cols, rgb):
+        try:
             a = np.asarray(rgb, dtype=np.float32)
         except (TypeError, ValueError):
             return
-        if a.ndim != 2 or a.shape[1] < 3 or rows.size != cols.size or a.shape[0] != rows.size or rows.size == 0:
+        if a.ndim != 2 or a.shape[1] < 3 or a.shape[0] != rows.size:
             return
         h, w = self.image.shape[:2]
         ok = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
@@ -305,13 +344,47 @@ class LiveView(QWidget):
             rows, cols, a = rows[ok], cols[ok], a[ok]
             if rows.size == 0:
                 return
+        if not self._chunks_painted and self._block is not None and self._sweep_col is not None:
+            # the first chunk of the band: the bright sweep painted by the progress events before it stays
+            # otherwise frozen on the unpainted rows, so take it back to the plain band tint
+            r0, r1, c0, c1 = self._block
+            if self._sweep_col > c0:
+                self.image[r0:r1, c0:self._sweep_col] = (self._base[r0:r1, c0:self._sweep_col, None] * (1 - _TINT)
+                                                         + _ORANGE * _TINT)
+                self._touch(r0, r1)
+            self._sweep_col = c0
         self.image[rows, cols] = np.clip(np.nan_to_num(a[:, :3], nan=0.0, posinf=1.0, neginf=0.0), 0.0, 1.0)
         self._touch(int(rows.min()), int(rows.max()) + 1)
         self._chunks_painted += int(rows.size)
         self._mark_dirty()
 
+    def _paint_queued(self):
+        """Colour and paint the queued chunks, grouped by colouring function (one call each)."""
+        if not self._queued or self.image is None:
+            self._queued.clear()
+            return
+        queued, self._queued = self._queued, []
+        groups: dict = {}
+        for rows, cols, packed, colour in queued:
+            groups.setdefault(id(colour), (colour, []))[1].append((rows, cols, packed))
+        for colour, items in groups.values():
+            rows = np.concatenate([r for r, _, _ in items])
+            cols = np.concatenate([c for _, c, _ in items])
+            try:
+                rgb = colour(np.concatenate([p for _, _, p in items], axis=0))
+            except Exception as e:  # noqa: BLE001  (the preview must never stop the run)
+                self._report_error(f"Live preview: colouring failed ({type(e).__name__}: {e})")
+                continue
+            self._paint_points(rows, cols, rgb)
+
+    def _report_error(self, text: str):
+        if self._errors_reported == 0:
+            self.error.emit(text)
+        self._errors_reported += 1
+
     def block_done(self, r0, r1, c0, c1, rgb, n_patterns, seconds):
         band = self._clip_block(r0, r1, c0, c1)
+        self._queued.clear()  # the band is repainted whole from its crystal map
         if self.image is not None and band is not None:
             br0, br1, bc0, bc1 = band
             # restore grey first so an rgb that does not cover the band leaves no tint behind
@@ -347,9 +420,11 @@ class LiveView(QWidget):
     def end_run(self, success: bool):
         self._sweep_timer.stop()
         self._redraw_timer.stop()
+        self._paint_queued()
         if self._block is not None:
             self._untint_band()
             self._block = None
+            self._mark_dirty()
         self._sweep_col = None
         was_running = self._running
         self._running = False
@@ -527,6 +602,7 @@ class LiveView(QWidget):
     def _on_redraw_tick(self):
         if self._running:
             self._update_status()
+        self._paint_queued()
         self._flush()
         if not self._running:
             self._redraw_timer.stop()
@@ -551,14 +627,16 @@ class LiveView(QWidget):
         row, col = r0 + i // w, c0 + i % w
         try:
             pattern = self._pattern_source(row, col)
-        except Exception:
+        except Exception as e:  # noqa: BLE001  (the pattern panel must never stop the run)
+            self._report_error(f"Live view: the pattern at ({row}, {col}) could not be fetched ({type(e).__name__}: {e})")
             return
         if pattern is None:
             return
         self.n_fetched += 1
         try:
             self.show_pattern(pattern, row, col)
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            self._report_error(f"Live view: the pattern at ({row}, {col}) could not be shown ({type(e).__name__}: {e})")
             return
         # no marker during a run: the patterns swept past are indicated by the band outline only
 
@@ -588,7 +666,12 @@ class LiveView(QWidget):
         if self._speed_block is not None:
             parts.append(f"{_fmt_int(self._speed_block)} pat/s this block")
         if self._block is not None and (self._frac_index > 0 or self._frac_refine > 0):
-            parts.append(f"block: search {100 * self._frac_index:.0f} %, refine {100 * self._frac_refine:.0f} %")
+            # the fork refines inside the search tasks, so a separate refinement fraction only exists (and is
+            # shown) when it is still below 100 %
+            text_block = f"block: {100 * self._frac_index:.0f} %"
+            if self._frac_refine < 1.0:
+                text_block = f"block: search {100 * self._frac_index:.0f} %, refine {100 * self._frac_refine:.0f} %"
+            parts.append(text_block)
         text = " · ".join(parts)
         if text != self.status.text():
             self.status.setText(text)

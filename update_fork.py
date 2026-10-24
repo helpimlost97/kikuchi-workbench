@@ -84,6 +84,12 @@ def main():
             )
         run(["git", "apply", "--reverse", PATCH], cwd=clone)
         print("reverted the previously applied local patch")
+        # the reverse-apply check only looks at the files the patch touches: anything else that is still
+        # modified is someone's own work and must not be carried through the checkout
+        dirty = run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=clone, capture=True).stdout.strip()
+        if dirty:
+            print(dirty)
+            sys.exit(f"{clone} has local changes besides this project's patch; commit, stash or discard them first")
 
     # Step 3: the pinned commit
     target = a.commit

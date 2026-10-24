@@ -27,7 +27,7 @@ import struct
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 import h5py
 import numpy as np
@@ -208,6 +208,7 @@ class Project:
     path: str
     name: str
     tiles: list[Tile]
+    skipped: list[str] = field(default_factory=list)  # map groups without a scan grid (e.g. EDS-only maps)
 
     @property
     def folder(self) -> str:
@@ -276,13 +277,18 @@ def read_project(path: str | os.PathLike) -> Project:
                 name = str(_attr(f[key], "Name", name))
                 break
 
+        skipped = []
+
         def visit(_name, obj):
             if isinstance(obj, h5py.Group) and _attr(obj, "GroupType") == GROUP_MAP:
-                tiles.append(_read_tile(obj))
+                if "Sample/Number Of Rows" in obj and "Sample/Number Of Columns" in obj:
+                    tiles.append(_read_tile(obj))
+                else:  # a map group that is not an EBSD scan (no grid): not a tile
+                    skipped.append(f"{str(_attr(obj, 'Name', obj.name))} ({obj.name}): no Sample/Number Of Rows|Columns")
 
         f.visititems(visit)
     tiles.sort(key=lambda t: (t.row if t.row is not None else 1 << 30, t.col if t.col is not None else 1 << 30, t.h5_path))
-    return Project(path, name, tiles)
+    return Project(path, name, tiles, skipped)
 
 
 def match_tiles(project: Project, headers: list[PatternHeader], prefer_suffix: str | None = None,
@@ -302,11 +308,24 @@ def match_tiles(project: Project, headers: list[PatternHeader], prefer_suffix: s
             by_guid.setdefault(h.guid.lower(), []).append(h)
         else:
             without_guid.append(h)
+
+    def name_matches(h: PatternHeader, tile: Tile) -> bool:
+        stem = os.path.splitext(h.name)[0]
+        return stem.endswith(tile.name) or bool(prefer_suffix and stem.endswith(tile.name + prefer_suffix))
+
+    # a file without a GUID is matched by name only when exactly one tile has that name (a project with several
+    # areas can hold the same map name twice; such files cannot be told apart and are left unassigned)
+    ambiguous = set()
+    for h in without_guid:
+        n_tiles = sum(1 for t in project.tiles if name_matches(h, t))
+        if n_tiles > 1:
+            ambiguous.add(h.path)
+            if log is not None:
+                log(f"{h.name}: no GUID in its header and {n_tiles} tiles of the project match its name; not assigned")
     for tile in project.tiles:
         candidates = list(by_guid.get((tile.guid or "").lower(), []))
         for h in without_guid:
-            stem = os.path.splitext(h.name)[0]
-            if stem.endswith(tile.name) or (prefer_suffix and stem.endswith(tile.name + prefer_suffix)):
+            if h.path not in ambiguous and name_matches(h, tile):
                 candidates.append(h)
         tile.pattern, tile.status = None, "no pattern file"
         if not candidates:
@@ -409,25 +428,6 @@ def copy_project(project_path: str | os.PathLike, out_path: str | os.PathLike, o
     return out_path
 
 
-def zero_pattern_mask(s) -> np.ndarray | None:
-    """(rows, cols) True where a pattern is all zeros (the processor writes zeros for patterns it excluded), or
-    None when there is no such pattern. Works for lazy signals."""
-    nav_shape = tuple(int(v) for v in s.axes_manager.navigation_shape[::-1])
-    sig_shape = tuple(int(v) for v in s.axes_manager.signal_shape[::-1])
-    data = s.data
-    try:
-        import dask.array as da
-
-        if isinstance(data, da.Array):
-            flat = data.reshape((-1,) + sig_shape).max(axis=(-2, -1)).compute()
-        else:
-            flat = np.asarray(data).reshape((-1,) + sig_shape).max(axis=(-2, -1))
-    except Exception:  # noqa: BLE001  (a layout that cannot be reshaped: go through numpy)
-        flat = np.asarray(data).reshape((-1,) + sig_shape).max(axis=(-2, -1))
-    mask = np.asarray(flat == 0).reshape(nav_shape)
-    return mask if mask.any() else None
-
-
 def tile_stats(s, progress: Callable[[float], None] | None = None) -> tuple[np.ndarray, np.ndarray | None]:
     """One pass over a tile's patterns: the quasi-IQ map (per-pattern standard deviation, float32 (rows, cols))
     and the mask of all-zero patterns (None when there is none), e.g. the patterns the processor excluded."""
@@ -509,7 +509,9 @@ def write_tile_result(out_path: str | os.PathLike, tile: Tile, xmap, iq_prop: st
     from sph_core import full_shape
 
     shape = full_shape(xmap)
-    if shape != (tile.n_rows, tile.n_cols):
+    # a tile of one row (or one column) is a 1D crystal map: its n points are the grid in row-major order too
+    one_line = min(tile.n_rows, tile.n_cols) == 1 and shape == (tile.n_rows * tile.n_cols,)
+    if shape != (tile.n_rows, tile.n_cols) and not one_line:
         raise ValueError(f"{tile.name}: crystal map grid {shape} is not the tile's grid ({tile.n_rows}, {tile.n_cols})")
     mats, in_data = _full_grid_matrices(xmap)
     iq = None if iq_prop is None else _full_grid_prop(xmap, iq_prop, in_data, 0.0)
@@ -543,6 +545,92 @@ def write_tile_result(out_path: str | os.PathLike, tile: Tile, xmap, iq_prop: st
             except (TypeError, ValueError, OSError):
                 pass
     return {"n_points": int(n), "n_indexed": int(in_data.sum()), "n_not_indexed": int((~in_data).sum())}
+
+
+RESULT_MARKER = "Spherical indexing"  # start of the comment write_tile_result leaves in an indexed tile
+
+
+def indexed_tiles(out_path: str | os.PathLike, tiles: Sequence[Tile]) -> set[str]:
+    """The ``h5_path`` of every tile of ``tiles`` whose table in the output project was written by
+    :func:`write_tile_result` (its comment starts with :data:`RESULT_MARKER`)."""
+    done = set()
+    if not os.path.exists(str(out_path)):
+        return done
+    with h5py.File(out_path, "r") as f:
+        for t in tiles:
+            key = f"{t.h5_path}/EBSD/ANG/HEADER/Comments"
+            if key not in f:
+                continue
+            try:
+                value = f[key][0]
+            except (IndexError, TypeError, ValueError, OSError):
+                continue
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", "replace")
+            if str(value).startswith(RESULT_MARKER):
+                done.add(t.h5_path)
+    return done
+
+
+def phase_mapping(master_names: Sequence[str], project_phases: Sequence[Phase], spec: str | None = None,
+                  log: Log | None = None) -> dict[int, int]:
+    """Which phase of the project each master pattern is: a dict master index -> 0-based index into the project's
+    phase list (the ``Phase`` column of the output table).
+
+    ``spec`` is the user's choice, the 1-based project phase number of every master, comma separated (e.g.
+    "2,1"). Without it the masters are matched to the project's phases by name (one name containing the other,
+    case insensitive), and when that is not unique for every master, by order when there are as many masters as
+    phases. Raises ValueError when no mapping can be made, so that a wrong phase is never written.
+    """
+    n_m, n_p = len(master_names), len(project_phases)
+    if n_p == 0:
+        raise ValueError("The project has no phase list (EBSD/ANG/HEADER/Phase)")
+    names_p = [str(p.name) for p in project_phases]
+    if spec is not None and str(spec).strip():
+        parts = [s.strip() for s in str(spec).replace(";", ",").split(",") if s.strip()]
+        if len(parts) != n_m:
+            raise ValueError(f"The phase assignment {spec!r} has {len(parts)} entries, but there are {n_m} master patterns")
+        mapping = {}
+        for i, part in enumerate(parts):
+            try:
+                k = int(part)
+            except ValueError:
+                raise ValueError(f"The phase assignment {spec!r}: {part!r} is not a phase number (1..{n_p})") from None
+            if not 1 <= k <= n_p:
+                raise ValueError(f"The phase assignment {spec!r}: phase {k} does not exist in the project (1..{n_p}: "
+                                 + ", ".join(names_p) + ")")
+            mapping[i] = k - 1
+        if log is not None:
+            log("Phases: " + ", ".join(f"master {i + 1} ({master_names[i] or '?'}) -> project phase {k + 1} ({names_p[k]})"
+                                       for i, k in mapping.items()))
+        return mapping
+    def words(text: str) -> set[str]:
+        return {w for w in re.split(r"[^a-z0-9]+", text.lower()) if w}
+
+    # a master matches a project phase whose name is the same, or whose name has the master's name as a whole
+    # word (or the other way round): 'ferrite' matches 'Ferrite (bcc)', while 'ni' must not match 'austenite'
+    mapping = {}
+    for i, name in enumerate(master_names):
+        n = (name or "").strip().lower()
+        hits = [k for k, pn in enumerate(names_p)
+                if n and (n == pn.lower() or n in words(pn) or pn.lower() in words(n))]
+        if len(hits) == 1:
+            mapping[i] = hits[0]
+    if len(mapping) == n_m and len(set(mapping.values())) == n_m:
+        if log is not None:
+            log("Phases matched by name: " + ", ".join(f"master {i + 1} ({master_names[i]}) -> project phase {k + 1} ({names_p[k]})"
+                                                       for i, k in mapping.items()))
+        return mapping
+    if n_m == n_p:
+        if log is not None:
+            log(f"NB! The master pattern names ({', '.join(m or '?' for m in master_names)}) could not all be matched to the "
+                f"project's phases ({', '.join(names_p)}) by name: taken in order. Set the phase assignment to change that")
+        return {i: i for i in range(n_m)}
+    raise ValueError(
+        f"{n_m} master pattern(s) ({', '.join(m or '?' for m in master_names)}) but the project has {n_p} phase(s) "
+        f"({', '.join(names_p)}), and the names do not match: give the project phase number of each master in the "
+        "phase assignment field (e.g. '2' or '2,1')"
+    )
 
 
 def read_tile_result(path: str | os.PathLike, tile: Tile) -> dict:

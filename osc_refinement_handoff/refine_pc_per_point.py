@@ -2,8 +2,8 @@
 
 CPU only (kikuchipy pattern-matching refinement, numba + dask threads, nlopt). This is the former section 11
 of the project's spherical indexing notebook turned into a script, with the starting orientations read from
-an .ang file. The project's spherical_refinement_template.ipynb now does a cheaper projection center drift
-correction without patterns instead; this script is the only remaining form of the full refinement.
+an .ang file. It is the only form of the per-point refinement in the repository (a cheaper projection center
+drift correction without patterns was made as a separate notebook that is not part of the repository).
 
 Flow (https://kikuchipy.org/en/stable/tutorials/hybrid_indexing.html, without the Hough / dictionary parts):
 
@@ -173,11 +173,13 @@ if PC is None:
     header = [line for line in open(ANG_FILE, encoding="utf-8", errors="ignore") if line.startswith("#")]
     pc = {}
     for line in header:
-        parts = line[1:].split()
+        parts = line[1:].replace(":", " ").split()  # '# x-star 0.5' (EMSphInx, orix) and '# x-star: 0.5' (OIM)
         if len(parts) == 2 and parts[0] in ("x-star", "y-star", "z-star"):
             pc[parts[0]] = float(parts[1])
         if len(pc) == 3:
             break
+    if len(pc) < 3:
+        raise ValueError(f"{ANG_FILE}: no x-star/y-star/z-star in the header; set PC")
     pc = (pc["x-star"], pc["y-star"], pc["z-star"])
 else:
     pc = tuple(PC)
