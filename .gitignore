@@ -3,7 +3,6 @@
 !.gitignore
 !README.md
 !kikuchipy_local_patches.patch
-!build_notebook.py
 !update_fork.py
 !make_montage_sample.py
 !STITCH_DATASET_NOTES.md
@@ -15,14 +14,10 @@
 !montage.py
 !montage_tab.py
 !Open workbench.bat
-!spherical_indexing_template.ipynb
-!spherical_indexing_RKD.ipynb
 !preset_RKD.txt
 !ebsd_params.py
 !sph_benchmark.py
 !test_gpu_memory_fix.py
-!Open RKD notebook.bat
-!Open template notebook.bat
 !osc_refinement_handoff/
 osc_refinement_handoff/*
 !osc_refinement_handoff/OSC_REFINEMENT_HANDOFF.md

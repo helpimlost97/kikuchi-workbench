@@ -23,7 +23,7 @@ Activate the environment that has h5py and numpy first, e.g. `source /path/to/ve
 Windows (PowerShell or cmd), same options; quote paths which contain spaces:
     python "C:/path/to/ebsd_params.py" "C:/data/scan.ang" --up1 "C:/data/scan.up1" --delta 55
 
-From Python or a notebook:
+From Python:
     import ebsd_params
     scan = ebsd_params.scan_info("scan.ang", pattern_file="scan.up1")
     ebsd_params.print_scan_info(scan)
@@ -293,7 +293,7 @@ def run_ang(a):
             print(f"  {o}")
 
 # ----------------------------------------------------------------------------
-# Importable interface (used by the spherical indexing notebooks)
+# Importable interface (used by sph_core.py and the workbench)
 # ----------------------------------------------------------------------------
 
 SCAN_INFO_KEYS = [

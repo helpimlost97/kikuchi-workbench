@@ -1,9 +1,9 @@
 """Orientation refinement with a projection center (PC) per map point, starting from an EMSphInx result.
 
-CPU only (kikuchipy pattern-matching refinement, numba + dask threads, nlopt). This is the former section 11
-of the project's spherical indexing notebook turned into a script, with the starting orientations read from
-an .ang file. It is the only form of the per-point refinement in the repository (a cheaper projection center
-drift correction without patterns was made as a separate notebook that is not part of the repository).
+CPU only (kikuchipy pattern-matching refinement, numba + dask threads, nlopt). Stand-alone script for a
+cluster, with the starting orientations read from an .ang file written by the workbench or EMSphInx. It is
+the only form of the per-point refinement in the repository (a cheaper projection center drift correction
+without patterns exists outside the repository).
 
 Flow (https://kikuchipy.org/en/stable/tutorials/hybrid_indexing.html, without the Hough / dictionary parts):
 
@@ -79,9 +79,9 @@ dask.config.set(num_workers=N_WORKERS)
 print(f"kikuchipy {kp.__version__}, {N_WORKERS} dask workers, stage: {stage}")
 
 
-# ---------------------------------------- helpers (from the notebook) ----------------------------------------
+# ---------------------------------------- helpers (as in sph_core.py) ----------------------------------------
 def rotate_about_z(xmap, degrees):
-    """Crystal map with the orientations rotated by `degrees` about the sample normal (the notebook's TWIST)."""
+    """Crystal map with the orientations rotated by `degrees` about the sample normal (the workbench's TWIST)."""
     if not degrees:
         return xmap
     twist = Rotation.from_axes_angles([0, 0, 1], degrees, degrees=True)
@@ -137,7 +137,7 @@ if len(ids) != 1:
 phase = xmap_ang.phases[ids[0]]
 if not phase.name:
     phase.name = "ni"
-# The notebook's spherical indexing map carries the correlation score as "scores" and the image quality as
+# The workbench's spherical indexing map carries the correlation score as "scores" and the image quality as
 # "iq". EMSphInx writes the score into the CI column, which orix reads as "ci".
 if "scores" not in xmap_ang.prop:
     xmap_ang.prop["scores"] = xmap_ang.prop["ci"]

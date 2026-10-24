@@ -1,6 +1,6 @@
 # Preset for an RKD scan (detector parallel to the sample, 479 x 479 px patterns, 55 um/px, Ni at 10 kV).
-# Usage:  python build_notebook.py spherical_indexing_RKD.ipynb preset_RKD.txt
-# The builder ignores the names that are not settings of the notebook and says so.
+# Load it in the Kikuchi workbench (indexing tab, "Load preset", or python kikuchi_workbench.py --preset preset_RKD.txt):
+# only the indexing parameters are taken from it, never files, folders or projection center values.
 # Lines starting with # are ignored. Replace every path below with your own; values are Python source.
 
 # <-- your pattern file (an NLPAR / background-processed .up1 here, hence no background removal below)

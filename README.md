@@ -1,9 +1,12 @@
 # GPU-accelerated spherical indexing of EBSD / RKD patterns
 
-Set-up guide for running Johan Westraadt's Python port of **EMSphInx** (spherical harmonic
-EBSD indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, on any Windows or Linux
-machine with an NVIDIA GPU. The port lives in his fork of kikuchipy; nothing here is in
-upstream kikuchipy or on PyPI, so everything is installed from a git clone.
+The **Kikuchi workbench**: a PyQt5 GUI that puts the
+[Kikuchi Pattern Processor](https://github.com/helpimlost97/kikuchi-pattern-processor) and GPU
+spherical indexing in one window, with a third tab that runs both over every tile of an EDAX APEX
+montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
+indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, which lives in his fork of kikuchipy;
+nothing of it is in upstream kikuchipy or on PyPI, so it is installed from a git clone (section 3).
+Everything in this repository is the GUI and the functions it calls; there are no notebooks.
 
 Tested on: Windows 11, Python 3.14.0, RTX 5070 Laptop GPU (8 GB VRAM), driver with CUDA 13
 support, Core Ultra 9 275HX (8 performance cores), 32 GB RAM. Linux works the same way;
@@ -18,16 +21,13 @@ only the path syntax in the examples changes.
 | `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/jwestraadt/kikuchipy, branch `develop`, pinned at commit `4c7a0035`, plus the local patches below. Installed in editable mode. |
 | `update_fork.py` | Clones or updates that clone, checks out the pinned commit, applies the patch and installs it, in one command. Also undoes an earlier patch first, so re-running it after Johan pushes new commits is safe. See step 3. |
 | `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Applied by `update_fork.py`, or by hand, see step 3. |
-| `kikuchi_workbench.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.8. `sph_core.py` holds the indexing code the GUI calls (the notebook's cells as functions, usable from scripts), `live_view.py` the animated progress view. |
-| `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.9. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's third tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
-| `build_notebook.py` | Generates the indexing notebook (sections 0 to 10 plus an optional HROSM section 11). Edit this, then regenerate; do not hand-edit the generated `.ipynb` unless you know you will not regenerate it. |
-| `spherical_indexing_template.ipynb` | Generated indexing notebook with default settings. Runs on kikuchipy's nickel demo data when no pattern file is given. |
-| `spherical_indexing_RKD.ipynb`, `preset_RKD.txt` | Example of the notebook generated with a preset file (an RKD data set, detector parallel to the sample). The paths in all three are placeholders, see section 6.1. |
-| `ebsd_params.py` | Reads acquisition parameters (pattern size, projection center, map size, step) from an EDAX `.ang` or `.edaxh5` file and a `.up1`/`.up2` file. Used by the notebook's first cell and usable from the command line. |
+| `kikuchi_workbench.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare; usable from scripts), `live_view.py` the animated progress view. |
+| `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.2. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's third tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
+| `preset_RKD.txt` | Example preset file for the GUI (an RKD data set, detector parallel to the sample): the indexing parameters as `NAME = value` lines. The paths in it are placeholders and are not read by the GUI. |
+| `ebsd_params.py` | Reads acquisition parameters (pattern size, projection center, map size, step) from an EDAX `.ang` or `.edaxh5` file and a `.up1`/`.up2` file. Used by the GUI's *Read scan parameters* and usable from the command line. |
 | `sph_benchmark.py` | CPU vs GPU speed and parity benchmark on the nickel demo data set. Use it to verify the install. |
 | `test_gpu_memory_fix.py` | Checks that VRAM is released between two GPU runs (tests one of the local patches). |
 | `osc_refinement_handoff/` | Full pattern-matching refinement with a PC per map point (hours to days, CPU) as a stand-alone script for a cluster, with its own hand-off notes. |
-| `Open ... notebook.bat` | Windows shortcuts that start JupyterLab on a notebook from this folder. They use the `python` on PATH; set the `PYTHON` variable at the top to a full interpreter path if your environment is elsewhere. |
 
 ---
 
@@ -71,10 +71,10 @@ pip install -e .
 
 `4c7a0035` is the head of `develop` on 2026-10-18. Compared with the earlier pin `71a1b2f` it adds
 NLPAR (`EBSD.average_non_local_neighbour_patterns`; not used here, the Kikuchi Pattern Processor
-does NLPAR through pyebsdindex), HROSM (`EBSD.hrosm`, section 6.7) and a HyperSpy 2.5 fix. The
+does NLPAR through pyebsdindex), HROSM (`EBSD.hrosm`, not used here) and a HyperSpy 2.5 fix. The
 spherical indexing code and its `spherical_indexing()` signature are unchanged, the patch applies
-cleanly, and the fork's spherical indexing tests (326, with the patch) and the whole template
-notebook on the demo data were re-run against it. To try a newer commit later:
+cleanly, and the fork's spherical indexing tests (326, with the patch) and the workbench's indexing
+of the demo data were re-run against it. To try a newer commit later:
 
 ```bash
 python update_fork.py --show-latest       # lists the commits on origin/develop after the pin
@@ -97,16 +97,16 @@ What the patch does:
 - `tests/test_indexing/test_spherical_gpu.py`: a no-op to keep the author's test suite in
   step with the change above.
 
-`update_fork.py` has already run `pip install -e kikuchipy`. Add what the notebook and scripts
-need beyond the core package:
+`update_fork.py` has already run `pip install -e kikuchipy`. Add what the GUI and scripts need
+beyond the core package:
 
 ```bash
-pip install pooch nlopt jupyterlab nbformat psutil ipywidgets
+pip install pooch nlopt psutil pyqt5 pyebsdindex scipy scikit-image
 ```
 
-In that line, `pooch`
-downloads the nickel demo data, `nlopt` is used by the refinement stage, `jupyterlab` runs the
-notebook, `nbformat` builds it, `psutil` decides whether to load a file lazily. Alternatively
+In that line, `pooch` downloads the nickel demo data, `nlopt` is used by the refinement script,
+`psutil` decides whether to load a file lazily, and the last four are the pattern processor's
+packages (add `pyopencl` for NLPAR on the GPU). Alternatively
 `pip install -e ".[all]"` installs the author's full extra set (adds pyebsdindex, pyvista and
 ebsdsim); use that if you want them and nothing else in the environment pins pyebsdindex.
 
@@ -177,157 +177,43 @@ automatic batch size is the same in both runs, and both runs give the same orien
 
 ---
 
-## 6. Index your own data with the notebook
+## 6. Index your own data with the workbench
 
-### 6.1 Placeholder paths
-
-Nothing in this folder is tied to a particular machine. Every setting that needs a file of
-yours is written as a placeholder such as `r"C:\path\to\scan.up1"` and, where it is not
-obvious, carries a comment that says what goes there:
-
-```python
-PATTERN_FILE = r"C:\path\to\scan.up1"  # <-- your pattern file
-```
-
-Replace the placeholder with the real path and keep the `r"..."` raw-string form (on Linux
-`r"/path/to/scan.up1"` works the same way). Lines marked `# <--` are the ones to set; the
-other settings have working defaults.
-
-The notebook's first cell also has `PROJECT_DIR`, the folder that contains `ebsd_params.py`.
-Leave it `None` when you start JupyterLab from this folder (the `.bat` files do), and set it
-to this folder's path only when you start Jupyter from somewhere else.
-
-### 6.2 Build a notebook
-
-```bash
-python build_notebook.py my_scan.ipynb                # default settings
-python build_notebook.py my_scan.ipynb my_preset.txt  # with a preset
-```
-
-A preset is a text file of `NAME = value` lines that overwrite settings in the notebook's
-first two cells. `value` is Python source, so paths are written as raw strings. Names that
-are not settings of the notebook being built are listed and ignored. A notebook built earlier can be given in the
-place of a preset; its settings are then copied. `preset_RKD.txt` is a complete example; a
-minimal one for conventional EBSD looks like
-
-```
-PATTERN_FILE = r"C:\data\scan.up1"
-SCAN_FILE = r"C:\data\scan.ang"
-MASTER_FILE = r"C:\data\Ni 20kV.sht"
-CAMERA_TILT = 8.0
-BANDWIDTH = 123
-OUTPUT_DIR = r"C:\data\results"
-```
-
-### 6.3 Start JupyterLab
-
-```bash
-python -m jupyter lab my_scan.ipynb
-```
-
-(On Windows the two `.bat` files do exactly this for the two example notebooks. They use the
-`python` found on PATH; if your environment's interpreter is elsewhere, put its full path in
-the `set PYTHON=` line at the top of the file.)
-
-### 6.4 Walk through the notebook
-
-The notebook follows the author's tutorial, `kikuchipy/doc/tutorials/spherical_indexing.ipynb`.
-
-1. **Section 0, files.** Set `PATTERN_FILE` and `SCAN_FILE` (the `.ang` or `.edaxh5` written at
-   acquisition, not an indexing result) and run the cell. It prints pattern size, projection
-   center, map size and step size. With `PATTERN_FILE = None` the notebook uses the nickel
-   demo data, which is the easiest way to confirm that everything runs.
-2. **Section 1, settings.** The ones that matter most:
-   - `PC` and `PC_CONVENTION`: the projection center. Values from an `.ang` file are in the
-     `"edax"` convention, which is the default.
-   - `CAMERA_TILT`: detector tilt / camera elevation in degrees (EMSphInx `thetac`). Typically
-     8 for a conventional EBSD camera, -90 for RKD (detector parallel to the sample). The fork
-     has no -60 to 60 deg limit on this, unlike the EMSphInx binary.
-   - `SAMPLE_TILT = None` takes the tilt the master pattern was simulated for, as EMSphInx
-     does. Set `OVERRIDE_MASTER_SAMPLE_TILT = True` only if you deliberately want another value.
-   - `MASTER_FILE`: an EMSphInx `.sht` file or an EMsoft master pattern `.h5`. A list of files
-     indexes several phases.
-   - `REMOVE_STATIC_BACKGROUND` / `REMOVE_DYNAMIC_BACKGROUND`: set both to `False` for pattern
-     files that are already background corrected or NLPAR processed.
-   - `BANDWIDTH`: 68 is the EMSphInx default, 88 or 123 for more accuracy at lower speed.
-     `kp.indexing.fast_bandwidths()` lists the efficient values.
-   - `BACKEND = "gpu"`, `N_WORKERS` = number of performance cores, `CHUNKSIZE = None`
-     (automatic GPU batch size; set a number if a run reports out of memory).
-   - `TWIST`: rotation of the detector about its normal. The indexer cannot use a twisted
-     detector, so the notebook rotates the indexed orientations about the sample normal
-     afterwards. Flip the sign if the IPF-X and IPF-Y maps come out rotated the wrong way.
-3. **Sections 2 to 6.** Run them in order. Section 6 indexes a small test region of
-   `TEST_SIZE` x `TEST_SIZE` points so you can check the geometry before committing to the
-   full map. If the test maps look like noise, try `FLIP_PATTERNS_UD = True` or check the
-   projection center and camera tilt.
-4. **Section 7** indexes the full map (or `ROI`), **8** plots it, **9** saves `.ang` and `.h5`
-   files to `OUTPUT_DIR`, **10** compares against `REFERENCE_FILE` if you have a result for the
-   same map from EMSphInx or OIM.
-5. The `.h5` written in section 9 is the input of the PC drift correction notebook, section 6.6.
-   Run that on every map wider than a few hundred micrometres.
-6. **Section 11, HROSM** (optional, needs an EMsoft master pattern `.h5`): re-indexes every grain on
-   a fine misorientation ball, section 6.7.
-
-### 6.5 Reading scan parameters without the notebook
-
-```bash
-python ebsd_params.py "scan.ang" --up1 "scan.up1"            # EDAX and EMsoft pattern centers
-python ebsd_params.py "scan.edaxh5" --map "Area 1" --px 115
-```
-
-The docstring at the top of `ebsd_params.py` lists all options.
-
-### 6.6 Correct the projection center drift
-
-Spherical indexing (like EMSphInx) uses one projection center (PC) for the whole map, but the
-true PC moves with the beam by one step length per scan step. Indexed with a fixed PC, that
-shift is read as a rotation of about *beam travel / detector distance*: for a 3 mm wide map at
-a detector distance of 18 mm it is 10 degrees edge to edge, and about 0.1 degrees across a 30 um
-grain. Point-to-point noise is unaffected, but grain reference orientation deviations and
-orientation gradients within grains are.
-
-A projection center drift correction (every point's PC extrapolated from one anchor PC and the scan
-geometry, and each orientation rotated back by its local correction, without re-indexing and without the
-pattern file) was built as a separate notebook, but that builder and its notebooks are **not part of this
-repository** (they were never committed). What the repository holds for this is the cluster script in
-`osc_refinement_handoff/` (`refine_pc_per_point.py`, with its handoff notes): the full pattern-matching
-refinement with a PC per point, which also removes the band limit; it costs hours to days.
-
-### 6.7 HROSM: re-index every grain on a fine misorientation ball
-
-`EBSD.hrosm()` (new in the fork since `71a1b2f`; Johan's port of EMsoftOO's EMHROSM, Marquardt
-et al. 2017) takes an indexed map, computes its kernel average misorientation (KAM), segments it
-into grains, and re-indexes every grain by dictionary indexing against patterns simulated on a
-cubochoric grid within `HROSM_MAX_ANGLE` of the grain's reference orientation. The result is a high
-angular resolution orientation similarity map (HROSM), orientations on a grid much finer than the
-global search, and the KAM, grain labels and grain reference orientation deviation (GROD). Section
-11 of the indexing notebook runs it on the map of section 7 and saves `<name>_hrosm_n<steps>.h5`
-and `.ang`. (The GUI does not do HROSM; it is pattern processing and spherical indexing only.)
-
-- `HROSM_MASTER_FILE`: the EMsoft master pattern `.h5` of the phase. Patterns are simulated, so an
-  `.sht` file cannot be used. `None` skips the section (the demo data uses its own master).
-- `HROSM_MAX_ANGLE` (5 deg) must be at least the largest GROD of the grains; the run warns and
-  names the radius that covers every grain otherwise. `HROSM_N_STEPS` (10) gives `(2 n + 1)^3`
-  orientations per grain, 9261 for 10 and 68921 for 20 (EMHROSM's default); the cost grows with the
-  cube of it and with the number of grains, not much with the grain size. Start with 10 and an
-  `HROSM_ROI`. On the nickel demo (4125 patterns, 31 grains) `HROSM_N_STEPS = 4` took 13 s on 3
-  CPU workers; `n_steps=10` on the same map is about 20 s on a 20-core workstation according to
-  the fork's tutorial (`kikuchipy/doc/tutorials/hrosm.ipynb`, which also discusses `threshold`,
-  `average` and `dilate`).
-- HROSM runs on the orientations as indexed (without `TWIST`); the twist is applied to the result.
-  The whole computation is on the CPU (Dask threads, `N_WORKERS`); the GPU backend only concerns
-  the spherical search.
-
-### 6.8 The GUI: pattern processor and spherical indexing in one window
+### 6.1 The GUI: pattern processor and spherical indexing in one window
 
 `kikuchi_workbench.py` puts the [Kikuchi Pattern Processor](https://github.com/helpimlost97/kikuchi-pattern-processor)
-and the indexing of this folder into one PyQt5 window with three tabs:
+and the spherical indexing of `sph_core.py` into one PyQt5 window with three tabs:
 
 1. **Pattern processor**: the unchanged `gpu_pattern_viewer.py`, imported from its own folder
    (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`).
-2. **Spherical indexing**: the settings of the notebook as a form on the left (drag the divider to
+2. **Spherical indexing**: the indexing settings as a form on the left (drag the divider to
    resize it), the live view, the result maps and a log on the right.
-3. **Montage batch**: the two steps above for every tile of an EDAX APEX montage, see 6.9.
+3. **Montage batch**: the two steps above for every tile of an EDAX APEX montage, see 6.2.
+
+The settings of the indexing tab (the names are those of `sph_core.Settings` and of the preset files):
+
+- `PC` and `PC_CONVENTION`: the projection center. Values from an `.ang` file are in the `"edax"`
+  convention, which is the default; *Read scan parameters* fills them in.
+- `CAMERA_TILT`: detector tilt / camera elevation in degrees (EMSphInx `thetac`). Typically 8 for a
+  conventional EBSD camera, -90 for RKD (detector parallel to the sample). The fork has no -60 to
+  60 deg limit on this, unlike the EMSphInx binary.
+- `SAMPLE_TILT = None` takes the tilt the master pattern was simulated for, as EMSphInx does. Set
+  `OVERRIDE_MASTER_SAMPLE_TILT` only if you deliberately want another value.
+- `MASTER_FILE`: an EMSphInx `.sht` file or an EMsoft master pattern `.h5`. Several files, one per
+  line, index several phases.
+- `REMOVE_STATIC_BACKGROUND` / `REMOVE_DYNAMIC_BACKGROUND`: off for pattern files that the processor
+  already background corrected or NLPAR processed (the default).
+- `BANDWIDTH`: 68 is the EMSphInx default, 88 or 123 for more accuracy at lower speed.
+  `kp.indexing.fast_bandwidths()` lists the efficient values.
+- `BACKEND = "gpu"`, `N_WORKERS` = number of performance cores, `CHUNKSIZE = None` (automatic GPU
+  batch size; set a number if a run reports out of memory).
+- `TWIST`: rotation of the detector about its normal. The indexer cannot use a twisted detector, so
+  the indexed orientations are rotated about the sample normal afterwards. Flip the sign if the
+  IPF-X and IPF-Y maps come out rotated the wrong way.
+- `TEST_SIZE`: side of the square test region, in map points. If the test maps look like noise, try
+  `FLIP_PATTERNS_UD` or check the projection center and camera tilt.
+- `ROI`: `(col_start, col_stop, row_start, row_stop)` to index part of the map; `REFERENCE_FILE`: an
+  `.ang` of the same map from EMSphInx or OIM for *Compare with reference*.
 
 Workflow in the indexing tab:
 
@@ -373,9 +259,8 @@ Workflow in the indexing tab:
   indexing parameters only: master bandwidth, PC convention, sample and camera tilt, pixel size,
   twist, the two background removals, bandwidth, workers, refinement, AHE tiles, circular mask,
   Gaussian background, normalization and chunk size. Files, folders and the projection center
-  values are never written to or taken from a preset. The file format is the one
-  `build_notebook.py` accepts, so a GUI preset also builds a notebook, and a notebook preset such
-  as `preset_RKD.txt` loads into the GUI with only those parameters applied.
+  values are never written to or taken from a preset. `preset_RKD.txt` is an example; other names
+  in a preset file are listed in the log and ignored.
 
 ```bash
 python kikuchi_workbench.py                                   # processor found next to this folder
@@ -400,7 +285,7 @@ Verified headlessly on the nickel demo data written as a `.up1` (no GPU in that 
 backend): processor load and `Apply && Save`, `Load processed patterns`, quasi-IQ map, band-wise test region and full map with the live events, save. The
 band-wise result is checked to be identical to a single call.
 
-### 6.9 Montage batch: process and index every tile of an APEX montage
+### 6.2 Montage batch: process and index every tile of an APEX montage
 
 An APEX montage ("stitch") scan is one `.edaxh5` project holding every tile as a map (`OIM Map
 1_r000c000`, `..._r000c001`, ...) with its grid, step, pattern center, phases and the Hough results,
@@ -477,9 +362,33 @@ pattern files cropped to match, GUIDs kept) out of a real montage for tests;
 
 ---
 
+### 6.3 Reading scan parameters from the command line
+
+```bash
+python ebsd_params.py "scan.ang" --up1 "scan.up1"            # EDAX and EMsoft pattern centers
+python ebsd_params.py "scan.edaxh5" --map "Area 1" --px 115
+```
+
+The docstring at the top of `ebsd_params.py` lists all options.
+
+### 6.4 Correct the projection center drift
+
+Spherical indexing (like EMSphInx) uses one projection center (PC) for the whole map, but the
+true PC moves with the beam by one step length per scan step. Indexed with a fixed PC, that
+shift is read as a rotation of about *beam travel / detector distance*: for a 3 mm wide map at
+a detector distance of 18 mm it is 10 degrees edge to edge, and about 0.1 degrees across a 30 um
+grain. Point-to-point noise is unaffected, but grain reference orientation deviations and
+orientation gradients within grains are.
+
+A projection center drift correction (every point's PC extrapolated from one anchor PC and the scan
+geometry, and each orientation rotated back by its local correction, without re-indexing and without the
+pattern file) exists outside this repository. What the repository holds for this is the cluster script in
+`osc_refinement_handoff/` (`refine_pc_per_point.py`, with its handoff notes): the full pattern-matching
+refinement with a PC per point, which also removes the band limit; it costs hours to days.
+
 ## 7. Using the API directly
 
-The notebook is a thin layer over one method of the fork:
+The GUI is a thin layer over one method of the fork:
 
 ```python
 import dask, kikuchipy as kp
@@ -493,7 +402,7 @@ dask.config.set(num_workers=8)
 xmap = s.spherical_indexing(harmonics, det, bandwidth=68, backend="gpu")
 ```
 
-`sph_core.py` wraps these steps as functions with the notebook's settings names (see its docstring).
+`sph_core.py` wraps these steps as functions driven by a `Settings` object (see its docstring).
 Signature on the pinned commit (unchanged from `71a1b2f`):
 
 ```
@@ -519,16 +428,16 @@ patterns per Dask chunk and, on the GPU, the device batch size.
   bandwidth 123, about 130 patterns/s on the GPU and about 28 on 8 CPU workers.
 - **VRAM held after a run.** Without the plan-cache patch, several GB of VRAM can stay
   allocated in the process after a GPU run, and the next call picks a tiny automatic batch
-  size. Work-arounds: apply the patch, set `CHUNKSIZE` explicitly, or restart the kernel
-  between runs. Also check that no other process (a game, another notebook) holds VRAM when
+  size. Work-arounds: apply the patch, set `CHUNKSIZE` explicitly, or restart the program
+  between runs. Also check that no other process holds VRAM when
   a run reports out of memory.
 - **Large pattern files.** `LAZY = "auto"` memory-maps files larger than a quarter of RAM.
   The operating system may show a lot of "used" memory for mapped file pages; that is cache,
   not a leak. Apply the lazy-load patch or opening such files takes minutes.
 - **Accuracy vs the EMSphInx binary:** the author reports a median refined disagreement of
   about 0.3 deg, due to a pixel-stretch quirk in EMSphInx that was deliberately not copied.
-  On an RKD data set the notebook matched an EMSphInx result to a median of 0.03 deg.
-- **Old `.up1` files** (header version 1) do not store the map size or step; the notebook
+  On an RKD data set this code matched an EMSphInx result to a median of 0.03 deg.
+- **Old `.up1` files** (header version 1) do not store the map size or step; the GUI
   takes them from the `.ang` file (version 3 and later store both). Hexagonal grids are not
   handled by that fallback.
 - **Dask version.** Tested with dask 2026.1.2, numba 0.64, numpy 2.3, orix 0.14, hyperspy 2.4 on
@@ -540,9 +449,8 @@ patterns per Dask chunk and, on the GPU, the device batch size.
 ## 9. References
 
 - Fork: https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `4c7a0035`).
-  Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, HROSM in
-  `src/kikuchipy/indexing/_hrosm/`, design notes in `specs/`, tutorials in
-  `doc/tutorials/spherical_indexing.ipynb` and `doc/tutorials/hrosm.ipynb`.
+  Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, design notes in `specs/`,
+  tutorial in `doc/tutorials/spherical_indexing.ipynb`.
 - W. C. Lenthe, S. Singh, M. De Graef, "A spherical harmonic transform approach to the
   indexing of electron back-scattered diffraction patterns", Ultramicroscopy 207 (2019).
 - EMSphInx: https://github.com/EMsoft-org/EMSphInx

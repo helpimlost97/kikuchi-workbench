@@ -3,7 +3,7 @@
 
     python kikuchi_workbench.py                              # finds the pattern processor next to this folder
     python kikuchi_workbench.py --processor-dir C:\\path\\to\\kikuchi-pattern-processor
-    python kikuchi_workbench.py --preset preset_RKD.txt      # start with the settings of a notebook preset
+    python kikuchi_workbench.py --preset preset_RKD.txt      # start with the indexing settings of a preset file
     set KPP_DIR=C:\\path\\to\\kikuchi-pattern-processor       # alternative to --processor-dir (Windows cmd)
 
 Three tabs:
@@ -12,11 +12,11 @@ Three tabs:
    https://github.com/helpimlost97/kikuchi-pattern-processor), imported from its own folder. Load a UP1/UP2,
    set the aperture, IQ range, NLPAR and the processing chain as usual. "Apply && Save" still writes a file; the
    saved file is then offered to the indexing tab automatically.
-2. **Spherical indexing**: the settings of spherical_indexing_template.ipynb as a form. The patterns come from a
+2. **Spherical indexing**: the settings of sph_core.Settings as a form. The patterns come from a
    file (anything kikuchipy loads, memory-mapped when big): "Load processed patterns" takes the file the
    processor's "Apply && Save" just wrote (every pattern of it is indexed, the ones outside the processor's IQ
    range too: the processor writes them unprocessed), the browse button any other file. Check the geometry on one pattern, index a test region, index the full map, save
-   .ang/.h5. Load and save notebook presets.
+   .ang/.h5. Load and save presets.
 
 Needs the environment of README.md (the kikuchipy fork, CuPy for the GPU) plus the pattern processor's packages
 (PyQt5, pyebsdindex, scipy, scikit-image). Without the processor folder the indexing tab still works
@@ -79,7 +79,7 @@ def import_processor(directory: Path | None):
 
 _args = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 _args.add_argument("--processor-dir", default=None, help="folder of kikuchi-pattern-processor (gpu_pattern_viewer.py)")
-_args.add_argument("--preset", default=None, help="notebook preset file (NAME = value lines) to start with")
+_args.add_argument("--preset", default=None, help="preset file (NAME = value lines) to start with")
 _args.add_argument("--no-processor", action="store_true", help="do not load the pattern processor tab")
 ARGS, _ = _args.parse_known_args()
 
@@ -624,7 +624,7 @@ class Workbench(QMainWindow):
         form.group("Master pattern(s)")
         form.add_path("MASTER_FILE", "Master file(s):", tip="EMSphInx .sht or EMsoft master pattern .h5; several files (one per phase) as a list ['a.sht', 'b.sht']",
                       filter="Master patterns (*.sht *.h5 *.hdf5);;All files (*)", multi=True)
-        form.add_int("MASTER_BANDWIDTH", "Master bandwidth (.h5):", 384, 16, 1024, "Bandwidth of the harmonics computed from an .h5 master; keep >= 384 (see build_notebook.py)")
+        form.add_int("MASTER_BANDWIDTH", "Master bandwidth (.h5):", 384, 16, 1024, "Bandwidth of the harmonics computed from an EMsoft .h5 master pattern; keep >= 384")
         form.add_text("MASTER_ENERGY", "Master energy keV (.h5):", tip="Only for .h5 masters with several energies; blank = all, weighted", placeholder="None")
         form.add_bool("OVERRIDE_MASTER_SAMPLE_TILT", "Override master sample tilt", "Use the sample tilt below even when the master pattern was simulated for another one; indexing refuses the mismatch otherwise")
 
@@ -750,8 +750,7 @@ class Workbench(QMainWindow):
             return
         sph_core.write_preset(path, self.settings(), header="Indexing settings of the Kikuchi workbench (no files, folders or PC values)",
                               fields=PRESET_FIELDS)
-        self.log(f"Preset saved: {path} ({len(PRESET_FIELDS)} indexing settings); a notebook can be built from it with: "
-                 f"python build_notebook.py my_scan.ipynb \"{path}\"")
+        self.log(f"Preset saved: {path} ({len(PRESET_FIELDS)} indexing settings)")
 
     def log(self, text: str):
         self.log_box.appendPlainText(text)

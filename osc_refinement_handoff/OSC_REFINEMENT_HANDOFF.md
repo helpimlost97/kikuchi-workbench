@@ -1,14 +1,14 @@
 # Handoff: orientation refinement with a PC per map point, on OSC
 
 Written 2026-10-06 for a session on a university HPC cluster ("OSC" in file names and text below refers to it).
-Goal: run **only the pattern-matching refinement stage** (formerly section 11 of the spherical indexing
-notebook; this script is the only form of the per-point refinement in the repository) on a
+Goal: run **only the pattern-matching refinement stage** (this script is the only form of the per-point
+refinement in the repository) on a
 2.3-million-point EBSD map, starting from an EMSphInx result that already exists. Do not build or
 run spherical indexing; the starting orientations come from a file.
 
 Files in this handoff:
 
-- `refine_pc_per_point.py`: the complete refinement, extracted from the notebook. Treat it as the
+- `refine_pc_per_point.py`: the complete refinement. Treat it as the
   specification; adapt paths and settings in its SETTINGS block, keep the flow.
 - `edax_binary_lazy_load.patch`: optional patch to kikuchipy's `.up1` reader, see section 4.
 

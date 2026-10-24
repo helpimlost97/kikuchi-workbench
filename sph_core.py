@@ -1,8 +1,7 @@
-"""Spherical indexing without a notebook: the functions behind kikuchi_workbench.py.
+"""Spherical indexing: the functions behind the Kikuchi workbench's indexing and montage tabs.
 
-Everything here mirrors the cells of spherical_indexing_template.ipynb (built by build_notebook.py) so that
-the GUI and the notebook do the same thing with the same settings names. Nothing in here imports Qt, so the
-module can be used from a script too::
+Each step of the indexing (load, preprocess, harmonics, detector, index, save, compare) is one function taking a
+:class:`Settings`. Nothing in here imports Qt, so the module can be used from a script too::
 
     import sph_core
     st = sph_core.Settings(PATTERN_FILE="scan.up1", SCAN_FILE="scan.ang", MASTER_FILE="Ni.sht", CAMERA_TILT=8)
@@ -15,8 +14,8 @@ module can be used from a script too::
 
 :func:`index_blocks` gives the same map band by band with progress events, for a GUI.
 
-Settings names are those of the notebook's settings cells, so a notebook preset file (NAME = value lines) can
-be read with :func:`read_preset` and written with :func:`write_preset`.
+A preset file (NAME = value lines, values as Python literals) holds settings; :func:`read_preset` reads one and
+:func:`write_preset` writes one.
 """
 from __future__ import annotations
 
@@ -46,7 +45,7 @@ def _print(msg: str) -> None:
 
 @dataclass
 class Settings:
-    """The settings of the indexing notebook. Defaults are the notebook's defaults."""
+    """Every setting of the spherical indexing (files, geometry, preprocessing, indexing, output)."""
 
     # files
     PATTERN_FILE: str | None = None
@@ -112,7 +111,7 @@ def _preset_value(text: str):
 def read_preset(path: str | Path, settings: Settings | None = None) -> tuple[Settings, list[str]]:
     """Settings from a preset file of ``NAME = value`` lines (values are Python literals).
 
-    Returns the settings and the names that are not settings (ignored, as build_notebook.py does).
+    Returns the settings and the names in the file that are not settings (ignored).
     """
     settings = dataclasses.replace(settings) if settings is not None else Settings()
     ignored = []
@@ -132,10 +131,10 @@ def read_preset(path: str | Path, settings: Settings | None = None) -> tuple[Set
 
 
 def write_preset(path: str | Path, settings: Settings, header: str = "", fields: Sequence[str] | None = None) -> None:
-    """Write the settings as a preset file that build_notebook.py accepts (values as Python source).
+    """Write the settings as a preset file (NAME = value lines, values as Python source).
     ``fields`` restricts it to those setting names (all of them when not given)."""
     lines = [f"# {h}" for h in header.splitlines()] if header else []
-    lines.append("# Preset written by kikuchi_workbench.py; usage: python build_notebook.py my_scan.ipynb this_file.txt")
+    lines.append("# Preset written by kikuchi_workbench.py: load it with 'Load preset' or --preset")
     for name in settings.names() if fields is None else fields:
         # repr escapes backslashes, and ast.literal_eval reads them back as they were (a raw-string prefix on a
         # repr would double every backslash of a Windows path at each round trip)
@@ -160,7 +159,7 @@ def _lazy_decision(pattern_file: Path, lazy) -> bool:
 
 
 def load_patterns(st: Settings, scan: dict | None = None, log: Log = _print):
-    """The patterns as a kikuchipy EBSD signal, like sections 0 and 3 of the notebook.
+    """The patterns as a kikuchipy EBSD signal, with the scan parameters applied.
 
     ``scan`` is the dict of ebsd_params.scan_info() (read here when not given); it supplies the map size and
     step of old .up1 files. Returns the signal and the scan dict. PATTERN_FILE=None loads the nickel demo.
@@ -278,7 +277,7 @@ def apply_roi_and_flip(s, st: Settings):
 
 
 def preprocess(s, st: Settings, log: Log = _print) -> None:
-    """Static and dynamic background removal, in place, like section 3 of the notebook. NLPAR is the
+    """Static and dynamic background removal, in place. NLPAR is the
     Kikuchi Pattern Processor's job (pyebsdindex) and is not done here."""
     nav_shape = s.axes_manager.navigation_shape[::-1]
     if st.REMOVE_STATIC_BACKGROUND:
@@ -442,7 +441,7 @@ def preprocess_pattern_for_preview(pattern: np.ndarray, st: Settings) -> np.ndar
 
 
 def load_harmonics(st: Settings, log: Log = _print, demo: bool = False) -> list:
-    """Harmonics of every master in MASTER_FILE (.sht or EMsoft .h5), like section 4 of the notebook."""
+    """Harmonics of every master in MASTER_FILE (.sht or EMsoft .h5)."""
     import kikuchipy as kp
 
     if demo or st.MASTER_FILE is None:
@@ -500,7 +499,7 @@ def resolve_sample_tilt(st: Settings, harmonics: Sequence, log: Log = _print, de
 
 
 def make_detector(st: Settings, s, harmonics: Sequence, log: Log = _print, demo: bool = False):
-    """The EBSDDetector of section 5 of the notebook."""
+    """The EBSDDetector: pattern shape, projection center, tilts and pixel size from the settings."""
     import kikuchipy as kp
 
     sample_tilt = resolve_sample_tilt(st, harmonics, log, demo)
