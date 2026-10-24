@@ -430,7 +430,8 @@ def copy_project(project_path: str | os.PathLike, out_path: str | os.PathLike, o
 
 def tile_stats(s, progress: Callable[[float], None] | None = None) -> tuple[np.ndarray, np.ndarray | None]:
     """One pass over a tile's patterns: the quasi-IQ map (per-pattern standard deviation, float32 (rows, cols))
-    and the mask of all-zero patterns (None when there is none), e.g. the patterns the processor excluded."""
+    and the mask of all-zero patterns (None when there is none), which cannot be indexed (processor versions
+    before 1.7.0 wrote zeros for the patterns outside the IQ range; later ones keep them unprocessed)."""
     nav_shape = tuple(int(v) for v in s.axes_manager.navigation_shape[::-1])
     sig_shape = tuple(int(v) for v in s.axes_manager.signal_shape[::-1])
     data = s.data

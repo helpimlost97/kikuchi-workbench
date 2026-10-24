@@ -334,12 +334,13 @@ Workflow in the indexing tab:
 - **One data set at a time**: loading a file in either tab unloads the other tab's data set
   (the processor's scan and NLPAR result, or the indexer's patterns, map and last result), so two
   scans never sit in memory together. After `Apply && Save`, loading the processed file in the
-  indexing tab therefore empties the processor tab; the saved file and its IQ exclusion are kept.
+  indexing tab therefore empties the processor tab; the saved file is kept.
 - **Pattern source**: always a file. **Load processed patterns** is greyed out until the
   processor's `Apply && Save` has written a file; it then puts that file into the pattern file box
-  and loads it, and the patterns the processor excluded by its IQ range are not indexed (grey in
-  the maps). The browse button takes any other file kikuchipy reads, e.g. a scan that was not
-  processed. Big files are memory mapped and read chunk by chunk, so RAM is not a concern.
+  and loads it. Every pattern of the file is indexed: the processor leaves the patterns outside its
+  IQ range out of the processing (background, stretch, NLPAR) but writes them unprocessed, so they
+  are still in the file. The browse button takes any other file kikuchipy reads, e.g. a scan that
+  was not processed. Big files are memory mapped and read chunk by chunk, so RAM is not a concern.
 - **Load patterns (quasi-IQ map)**: runs by itself after browsing for a pattern file (and when the
   source is switched to the processor, whose IQ map is reused). It loads the patterns, computes a
   quasi image quality map (the standard deviation of every raw pattern, the processor's definition),
@@ -396,8 +397,7 @@ read again and processed. Long steps run in a worker thread with their console o
 pane.
 
 Verified headlessly on the nickel demo data written as a `.up1` (no GPU in that environment, CPU
-backend): processor load and `Apply && Save`, `Load processed patterns` with the IQ exclusion
-carried over, quasi-IQ map, band-wise test region and full map with the live events, save. The
+backend): processor load and `Apply && Save`, `Load processed patterns`, quasi-IQ map, band-wise test region and full map with the live events, save. The
 band-wise result is checked to be identical to a single call.
 
 ### 6.9 Montage batch: process and index every tile of an APEX montage
@@ -425,20 +425,21 @@ The **3. Montage batch** tab:
   one after the other with those settings into `<tile>_proc.up1` in the output folder (the suffix
   is editable). The header is copied as it is, so the processed file keeps the GUID. Each tile is
   unloaded after it is written, and the processor is empty when the batch ends. The IQ range
-  applies per tile as fractions of that tile's IQ range, as in the processor; excluded patterns are
-  written as zeros. NLPAR, when enabled, runs per tile with the lambda optimized on the preview
+  applies per tile as fractions of that tile's IQ range, as in the processor; the patterns outside it
+  are written unprocessed (they take no part in the background, stretch or NLPAR). NLPAR, when enabled, runs per tile with the lambda optimized on the preview
   tile.
 - **2. Batch indexing** uses the indexing tab's settings: one projection center, sample tilt,
   camera tilt and pixel size for the whole montage, as typed there (*Copy the project's PC and
   tilts to the indexing tab* fills them from the first tile; check them). *Load selected tile in
   the indexer* puts one processed tile into tab 2 for a test region. *Index all tiles* loads each
-  processed tile memory mapped, skips its zero patterns, indexes it band by band with the live view
+  processed tile memory mapped, indexes it band by band with the live view
   of this tab, and writes its orientation matrices, cross-correlation (`CI`), image quality
   (`IQ`, EMSphInx's discrete cosine measure, as EMSphInx's own .ang output; tick *Keep the
   project's (Hough) IQ* to leave the acquisition's IQ in place), phase and `Valid` flag into a
   copy of the project, `<project>_sph_bw<bandwidth>.edaxh5` in the output folder, right after the
-  tile is done (tiles not indexed keep their Hough results). The zero patterns are found on the raw
-  data, before the background removal, which would rescale them. The orientation matrix convention
+  tile is done (tiles not indexed keep their Hough results). All-zero patterns, which cannot be
+  indexed (processor versions before 1.7.0 wrote them outside the IQ range), are skipped; they are
+  found on the raw data, before the background removal, which would rescale them. The orientation matrix convention
   of the file was verified against the Hough results of a real tile. Untick *Index the processed
   files* to index the raw files instead. Tiles without a usable file are named in the log and
   skipped, and a bad processed file shows in the table's status column.

@@ -14,8 +14,8 @@ Three tabs:
    saved file is then offered to the indexing tab automatically.
 2. **Spherical indexing**: the settings of spherical_indexing_template.ipynb as a form. The patterns come from a
    file (anything kikuchipy loads, memory-mapped when big): "Load processed patterns" takes the file the
-   processor's "Apply && Save" just wrote (patterns it excluded by the IQ range are not indexed), the browse
-   button any other file. Check the geometry on one pattern, index a test region, index the full map, save
+   processor's "Apply && Save" just wrote (every pattern of it is indexed, the ones outside the processor's IQ
+   range too: the processor writes them unprocessed), the browse button any other file. Check the geometry on one pattern, index a test region, index the full map, save
    .ang/.h5. Load and save notebook presets.
 
 Needs the environment of README.md (the kikuchipy fork, CuPy for the GPU) plus the pattern processor's packages
@@ -477,10 +477,9 @@ class Workbench(QMainWindow):
         self.base = Settings()
         # prepared state of the indexing tab
         self.loaded = None        # dict: key, signal (raw patterns), scan, iq (stretched quasi-IQ), source, source_file
-        self.prepared = None      # dict: signal, scan, key, source, nav_mask, source_file
+        self.prepared = None      # dict: signal, scan, key, source, source_file
         self.pattern_width = None  # pixels, once a pattern file is known
         self.processed_file = None      # the file the processor's Apply && Save wrote last
-        self.processed_exclusion = None  # (rows, cols) True where the processor's IQ range excluded the pattern
         self.live_run = None      # state of the run shown in the live view
         self.harmonics = None     # list, with its key
         self.harmonics_key = None
@@ -558,14 +557,12 @@ class Workbench(QMainWindow):
         self.proc.load_path = load_path_exclusive
 
     def _processor_saved(self, path):
+        """Called after the processor's Apply && Save: offers the written file to the indexing tab. Every pattern of
+        it is indexed; the ones outside the processor's IQ range are in the file unprocessed."""
         self.processed_file = path
-        mask = self.proc._get_iq_mask()
-        self.processed_exclusion = None if mask is None or mask.all() else ~np.asarray(mask, dtype=bool)
-        n_excl = 0 if self.processed_exclusion is None else int(self.processed_exclusion.sum())
         self.btn_load_processed.setEnabled(True)
-        self.btn_load_processed.setToolTip(f"Loads {path}" + (f"; {n_excl} patterns excluded by the IQ range will not be indexed" if n_excl else ""))
-        self.log(f"Processor saved {path}: 'Load processed patterns' in the indexing tab loads it"
-                 + (f" ({n_excl} patterns excluded by the IQ range will not be indexed)" if n_excl else ""))
+        self.btn_load_processed.setToolTip(f"Loads {path}")
+        self.log(f"Processor saved {path}: 'Load processed patterns' in the indexing tab loads it")
 
     def load_processed_clicked(self):
         """Put the file Apply && Save wrote into the pattern file box and load it."""
@@ -1067,26 +1064,6 @@ class Workbench(QMainWindow):
             return self.prepared
         return None
 
-    def _exclusion_mask(self, st: Settings, nav_shape, log=None):
-        """The processor's IQ-range exclusion as a navigation mask (True = skip) when the pattern file is the one
-        Apply && Save wrote and the shapes agree, else None (logged when they do not agree)."""
-        if self.processed_exclusion is None or not st.PATTERN_FILE or not self.processed_file:
-            return None
-        if os.path.abspath(st.PATTERN_FILE) != os.path.abspath(self.processed_file):
-            return None
-        mask = self.processed_exclusion
-        if st.ROI is not None:
-            c0, c1, r0, r1 = st.ROI
-            mask = mask[r0:r1, c0:c1]
-        if tuple(mask.shape) != tuple(nav_shape):
-            if log is not None:
-                log(f"NB! The processor's IQ exclusion mask has shape {tuple(mask.shape)} but the loaded map "
-                    f"{tuple(nav_shape)}: no patterns are excluded (check NAV_SHAPE / the scan file)")
-            return None
-        if not mask.any():
-            return None
-        return mask
-
     def _prepare_in_worker(self, st: Settings, prepared, log):
         """Loads the patterns from a file when needed, then the harmonics and the detector."""
         key = self._prepare_key(st)
@@ -1108,9 +1085,7 @@ class Workbench(QMainWindow):
                     # the raw copy was preprocessed differently before: replace it rather than keep two
                     loaded["signal"] = s
                     loaded["preprocessed"] = wanted
-            nav_mask = self._exclusion_mask(st, s.axes_manager.navigation_shape[::-1], log)
-            prepared = {"key": key, "signal": s, "scan": scan, "source": "file", "nav_mask": nav_mask,
-                        "source_file": st.PATTERN_FILE}
+            prepared = {"key": key, "signal": s, "scan": scan, "source": "file", "source_file": st.PATTERN_FILE}
         demo = prepared["source"] == "file" and st.PATTERN_FILE is None
         hkey = (st.MASTER_FILE, st.MASTER_BANDWIDTH, st.MASTER_ENERGY, demo)
         if self.harmonics is None or self.harmonics_key != hkey:
@@ -1198,18 +1173,11 @@ class Workbench(QMainWindow):
             result = self._prepare_in_worker(st, prepared, log)
             prepared_, harmonics, hkey, det, demo = result
             s = prepared_["signal"]
-            nav_mask = prepared_["nav_mask"]
             if test:
                 s_run, s_warm, (c0, r0) = sph_core.test_region(s, int(st.TEST_SIZE))
-                if nav_mask is not None:
-                    nav_mask = nav_mask[r0 : r0 + int(st.TEST_SIZE), c0 : c0 + int(st.TEST_SIZE)]
                 label, offset = "test region", (r0, c0)
             else:
                 s_run, s_warm, label, offset = s, None, "full map", (0, 0)
-            if nav_mask is not None and not nav_mask.any():
-                nav_mask = None
-            if nav_mask is not None:
-                log(f"{int(nav_mask.sum())} patterns excluded by the processor's IQ range are not indexed")
             nav_shape = tuple(int(v) for v in s_run.axes_manager.navigation_shape[::-1])
             n_run = int(np.prod(nav_shape))
             log(f"Indexing the {label}: {n_run} patterns, bandwidth {st.BANDWIDTH}, {st.BACKEND}")
@@ -1225,7 +1193,7 @@ class Workbench(QMainWindow):
 
                 # a test region is small: shorter bands, so that the animation shows several of them
                 xmap_indexed, dt, speed = sph_core.index_blocks(
-                    s_run, harmonics, det, st, log, navigation_mask=nav_mask, on_event=on_event,
+                    s_run, harmonics, det, st, log, on_event=on_event,
                     target_seconds=1.0 if test else LIVE_BLOCK_SECONDS,
                     first_patterns=max(nav_shape[1], min(300, max(1, n_run // 10))))
                 xmap = sph_core.apply_twist(xmap_indexed, st.TWIST)
@@ -1233,7 +1201,7 @@ class Workbench(QMainWindow):
                 if st.TWIST:
                     log(f"Orientations rotated by {st.TWIST} deg about the sample normal (TWIST)")
             else:
-                xmap, xmap_indexed, dt = sph_core.index(s_run, harmonics, det, st, log, navigation_mask=nav_mask, warm_up=s_warm)
+                xmap, xmap_indexed, dt = sph_core.index(s_run, harmonics, det, st, log, warm_up=s_warm)
                 speed = xmap.size / dt
             emit("run_end", {"success": True})
             if test:

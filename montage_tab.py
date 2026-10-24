@@ -423,7 +423,7 @@ class MontageTab(QWidget):
         for r in results:
             if r.get("ok"):
                 self.log(f"  {os.path.basename(r['output'])}: {r.get('n_saved')} patterns in {r.get('seconds', 0):.0f} s"
-                         + (f", {r['n_excluded']} excluded (zeros)" if r.get("n_excluded") else ""))
+                         + (f", {r['n_excluded']} outside the IQ range kept unprocessed" if r.get("n_excluded") else ""))
             else:
                 self.log(f"  {os.path.basename(r.get('source', '?'))}: FAILED: {r.get('error')}")
         self.log(f"Batch processing: {n_ok} of {len(jobs)} tiles written to {out_dir} in {(time.perf_counter() - t_start) / 60:.1f} min"
@@ -515,11 +515,12 @@ class MontageTab(QWidget):
                     st_t = dataclasses.replace(st, PATTERN_FILE=tile.pattern.path, SCAN_FILE=None, EDAXH5_MAP=None, NAV_SHAPE=None,
                                                STEP_SIZE=None, ROI=None)
                     s, _ = sph_core.load_patterns(st_t, scan=montage.scan_dict(tile), log=log)
-                    # the zero patterns (excluded by the processor) are found on the raw data: the background
-                    # removal rescales every pattern, zeros included, so afterwards they are no longer zero
+                    # All-zero patterns cannot be indexed and are skipped (processor versions before 1.7.0 wrote
+                    # them for the patterns outside the IQ range; now those are kept unprocessed and indexed like
+                    # the rest). They are found on the raw data: the background removal would rescale them.
                     iq, nav_mask = montage.tile_stats(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
                     if nav_mask is not None:
-                        log(f"  {int(nav_mask.sum())} zero patterns (excluded by the processor) are not indexed")
+                        log(f"  {int(nav_mask.sum())} all-zero patterns are not indexed")
                     sph_core.preprocess(s, st_t, log)
                     quiet = (lambda _msg: None) if det is not None else log
                     det = sph_core.make_detector(st_t, s, harmonics, quiet)
