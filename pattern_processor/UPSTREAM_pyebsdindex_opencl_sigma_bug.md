@@ -1,7 +1,7 @@
 # Draft upstream report for PyEBSDIndex (not posted yet)
 
 Target: https://github.com/USNavalResearchLaboratory/PyEBSDIndex/issues
-Affects: `pyebsdindex/opencl/clnlpar.cl`, kernel `calcnlpar`, in 0.3.9.x and `main`
+Affects: `pyebsdindex/opencl/clnlpar.cl`, kernel `calcnlpar`, in 0.3.9.x, 0.3.10.1 (same file) and `main`
 (checked 2026-10-13). The fix is one line; a PR body is included below the issue text.
 
 ---

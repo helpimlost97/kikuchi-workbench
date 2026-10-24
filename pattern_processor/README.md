@@ -43,9 +43,12 @@ turned out to be useful enough to publish.
   dimensionless λ and a σ²-normalized weight: `w(i,j) = exp(-max(d̃, 0) / λ²)`
   - Full-dataset batch runs through **pyebsdindex's own NLPAR** (v1.6): its
     OpenCL kernels when `pyopencl` sees a GPU, numba on the CPU otherwise. The
-    σ map from Optimize λ is reused by the batch. The viewer patches one line of
-    pyebsdindex's OpenCL kernel at startup (neighbour σ indexed as the centre σ;
-    see `PLAN_NLPAR_PYEBSDINDEX.md`); `KPP_NLPAR_KERNEL_PATCH=0` disables that.
+    σ map from Optimize λ is reused by the batch. The viewer redirects pyebsdindex's
+    OpenCL NLPAR kernel build to a patched copy at startup (`patches/clnlpar_fixed.cl`):
+    the neighbour σ indexed as the centre σ is fixed, the `float16` pointer casts are
+    replaced by `vload16`/`vstore16` helpers with an element-wise partial last vector,
+    so pattern sizes whose pixel count is not a multiple of 16 run on the GPU too (see
+    `PLAN_NLPAR_PYEBSDINDEX.md`); `KPP_NLPAR_KERNEL_PATCH=0` disables that.
   - On-demand single-pixel preview before committing to the full pass (our own
     NumPy code, kept for instant response; it uses pyebsdindex's σ map and
     saturation rule so interior pixels match the batch, and zero-pads at the
@@ -66,8 +69,9 @@ turned out to be useful enough to publish.
   - Engine choice: pyebsdindex uses OpenCL when `pyopencl` sees a GPU, else
     numba on all cores; `KPP_GPU=0` forces the CPU engine (on 479x479 patterns a
     24-core CPU was faster than an 8 GB laptop GPU)
-- **NPAR** as a uniform-weight special case (single-pixel preview only;
-  use NLPAR with high λ for the equivalent batch behavior)
+- **NPAR** as a uniform-weight special case: single-pixel preview, and with the
+  box ticked `Apply && Save` writes the same neighbourhood average (patterns
+  outside the IQ range are left out of the average and written unprocessed)
 - **Aperture masking** for the σ² estimate and the NLPAR distance term — three
   modes covering the geometries this tool was actually used on:
   - `None` — every pixel counts (default)

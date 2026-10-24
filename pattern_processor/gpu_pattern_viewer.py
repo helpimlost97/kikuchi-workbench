@@ -1,4 +1,4 @@
-__version__ = "1.7.0.dev2"   # shown in the window title; bump with each release (git tag v<version>)
+__version__ = "1.7.0.dev3"   # shown in the window title; bump with each release (git tag v<version>)
 import sys
 import os
 import gc
@@ -59,16 +59,32 @@ def _patch_pyebsdindex_nlpar_kernel():
     inward, the GPU mirrors indices).
 
     openclparam.get_context builds `path.join(<package dir>, kfile)`, so handing it an
-    absolute kfile path redirects the build to a patched copy. The copy is regenerated
-    from the installed file at every start; once upstream fixes the line the replace is
-    a no-op and nothing is redirected. Reported upstream: see PLAN_NLPAR_PYEBSDINDEX.md."""
+    absolute kfile path redirects the build to a patched copy. For the shipped file we
+    know (sha1 in _KNOWN_SHIPPED_CLNLPAR) the repository's patches/clnlpar_fixed.cl is
+    used as it is; for any other version the fix is derived from the installed text and
+    cached under a content hash in a per-user temp dir, so it is reused across starts.
+    Once upstream fixes the line the replace is a no-op and nothing is redirected. The
+    redirect needs get_context to take `kfile`; if a pyebsdindex version drops that
+    argument the patch is reported as unavailable instead of silently never firing
+    (finding 14). Line endings are normalised first, so a checkout with CRLF conversion
+    hashes and transforms like the LF original (finding 13). Reported upstream: see
+    PLAN_NLPAR_PYEBSDINDEX.md."""
     if not NLPAR_ON_GPU:
         return None, None
     try:
-        import hashlib, tempfile
+        import hashlib, tempfile, inspect
         from pyebsdindex.opencl import openclparam
+        orig = openclparam.OpenClParam.get_context
+        try:
+            sig = inspect.signature(orig)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is None or 'kfile' not in sig.parameters:
+            print("[NLPAR] pyebsdindex's OpenClParam.get_context has no `kfile` argument: the kernel "
+                  "build cannot be redirected, using the kernel as shipped")
+            return None, None
         src = os.path.join(os.path.dirname(openclparam.__file__), 'clnlpar.cl')
-        text = open(src, encoding='utf-8').read()
+        text = open(src, encoding='utf-8', newline='').read().replace('\r\n', '\n')
         sha = hashlib.sha1(text.encode('utf-8')).hexdigest()
         full = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'patches', 'clnlpar_fixed.cl')
         # Per-user cache dir: the system temp dir is shared on a cluster node and a
@@ -94,11 +110,16 @@ def _patch_pyebsdindex_nlpar_kernel():
             print(f"[NLPAR] pyebsdindex clnlpar.cl sha1 {sha[:12]} is not the version the shipped patch was made "
                   f"from; derived patch level: {level}"
                   + ("" if level == 'full' else "; pattern sizes with (height*width) % 16 != 0 will run NLPAR on the CPU instead"))
-        orig = openclparam.OpenClParam.get_context
-        def get_context(self, gpu_id=None, kfile='clkernels.cl'):
-            if kfile == 'clnlpar.cl':
-                kfile = dst
-            return orig(self, gpu_id=gpu_id, kfile=kfile)
+        def get_context(self, *args, **kwargs):
+            # Transparent to the call: kfile may arrive positionally or by keyword.
+            bound = sig.bind(self, *args, **kwargs)
+            if bound.arguments.get('kfile') == 'clnlpar.cl':
+                bound.arguments['kfile'] = dst
+                global NLPAR_KERNEL_REDIRECTED
+                if not NLPAR_KERNEL_REDIRECTED:
+                    NLPAR_KERNEL_REDIRECTED = True
+                    print(f"[NLPAR] OpenCL NLPAR kernel built from {dst}")
+            return orig(*bound.args, **bound.kwargs)
         openclparam.OpenClParam.get_context = get_context
         return dst, level
     except Exception as _e:
@@ -141,7 +162,7 @@ def _transform_clnlpar(text):
     t = t.replace('*(__global float16*) (data + indx0+16*z)', 'loadpat16(data + indx0+16*z, npatpoint - 16*z)')
     t = t.replace('*(__global float16*) (data + indx_ij+16*z)', 'loadpat16(data + indx_ij+16*z, npatpoint - 16*z)')
     t = t.replace('*(__global float16*) (dataout + indx0+16*z) += d1;', 'acc += d1;')
-    m = re.search(r'\n(\s*)mask0 = mask\[z\];\s*\n\s*mask0 =  \(mask0 > \(float16\) -1\.e-3\)', t)
+    m = re.search(r'\n(\s*)mask0 = mask\[z\];\s*\n\s*mask0 =\s+\(mask0 > \(float16\) -1\.e-3\)', t)
     if not m or t.count('acc += d1;') != 1:
         return s, 'sigma-only'
     t = t[:m.start()] + '\n' + m.group(1) + 'float16 acc = (float16) (0.0f);' + t[m.start():]
@@ -154,10 +175,12 @@ def _transform_clnlpar(text):
         return s, 'sigma-only'
     return t, 'full'
 
-# sha1 of pyebsdindex/opencl/clnlpar.cl as shipped in releases our full patch was made from.
+# sha1 of pyebsdindex/opencl/clnlpar.cl (LF line endings) as shipped in the releases our
+# full patch was made from.
 _KNOWN_SHIPPED_CLNLPAR = {
-    '14c0d609073680260f57d0d48aa71fcb29e18f3f',   # 0.3.9.1 (pip, 2026-10)
+    '14c0d609073680260f57d0d48aa71fcb29e18f3f',   # 0.3.9.1 and 0.3.10.1 (pip, 2026-10): same file
 }
+NLPAR_KERNEL_REDIRECTED = False   # set by the get_context wrapper the first time it redirects the build
 if os.environ.get('KPP_NLPAR_KERNEL_PATCH', '').strip() == '0':
     NLPAR_KERNEL_PATCH, NLPAR_KERNEL_PATCH_LEVEL = None, None
 else:
@@ -232,25 +255,39 @@ def _cgroup_headroom():
     not what the OOM killer counts against us). Charging it made available_ram() collapse
     to ~5 GB right after loading the Ni scan on the login node (64 GB user cap), which
     starved every threaded pass down to 1 thread. So reclaimable file cache
-    (`memory.stat: file`) is subtracted from `current` at each level."""
+    (`memory.stat: file`) is subtracted from `current` at each level.
+
+    cgroup v1 (older SLURM nodes; finding 16) is read the same way from the `memory`
+    controller's hierarchy: memory.limit_in_bytes, memory.usage_in_bytes and the
+    `total_cache` line of memory.stat; an "unlimited" v1 limit is a huge number."""
     try:
         with open('/proc/self/cgroup') as f:
-            rel = [l.split(':', 2)[2].strip() for l in f if l.startswith('0::')][0]
+            lines = [l.strip() for l in f if l.count(':') >= 2]
     except Exception:
+        return None
+    v2 = [l.split(':', 2)[2] for l in lines if l.startswith('0::')]
+    v1 = [l.split(':', 2)[2] for l in lines if 'memory' in l.split(':', 2)[1].split(',')]
+    if v2:
+        rel, root = v2[0], '/sys/fs/cgroup/'
+        f_lim, f_cur, cache_key = 'memory.max', 'memory.current', 'file '
+    elif v1:
+        rel, root = v1[0], '/sys/fs/cgroup/memory/'
+        f_lim, f_cur, cache_key = 'memory.limit_in_bytes', 'memory.usage_in_bytes', 'total_cache '
+    else:
         return None
     parts = [p for p in rel.split('/') if p]
     best = None
     for i in range(len(parts), -1, -1):
-        d = '/sys/fs/cgroup/' + '/'.join(parts[:i])
+        d = root + '/'.join(parts[:i])
         try:
-            with open(d + '/memory.max') as f: lim = f.read().strip()
-            if lim == 'max': continue
+            with open(d + '/' + f_lim) as f: lim = f.read().strip()
+            if lim == 'max' or int(lim) >= (1 << 60): continue      # unlimited at this level
             lim = int(lim)
-            with open(d + '/memory.current') as f: cur = int(f.read().strip())
+            with open(d + '/' + f_cur) as f: cur = int(f.read().strip())
             cache = 0
             with open(d + '/memory.stat') as f:
                 for line in f:
-                    if line.startswith('file '): cache = int(line.split()[1]); break
+                    if line.startswith(cache_key): cache = int(line.split()[1]); break
         except Exception:
             continue
         head = max(lim - max(cur - cache, 0), 0)
@@ -282,11 +319,16 @@ def read_patterns_parallel(path, offset, n_pat, ph, pw, dtype, out=None, nthr=No
     `progress(done_bytes, total_bytes)` is called from the CALLING thread every 0.2 s
     (safe to touch Qt from it). drop_cache=True tells the kernel it may discard the
     page cache of the range just read (posix_fadvise DONTNEED): used when the bytes now
-    live in our own array, so the cache copy is dead weight in the cgroup accounting."""
+    live in our own array, so the cache copy is dead weight in the cgroup accounting.
+    `out`, when given, must be a C-contiguous (n_pat, ph, pw) array of `dtype`."""
     itemsize = np.dtype(dtype).itemsize
     total = int(n_pat) * int(ph) * int(pw) * itemsize
     if out is None:
         out = np.empty((int(n_pat), int(ph), int(pw)), dtype=dtype)
+    if total == 0:                                       # nothing to read; the memoryview cast below would raise
+        if progress is not None:
+            progress(0, 0)
+        return out
     buf = memoryview(out).cast('B')                      # flat byte view of the output
     nthr = max(1, min(int(nthr or n_workers()), 16, max(1, total // int(min_bytes))))
     bounds = np.linspace(0, total, nthr + 1, dtype=np.int64)
@@ -334,7 +376,8 @@ class ScanMapCanvas(FigureCanvas):
         if event.inaxes != self.ax: return
         col, row = int(round(event.xdata)), int(round(event.ydata))
         if 0 <= col < self.ncols and 0 <= row < self.nrows:
-            if self._mask is not None and not self._mask[row, col]: return
+            # Clicks on IQ-excluded points go through: the preview panel shows them as
+            # "kept unprocessed" (the mask test here made that view unreachable; finding 9).
             self._place_marker(row, col); self.pattern_clicked.emit(row, col)
     def _on_scroll(self, event):
         if event.inaxes != self.ax: return
@@ -362,6 +405,8 @@ class ScanMapCanvas(FigureCanvas):
         self._orig_xlim = self.ax.get_xlim(); self._orig_ylim = self.ax.get_ylim(); self.draw_idle()
     def update_mask(self, mask):
         self._mask = mask
+        if self._mask_handle is None:        # before set_map / after unload: nothing to paint on
+            return
         overlay = np.zeros((self.nrows, self.ncols, 4))
         overlay[~mask, 0] = 1.0; overlay[~mask, 3] = 0.5
         self._mask_handle.set_data(overlay); self.draw_idle()
@@ -421,9 +466,16 @@ class RamUPFile(ebsd_pattern.UPFile):
         (_restore_excluded_output) so that they stay in the data set. Value 1 rather than 0:
         pyebsdindex's calcnlpar_cl treats an all-zero output pattern as the Apple-silicon
         GPU failure and recomputes the tile up to three times (code review 2026-10-13).
-        See PLAN_NLPAR_PYEBSDINDEX.md, Phase 3."""
+        See PLAN_NLPAR_PYEBSDINDEX.md, Phase 3.
+        Known limit (finding 17, 2026-10-24): a recorded pattern whose own sigma pyebsdindex
+        set to its 1e12 sentinel (a duplicate or flat pattern that the IQ range did not
+        exclude) normalises every distance to a negative number, so it gives full weight to
+        all its neighbours, the constant-served ones included. Such patterns have IQ ~0 and
+        are expected to be excluded by the IQ range themselves."""
         if self.exclude is not None:
-            sel = self.exclude[idx]
+            sel = np.zeros(idx.size, dtype=bool)
+            inside = idx < self.exclude.size            # a read past the recorded patterns has no flag
+            sel[inside] = self.exclude[idx[inside]]
             if sel.any():
                 pats[sel] = 1
         return pats
@@ -446,9 +498,13 @@ class RamUPFile(ebsd_pattern.UPFile):
         if psc.ndim == 1:                    # contiguous run of patterns
             p0 = int(psc[0]); n = int(psc[-1])
             if n == -1: n = int(self.nPatterns) - p0
-            n = max(1, min(n, int(self.nPatterns) - p0, self._ram.shape[0] - p0))
+            # Clamp to what exists in RAM and to the (possibly capped) nRows*nCols grid, so a
+            # run past either end gives an empty result rather than one xyloc row for zero
+            # patterns, or an unravel_index error (findings 11, 12). Not reached by pyebsdindex
+            # today (it does slab reads over capped rows); kept correct anyway.
+            n = max(0, min(n, int(self.nPatterns) - p0, self._ram.shape[0] - p0, nrows * ncols - p0))
             pats = self._ram[p0:p0 + n].astype(typeout)
-            idx = np.arange(p0, p0 + n, dtype=np.int64)
+            idx = np.arange(p0, p0 + pats.shape[0], dtype=np.int64)
         else:                                # [[col0, row0], [ncols, nrows]] slab
             c0, nc = int(psc[0, 0]), int(psc[1, 0]); r0, nr = int(psc[0, 1]), int(psc[1, 1])
             if nc < 0: nc = ncols - c0
@@ -490,7 +546,9 @@ class MaskedUPFile(ebsd_pattern.UPFile):
             return out
         pats, xyloc = out
         p0 = int(psc[0]); idx = np.arange(p0, p0 + pats.shape[0], dtype=np.int64)
-        sel = self.exclude[idx]
+        sel = np.zeros(idx.size, dtype=bool)
+        inside = idx < self.exclude.size         # same guard as RamUPFile._apply_exclude (finding 19)
+        sel[inside] = self.exclude[idx[inside]]
         if sel.any():
             pats[sel] = 1                        # fresh array from pat_reader: in place is safe
         return pats, xyloc
@@ -559,6 +617,7 @@ class MainWindow(QMainWindow):
         # loop, so button clicks and control changes arrive mid-call; the entry points
         # refuse while busy instead of re-entering on the same object (code review 2026-10-13).
         self._nlpar_busy = False
+        self._loading = False                # True inside load_path (its RAM read pumps the event loop too)
         self.nrows = self.ncols = self.current_row = self.current_col = 0
         self.mean_pattern = None; self.iq_map = None; self.iq_mask = None
         self.pixel_std = None  # per-pixel std across dataset, for variance-based aperture detection
@@ -651,9 +710,22 @@ class MainWindow(QMainWindow):
         self._invalidate_sigma_map()
         self._invalidate_global_range()
         self._lambda_optimized = False  # lambda was fitted for the previous aperture
-        self._nlobj = None; self._nlobj_key = None   # its sigma was computed under the old mask
+        self._drop_nlobj()              # its sigma was computed under the old mask
         if self.f_orig is not None:
             self.update_display()
+
+    def _on_aperture_thresh_changed(self):
+        """The auto-detect threshold only matters in mode 'Auto-detect'; in the other modes
+        an accidental spin change used to drop the sigma map, the NLPAR object and the
+        lambda gate for nothing (finding 7, 2026-10-24)."""
+        if self.aperture_mode.currentText() == "Auto-detect":
+            self._on_aperture_changed()
+
+    def _drop_nlobj(self):
+        """Forget the shared pyebsdindex NLPAR object AND its input file object. The latter
+        is a RamUPFile over the data set; keeping it alive after the object was dropped held
+        the previous scan in RAM through the next load's RAM check (finding 8, 2026-10-24)."""
+        self._nlobj = None; self._nlobj_key = None; self._nl_infile = None
 
     def _current_aperture(self):
         """Resolved aperture as a (ph, pw) float32 array of 1.0/0.0, or None when the
@@ -729,6 +801,8 @@ class MainWindow(QMainWindow):
         mp = self.mean_pattern
         if not preserve_mean:
             return mp
+        if ap_bool is not None and not np.any(ap_bool):
+            ap_bool = None            # empty aperture (auto-detect on a constant data set): level over all pixels, not NaN
         level = float(mp[ap_bool].mean()) if ap_bool is not None else float(mp.mean())
         if self.bg_mode.currentText() == "Subtract":
             return mp - level
@@ -875,13 +949,16 @@ class MainWindow(QMainWindow):
         Returns (patterns_2d_array, mask_2d, center_index_in_array)."""
         r = radius
         n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
+        if row >= n_avail_rows or col >= self.ncols:
+            # The partial last row of a map stopped early (or a stale click): no neighbourhood
+            # statistics exist there, so the centre pattern alone is the neighbourhood. Clipping
+            # the read to the full rows used to drop the centre row itself and index past the
+            # block (IndexError inside a Qt slot = the app aborts; review 2026-10-24, finding 1).
+            pat = self._read_pattern(fobj, row, col).astype(np.float32)
+            return pat[None, None], np.ones((1, 1), dtype=bool), 0, 0
         r0, r1 = max(0, row - r), min(n_avail_rows, row + r + 1)
         c0, c1 = max(0, col - r), min(self.ncols, col + r + 1)
         n_rows_read = r1 - r0; n_cols_read = c1 - c0
-        if n_rows_read <= 0 or n_cols_read <= 0:
-            ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-            dummy = np.zeros((1, 1, ph, pw))
-            return dummy, np.ones((1, 1), dtype=bool), 0, 0
         pats = self._read_rows(fobj, r0, n_rows_read, c0, n_cols_read, as_float=True)
         ph, pw = int(fobj.patternH), int(fobj.patternW)
         pats = pats.reshape(n_rows_read, n_cols_read, ph, pw)
@@ -900,6 +977,48 @@ class MainWindow(QMainWindow):
         if weight_sum < 1: return pats[cr, cc]
         result = np.sum(pats * valid[:, :, np.newaxis, np.newaxis], axis=(0, 1)) / weight_sum
         return result
+
+    def _npar_rows(self, fobj, row_start, n_rows, mask2d, radius):
+        """NPAR for the batch: the neighbourhood-averaged patterns of scan rows
+        [row_start, row_start+n_rows) of `fobj`, as float64 (n_rows*ncols, ph, pw) in scan
+        order. Same rule as the preview (_compute_npar_single): the plain mean over the
+        (2r+1)^2 window, leaving out neighbours outside the IQ range (`mask2d` False),
+        beyond the scan edge or beyond the recorded full rows. A point without a single
+        neighbour in range (itself included) keeps its own pattern. Until 2026-10-24
+        save_processed labelled its output "NPAR" but wrote the plain patterns (review
+        finding 2); now the file gets what the preview shows.
+        Memory: the chunk plus a 2r-row halo in the native dtype, the float64 result, and
+        one float64 row temporary per shift."""
+        r = int(radius); ncols = int(self.ncols)
+        n_full = int(getattr(self, 'n_actual_rows', self.nrows))
+        row_start, n_rows = int(row_start), int(n_rows)
+        h0, h1 = max(0, row_start - r), min(n_full, row_start + n_rows + r)
+        halo = self._read_rows(fobj, h0, h1 - h0)
+        ph, pw = halo.shape[1], halo.shape[2]
+        halo = halo.reshape(h1 - h0, ncols, ph, pw)                 # view
+        m = np.asarray(mask2d[h0:h1], dtype=np.float64)              # (rows, ncols) 1/0 weights
+        acc = np.zeros((n_rows, ncols, ph, pw), dtype=np.float64)
+        cnt = np.zeros((n_rows, ncols), dtype=np.float64)
+        for i in range(n_rows):
+            for dy in range(-r, r + 1):
+                src = row_start + i + dy
+                if src < h0 or src >= h1:
+                    continue
+                srow, wrow = halo[src - h0], m[src - h0]
+                for dx in range(-r, r + 1):
+                    c0, c1 = max(0, -dx), min(ncols, ncols - dx)    # output columns whose neighbour c+dx exists
+                    if c1 <= c0:
+                        continue
+                    w = wrow[c0 + dx:c1 + dx]
+                    acc[i, c0:c1] += srow[c0 + dx:c1 + dx] * w[:, None, None]
+                    cnt[i, c0:c1] += w
+        acc = acc.reshape(n_rows * ncols, ph, pw); cnt = cnt.reshape(-1)
+        own = halo[row_start - h0:row_start - h0 + n_rows].reshape(n_rows * ncols, ph, pw)
+        ok = cnt >= 1
+        acc[ok] /= cnt[ok, None, None]
+        if not ok.all():
+            acc[~ok] = own[~ok]
+        return acc
 
     def _compute_nlpar_single(self, row, col):
         """Compute NLPAR for a single pixel on-demand using the canonical
@@ -938,6 +1057,8 @@ class MainWindow(QMainWindow):
         center_pat = pats[cr, cc].astype(np.float64)
         if self.sigma_sq_map is None:
             return center_pat                    # sigma unavailable while a batch is running
+        if pats.shape[0] * pats.shape[1] == 1:
+            return center_pat                    # partial last row: no neighbourhood (see _read_neighborhood)
         on_gpu = self._nlpar_engine_of(self._nlobj)[0] if self._nlobj is not None else NLPAR_ON_GPU
         ph, pw = center_pat.shape
         nr, nc = pats.shape[0], pats.shape[1]
@@ -1032,15 +1153,18 @@ class MainWindow(QMainWindow):
         key = self._aperture_key()
         if self.sigma_sq_map is not None and self._sigma_aperture_key == key:
             return
+        if self._nlpar_busy:
+            # A pyebsdindex call is in flight (preview click during a batch): do not start a
+            # second one, and do not read nlobj.sigma either. During the batch it is the copy
+            # with sigma 0 at the IQ-excluded positions; caching that gave those neighbours
+            # zero weight in every later preview, even after the IQ range was widened
+            # (finding 6, 2026-10-24). The caller falls back to the centre pattern.
+            return
         t0 = time.time()
         nlobj, from_ram = self._get_nlobj(self.sr_spin.value())
         n_avail = int(getattr(self, 'n_actual_rows', self.nrows))
         sig = None if nlobj.sigma is None else np.asarray(nlobj.sigma)
         if sig is None or sig.ndim != 2 or sig.shape != (n_avail, int(self.ncols)):
-            if self._nlpar_busy:
-                # A pyebsdindex call is in flight on this object (preview click during a
-                # batch). Do not start a second one; the caller falls back gracefully.
-                return
             N_p, ap_label = self._nlobj_mask_info(nlobj)
             engine = self._nlpar_engine_of(nlobj)[1]
             print(f"[σ² MAP] engine={engine} aperture={ap_label} N_p={N_p} "
@@ -1125,7 +1249,7 @@ class MainWindow(QMainWindow):
             return
         if which == 'saturation':
             self._invalidate_sigma_map()
-            self._nlobj = None; self._nlobj_key = None
+            self._drop_nlobj()
         self._lambda_optimized = False
         if self.f_orig is not None:
             self.update_display()
@@ -1253,11 +1377,18 @@ class MainWindow(QMainWindow):
         KPP_NLPAR_IN_MEMORY=0 forces the file. Only whole rows [0, n_actual_rows) are
         produced by NLPAR; the partial last row of a map stopped early is copied here
         from the original. `tag` only prefixes the console message."""
+        # Free a previous result first, whichever way this one ends up. self.f_nlpar (a
+        # RamUPFile) holds the same array as self.nlpar_patterns, so clearing only the latter
+        # kept the old result alive through the RAM check and the new allocation: the second
+        # run of a big scan was pushed to disk, or three copies coexisted (finding 5).
+        if self.f_nlpar is not None or self.nlpar_patterns is not None:
+            self.f_nlpar = None; self.nlpar_patterns = None
+            self.nlpar_status.setText("No NLPAR file loaded")
+            gc.collect()
         if self.patterns is None:
             return False
         if os.environ.get('KPP_NLPAR_IN_MEMORY', '').strip().lower() in ('0', 'no', 'false'):
             return False
-        self.nlpar_patterns = None           # free a previous result first
         need = self.patterns.nbytes; avail = available_ram()
         if need > 0.6 * avail:
             print(f"{tag} result goes to disk: a second {need/1e9:.1f} GB copy does not fit "
@@ -1343,6 +1474,11 @@ class MainWindow(QMainWindow):
     def _get_base_pattern(self):
         """Get the base pattern for display, applying on-demand NPAR/NLPAR."""
         # Priority: loaded NLPAR file > on-demand NLPAR > on-demand NPAR > raw
+        if self.current_row >= int(getattr(self, 'n_actual_rows', self.nrows)):
+            # Partial last row of a map stopped early: NLPAR (whole rows only) and NPAR have
+            # no neighbourhood there, and save_processed takes these patterns from the
+            # original, so the preview starts from the original too.
+            return self._read_pattern(self.f_orig)
         if self.f_nlpar is not None:
             return self._read_pattern(self.f_nlpar)
         if self.nlpar_chk.isChecked():
@@ -1692,7 +1828,8 @@ class MainWindow(QMainWindow):
         elapsed = time.time() - t0
         # Build source label
         src = ""
-        if self.f_nlpar is not None: src = "NLPAR+"
+        if self.current_row >= int(getattr(self, 'n_actual_rows', self.nrows)): src = ""   # partial row: original
+        elif self.f_nlpar is not None: src = "NLPAR+"
         elif self.nlpar_chk.isChecked(): src = "NLPAR+"
         elif self.npar_chk.isChecked(): src = "NPAR+"
         # Proc display range follows the normalize toggle:
@@ -1711,17 +1848,79 @@ class MainWindow(QMainWindow):
 
     # ---- File loading ----
     def load_file(self):
+        if self._refuse_while_busy("Loading a file"): return
         path, _ = QFileDialog.getOpenFileName(self, "Open UP1/UP2 File",
             "", "UP1/UP2 Files (*.up1 *.up2)")
         if not path: return
         self.load_path(path)
 
+    def _busy_reason(self):
+        """Why a GUI entry point has to wait, or None."""
+        if self._nlpar_busy: return "an NLPAR step is running"
+        if self._loading: return "a file is being loaded"
+        if self._batch_running: return "a montage batch is running"
+        return None
+
+    def _refuse_while_busy(self, what):
+        """GUI entry points call this first and return when it is True. Every long pass pumps
+        the Qt event loop, so a button click arrives in the middle of one; re-entering the
+        loader, Optimize Lambda, the NLPAR batch or Apply && Save on the same objects
+        interleaved their reads and corrupted the window state (findings 7 and 15, 2026-10-24).
+        The montage batch itself calls load_path / save_processed directly, not through here."""
+        why = self._busy_reason()
+        if why is None:
+            return False
+        QMessageBox.information(self, "Busy", f"Wait: {why}. {what} can start when it has finished.")
+        return True
+
+    def _complain(self, title, text):
+        """A warning for the user: a message box, or the console and status bar only while a
+        montage batch runs headlessly (a modal box would block it; the batch sees the failure
+        through the window state)."""
+        print(f"[{title.upper()}] {text}")
+        self.statusBar().showMessage(f"{title}: {text.splitlines()[0]}")
+        if not self._batch_running:
+            QMessageBox.warning(self, title, text)
+
     def load_path(self, path):
         """Load a UP1/UP2 file by path (no dialog). Split out of load_file so the
-        loader can be driven headlessly for testing."""
-        if self._nlpar_busy:
-            QMessageBox.information(self, "NLPAR is running", "Wait for the NLPAR step to finish before loading another file.")
+        loader can be driven headlessly for testing (and used by batch_process).
+        Refuses while a pyebsdindex call or another load is in flight, and refuses a file
+        without a single complete pattern, BEFORE the previous data set is dropped; a read
+        error leaves the window with nothing loaded instead of half-switched. None of these
+        raise: callers check self.orig_path / self.f_orig afterwards."""
+        why = ("an NLPAR step is running" if self._nlpar_busy
+               else "a file is already being loaded" if self._loading else None)
+        if why is not None:
+            self._complain("Busy", f"Wait: {why}. Load the file when it has finished.")
             return
+        f_new = ebsd_pattern.get_pattern_file_obj(path)
+        ph, pw = int(f_new.patternH), int(f_new.patternW)
+        bpp = int(np.dtype(f_new.filedatatype).itemsize)          # 1 (.up1) or 2 (.up2)
+        header_bytes = int(getattr(f_new, 'filePos', 42) or 0)   # real data offset (42 for v3, more for v4)
+        fsize = int(os.path.getsize(path))
+        n_actual_pats = int((fsize - header_bytes) // (ph * pw * bpp))
+        if n_actual_pats <= 0:
+            # Header-only or sub-pattern file (findings 7 and 10): the zero-size reads downstream
+            # raised inside a Qt slot, after orig_path had already been switched.
+            self._complain("Cannot load file",
+                           f"{os.path.basename(path)} holds no complete pattern: {fsize} bytes, "
+                           f"{header_bytes}-byte header, {pw}x{ph} px at {bpp} byte(s) per pixel.")
+            return
+        self._loading = True
+        try:
+            self._load_dataset(path, f_new, n_actual_pats)
+        except (IOError, OSError) as e:
+            import traceback; traceback.print_exc()
+            self._loading = False
+            self.unload()
+            self._complain("Load failed", f"{os.path.basename(path)} could not be read:\n{e}")
+        finally:
+            self._loading = False
+
+    def _load_dataset(self, path, f_new, n_actual_pats):
+        """The body of load_path, once the file object `f_new` passed the checks there;
+        `n_actual_pats` is the number of complete patterns the file holds."""
         self.statusBar().showMessage("Loading patterns..."); QApplication.processEvents()
         # Drop EVERYTHING that belongs to the previous dataset before touching any widget.
         # The slider resets below emit valueChanged -> _update_iq_range -> update_display,
@@ -1736,19 +1935,18 @@ class MainWindow(QMainWindow):
         self._invalidate_sigma_map()      # sigma map belongs to the old scan
         self._invalidate_global_range()   # so do the global-stretch bounds
         self._lambda_optimized = False    # lambda gate re-arms for the new file
-        self._nlobj = None; self._nlobj_key = None   # pyebsdindex object (and its sigma) is per dataset
+        self._drop_nlobj()                # pyebsdindex object, its sigma and its input file object are per dataset
         self._aperture_cache = None; self._aperture_cache_key = None  # auto-detect mask is per dataset
-        self.orig_path = path; self.f_orig = ebsd_pattern.get_pattern_file_obj(path)
+        self.orig_path = path; self.f_orig = f_new
         self.nrows, self.ncols = self.f_orig.nRows, self.f_orig.nCols
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         # Check for truncated file but KEEP original header dimensions for OIM compat
-        fsize = int(os.path.getsize(path))
         bpp = int(np.dtype(self.f_orig.filedatatype).itemsize)   # 1 (.up1) or 2 (.up2)
         self.src_ext = os.path.splitext(path)[1].lower()
         self.dtype_max = int(np.iinfo(self.f_orig.filedatatype).max)
         self.scale_max = float(self.dtype_max); self.data_max = None
         header_bytes = int(getattr(self.f_orig, 'filePos', 42) or 0)  # real data offset (42 for v3, more for v4)
-        self.n_actual_pats = int((fsize - header_bytes) // (ph * pw * bpp))
+        self.n_actual_pats = int(n_actual_pats)
         self.n_actual_rows = self.n_actual_pats // self.ncols
         n_expected = self.nrows * self.ncols
         if self.n_actual_pats < n_expected:
@@ -1887,6 +2085,7 @@ class MainWindow(QMainWindow):
 
     def load_nlpar_file(self):
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
+        if self._refuse_while_busy("Loading an NLPAR file"): return
         path, _ = QFileDialog.getOpenFileName(self, "Open NLPAR UP1/UP2 File",
             os.path.dirname(self.orig_path), "UP1/UP2 Files (*.up1 *.up2)")
         if not path: return
@@ -1910,13 +2109,19 @@ class MainWindow(QMainWindow):
 
     def recompute_background(self):
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
-        mask = self._get_iq_mask()
+        if self._refuse_while_busy("Recomputing the background"): return
+        n_avail_rows = int(getattr(self, 'n_actual_rows', self.nrows))
+        # Only the recorded full rows take part, as in the load-time mean. The IQ map is
+        # padded with zeros for the rows a map stopped early never recorded, and with the
+        # min slider at 0 those cells are "in range": counting them in n_valid scaled the
+        # mean by recorded/total (0.73 on a 40-of-55-row file; finding 3, 2026-10-24).
+        mask = self._get_iq_mask().copy()
+        mask[n_avail_rows:] = False
         n_valid = int(mask.sum())
         if n_valid == 0: QMessageBox.warning(self, "Error", "No patterns in IQ range"); return
         self.statusBar().showMessage("Recomputing background from IQ range..."); QApplication.processEvents()
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
         mean_accum = np.zeros((ph, pw), dtype=np.float64)
-        n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
         # Native-dtype read + a masked copy of at most the same size; the sum accumulates
         # straight into float64 (exact for integer input). 50 rows of float32 here was
         # ~20 GB on a 430-col 479x479 scan — that's the _ArrayMemoryError we hit.
@@ -1931,7 +2136,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Recomputing BG: row {row_start + rows_to_read}/{self.nrows}")
             QApplication.processEvents()
         self.mean_pattern = mean_accum / n_valid
-        n_total = self.nrows * self.ncols
+        n_total = n_avail_rows * int(self.ncols)          # recorded full rows, the population the mean is over
         self.bg_status.setText(f"Background: {n_valid}/{n_total} patterns")
         self.statusBar().showMessage(f"Background recomputed from {n_valid} patterns"); self.update_display()
 
@@ -1969,8 +2174,7 @@ class MainWindow(QMainWindow):
           hand over IS makeautomask, so that case is unchanged.
         """
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
-        if self._nlpar_busy:
-            QMessageBox.information(self, "NLPAR is running", "Wait for the running NLPAR step to finish."); return
+        if self._refuse_while_busy("Optimize Lambda"): return
         try:
             t0 = time.time()
             sr = self.sr_spin.value()
@@ -2019,9 +2223,7 @@ class MainWindow(QMainWindow):
                 "'Apply NLPAR to Full Dataset' again.")
             return
         sr, lam = self.sr_spin.value(), self.lam_spin.value()
-        if self._nlpar_busy:
-            QMessageBox.information(self, "NLPAR is running", "Wait for the running NLPAR step to finish."); return
-
+        if self._refuse_while_busy("The NLPAR batch"): return
         self._apply_nlpar_pyebsdindex(sr, lam)
 
     def _apply_nlpar_pyebsdindex(self, sr, lam, raise_errors=False):
@@ -2152,11 +2354,13 @@ class MainWindow(QMainWindow):
     # Old name, still used by osc_selftest.py / osc_gpu_selftest.py (rewritten in Phase 4).
     _apply_nlpar_cpu = _apply_nlpar_pyebsdindex
 
-    def _restore_excluded_output(self, excl, target):
+    def _restore_excluded_output(self, excl, target, offset=0):
         """Put the ORIGINAL patterns back at the excluded positions of the NLPAR batch
         result, so that patterns outside the IQ range stay in the data set unprocessed
         (they were served to the kernel as constant patterns, whose output is meaningless).
-        `target` is the in-RAM result array or the path of the result file."""
+        `target` is the in-RAM result array or the path of the result file; `excl` is indexed
+        by pattern number, and an array `target` starting at pattern `offset` (a chunk of
+        save_processed) gets pattern p at target[p - offset]."""
         idx = np.flatnonzero(excl)
         if idx.size == 0:
             return
@@ -2167,7 +2371,7 @@ class MainWindow(QMainWindow):
             p0, n = int(run[0]), int(run.size)
             orig = self._read_patterns(self.f_orig, p0, n)
             if fobj is None:
-                target[p0:p0 + n] = orig
+                target[p0 - offset:p0 - offset + n] = orig
             else:
                 fobj.write_data(newpatterns=np.ascontiguousarray(orig, dtype=fobj.filedatatype),
                                 patStartCount=[p0, n], writeHead=False)
@@ -2178,6 +2382,7 @@ class MainWindow(QMainWindow):
         the extension, so a .up2 source is always written as a .up2. The GUI side (checks,
         file dialog, final message box) lives here; the work is save_processed (v1.7.0)."""
         if self.f_orig is None: QMessageBox.warning(self, "Error", "Load a UP1/UP2 file first"); return
+        if self._refuse_while_busy("Apply && Save"): return
         if self.nlpar_chk.isChecked() and self.f_nlpar is None:
             QMessageBox.information(self, "NLPAR not applied to full dataset",
                 "Need to apply NLPAR to the full dataset before saving.\n\n"
@@ -2241,13 +2446,13 @@ class MainWindow(QMainWindow):
         t0 = time.time()
         mask = self._get_iq_mask()
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        # Determine source file object
+        # Determine source file object. (NLPAR checked without a batch result was refused
+        # above, so the on-demand NLPAR preview never stands in for a file.)
         src_fobj = self.f_nlpar if self.f_nlpar is not None else self.f_orig
         src_label = "NLPAR" if self.f_nlpar else "Original"
         use_npar = self.npar_chk.isChecked() and self.f_nlpar is None
-        use_nlpar_od = self.nlpar_chk.isChecked() and self.f_nlpar is None
-        if use_npar: src_label = "NPAR"
-        if use_nlpar_od: src_label = "NLPAR(on-demand)"
+        npar_radius = int(self.npar_radius_spin.value())
+        if use_npar: src_label = f"NPAR (radius {npar_radius})"
         if HAS_GPU:
             pat_bytes = ph * pw * 4  # float32 on GPU
             mem_per_row = 3 * self.ncols * pat_bytes  # chunk + gaussian intermediates
@@ -2270,7 +2475,8 @@ class MainWindow(QMainWindow):
         # The CPU path holds more at its peak: on top of those, _cpu_pipeline_threaded's
         # float64 `out` (8), each sub-batch's `result = sub.copy()` (8 over the chunk) and
         # the np.where / gaussian_filter temporaries (~8-16) ≈ 42 B/px (2026-10-10).
-        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows(18 if HAS_GPU else 42))
+        # NPAR adds its float64 accumulator over the chunk (8) while the native halo is alive.
+        CHUNK_ROWS = min(CHUNK_ROWS, self._host_chunk_rows((18 if HAS_GPU else 42) + (8 if use_npar else 0)))
         # ---- Output size: exactly the patterns the source has (2026-09-28) ----
         # A map that was stopped early has fewer patterns in the .up1 than nCols*nRows
         # in its header (OIM writes it that way). The header keeps the full grid so OIM
@@ -2301,6 +2507,14 @@ class MainWindow(QMainWindow):
         out_obj = ebsd_pattern.get_pattern_file_obj(path)   # reads the header we just wrote
         mask_flat = mask.reshape(-1)
         n_saved = 0
+
+        def full_rows(r0, n):
+            """Processing-source patterns of the full rows [r0, r0+n): NPAR-averaged when the
+            NPAR box is on (finding 2), else as they are in the source."""
+            if use_npar:
+                return self._npar_rows(src_fobj, r0, n, mask, npar_radius)
+            return self._read_rows(src_fobj, r0, n)
+
         for row_start in range(0, n_rows_out, CHUNK_ROWS):
             if cancel is not None and cancel():
                 # Between chunks: drop the partial output (header + the chunks so far, the
@@ -2317,14 +2531,14 @@ class MainWindow(QMainWindow):
             p0 = row_start * ncols
             p1 = min((row_start + rows_to_read) * ncols, n_out)
             if p1 <= n_full_rows * ncols:
-                chunk = self._read_rows(src_fobj, row_start, rows_to_read)
+                chunk = full_rows(row_start, rows_to_read)
             else:
                 # Chunk ends in the partial row. Full rows come from the processing source;
                 # the partial row's patterns come from the original file (the NLPAR batch
                 # result has zeros there because pyebsdindex only processed whole rows).
                 parts = []
                 if p0 < n_full_rows * ncols:
-                    parts.append(self._read_rows(src_fobj, row_start, n_full_rows - row_start))
+                    parts.append(full_rows(row_start, n_full_rows - row_start))
                 q0 = max(p0, n_full_rows * ncols)
                 parts.append(self._read_patterns(self.f_orig, q0, p1 - q0))
                 chunk = parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
@@ -2340,7 +2554,15 @@ class MainWindow(QMainWindow):
                     f"Saving: processing row {frac_rows:.0f}/{n_rows_out} "
                     f"({100.0 * frac_rows / n_rows_out:.0f}%, {el:.0f}s elapsed, ETA {eta:.0f}s)")
                 QApplication.processEvents()
-            chunk = self._process_chunk_batch(chunk.astype(np.float64), mask_rows, progress=chunk_progress)
+            chunk = self._process_chunk_batch(np.asarray(chunk, dtype=np.float64), mask_rows, progress=chunk_progress)
+            if (src_fobj is not self.f_orig or use_npar) and not mask_rows.all():
+                # The chunk was not the original: the NLPAR result (NLPAR'd at the points that
+                # left the IQ range only after the batch ran; finding 4) or the NPAR average.
+                # _process_chunk_batch put the excluded patterns back as they came IN, so the
+                # promise "outside the IQ range: kept unprocessed", which the preview shows,
+                # needs them from the original file.
+                excl = np.zeros(n_out, dtype=bool); excl[p0:p1] = ~mask_rows
+                self._restore_excluded_output(excl, chunk, offset=p0)
             n_saved += int(mask_rows.sum())
             self.statusBar().showMessage(f"Saving: writing rows {row_start + 1}-{row_start + rows_to_read} of {n_rows_out} to disk...")
             QApplication.processEvents()
@@ -2685,7 +2907,7 @@ class MainWindow(QMainWindow):
         self.aperture_thresh_spin.setSingleStep(0.01)
         self.aperture_thresh_spin.setDecimals(3)
         self.aperture_thresh_spin.setToolTip("Auto-detect threshold as fraction of 95th-percentile pixel std")
-        self.aperture_thresh_spin.valueChanged.connect(lambda *_: self._on_aperture_changed())
+        self.aperture_thresh_spin.valueChanged.connect(lambda *_: self._on_aperture_thresh_changed())
         gl.addRow("Threshold:", self.aperture_thresh_spin)
         b_show_mask = QPushButton("Show detected mask")
         b_show_mask.clicked.connect(self.show_aperture_mask)

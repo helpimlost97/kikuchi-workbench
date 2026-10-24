@@ -99,11 +99,14 @@ clearly worth it, to be discussed later. Homebrew inventory in the viewer and it
   engine it was aligned with; edge pixels may differ (documented).
 
 ### Phase 3: features pyebsdindex lacks  (DONE 2026-10-13, v1.6.0.dev3)
-- IQ-range exclusion, implemented without changing pyebsdindex and with the legacy
-  semantics (excluded patterns neither averaged nor used as neighbours): the input file
-  object serves excluded patterns as zeros (`exclude` flag on RamUPFile / MaskedUPFile)
-  and their sigma is 0 in the array handed to calcnlpar, so their weight is exp(-huge) = 0;
-  outputs at excluded positions are zeroed explicitly. No upstream patch needed for this.
+- IQ-range exclusion, implemented without changing pyebsdindex (excluded patterns are
+  neither averaged nor used as neighbours): the input file object serves excluded
+  patterns as constant patterns of value 1 (`exclude` flag on RamUPFile / MaskedUPFile;
+  not 0, which the OpenCL path treats as a failed tile) and their sigma is 0 in the array
+  handed to calcnlpar, so their weight is exp(-huge) = 0. Their own output is replaced
+  by the original pattern afterwards (`_restore_excluded_output`), so they stay in the
+  data set unprocessed and can still be indexed (changed from zeroing on 2026-10-19).
+  No upstream patch needed for this.
 - Borders: pyebsdindex behaviour accepted and documented (numba shifts inward, OpenCL
   mirrors). Preview keeps zero-pad.
 - `saturation_protect` and `dthresh` exposed in the NLPAR panel with pyebsdindex
