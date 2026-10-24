@@ -20,21 +20,27 @@ With rows 3 and cols 40 a 115 x 115 px tile is 1.6 MB, so the sample of a 12-til
 pattern files fits comfortably in the git repository. Requires h5py and numpy.
 """
 import argparse
-import re
 import shutil
 import struct
-import sys
+import uuid
 from pathlib import Path
 
 import h5py
 import numpy as np
 
 
+def _is_map(obj) -> bool:
+    """True for a map group of an APEX project (attribute ``GroupType`` 3, one map per montage tile)."""
+    # APEX stores scalars as length-1 arrays; numpy 2 refuses int() on those, hence the reshape
+    return isinstance(obj, h5py.Group) and int(np.asarray(obj.attrs.get("GroupType", -1)).reshape(-1)[0]) == 3
+
+
 def map_groups(f: h5py.File) -> list[str]:
+    """The paths of every map group of the project, in file order."""
     out = []
 
     def visit(name, obj):
-        if isinstance(obj, h5py.Group) and int(np.asarray(obj.attrs.get("GroupType", -1))) == 3:
+        if _is_map(obj):
             out.append(name)
 
     f.visititems(visit)
@@ -42,12 +48,15 @@ def map_groups(f: h5py.File) -> list[str]:
 
 
 def copy_attrs(src, dst):
+    """Copy every attribute of ``src`` to ``dst``. Attributes whose name starts with ``User`` (user names,
+    stored by APEX as strings or string arrays) are blanked: empty strings of the same shape, zeros for
+    numbers. An attribute h5py refuses to write is reported and skipped, never fatal."""
     for k, v in src.attrs.items():
         if k.startswith("User"):
             a = np.asarray(v)
             if isinstance(v, (str, bytes)):
                 v = ""
-            elif a.dtype.kind in "OSU":  # APEX stores user names as string arrays: blank strings of the same shape
+            elif a.dtype.kind in "OSU":
                 v = np.array([""] * a.size, dtype=h5py.string_dtype()).reshape(a.shape)
             else:
                 v = np.zeros_like(a)
@@ -58,21 +67,32 @@ def copy_attrs(src, dst):
 
 
 def crop_table(data: np.ndarray, n_cols: int, rows: int, cols: int) -> np.ndarray:
-    """First `rows` x `cols` entries of a row-major (n_rows x n_cols) per-pattern table."""
+    """First `rows` x `cols` entries of a row-major (n_rows x n_cols) per-pattern table, as a (rows x cols,)
+    table in the same order."""
     idx = (np.arange(rows)[:, None] * n_cols + np.arange(cols)[None, :]).ravel()
     return data[idx]
 
 
 def copy_cropped(src: h5py.Group, dst: h5py.Group, grid: tuple[int, int] | None, rows: int, cols: int):
-    """Copy src into dst. grid = (n_rows, n_cols) of the map this group belongs to, None outside maps."""
+    """Copy the group ``src`` into ``dst`` recursively, cropping every map to its first ``rows`` x ``cols``.
+
+    ``grid`` is (n_rows, n_cols) of the map this group belongs to, None outside maps; it is picked up from
+    ``Sample/Number Of Rows|Columns`` when a map group is entered, and the map's original grid is kept in its
+    ``SampleOriginalRows`` / ``SampleOriginalCols`` attributes (-1 when it has none). Inside a map,
+    ``Sample/Number Of Rows|Columns`` are set to the cropped size, a dataset with exactly n_rows x n_cols
+    entries (an orientation table, a per-pattern image) keeps the cropped grid's entries, and any other dataset
+    over 4 MB keeps its first rows x cols elements. Scalars keep their length-1 shape and dtype. Datasets over
+    64 kB are gzip compressed. Attributes are copied with :func:`copy_attrs`.
+    """
     for name, obj in src.items():
         if isinstance(obj, h5py.Group):
             g = dst.create_group(name)
             copy_attrs(obj, g)
             this_grid = grid
-            if int(np.asarray(obj.attrs.get("GroupType", -1))) == 3:
+            if _is_map(obj):
                 try:
-                    this_grid = (int(obj["Sample/Number Of Rows"][()]), int(obj["Sample/Number Of Columns"][()]))
+                    this_grid = (int(np.asarray(obj["Sample/Number Of Rows"][()]).reshape(-1)[0]),
+                                 int(np.asarray(obj["Sample/Number Of Columns"][()]).reshape(-1)[0]))
                 except KeyError:
                     this_grid = None
                     print(f"  {obj.name}: no Sample/Number Of Rows|Columns, datasets only truncated")
@@ -83,10 +103,9 @@ def copy_cropped(src: h5py.Group, dst: h5py.Group, grid: tuple[int, int] | None,
         data = obj[()]
         if obj.shape == () or obj.size <= 1:
             # APEX stores every scalar as a length-1 array; keep the shape and dtype
-            if grid is not None and name == "Number Of Rows" and src.name.endswith("/Sample"):
-                data = np.full_like(np.asarray(data), min(rows, grid[0]))
-            elif grid is not None and name == "Number Of Columns" and src.name.endswith("/Sample"):
-                data = np.full_like(np.asarray(data), min(cols, grid[1]))
+            if grid is not None and src.name.endswith("/Sample") and name in ("Number Of Rows", "Number Of Columns"):
+                keep = min(rows, grid[0]) if name == "Number Of Rows" else min(cols, grid[1])
+                data = np.full_like(np.asarray(data), keep)
             d = dst.create_dataset(name, data=data)
         else:
             n = obj.shape[0]
@@ -99,6 +118,15 @@ def copy_cropped(src: h5py.Group, dst: h5py.Group, grid: tuple[int, int] | None,
 
 
 def crop_pattern_file(src: Path, dst: Path, rows: int, cols: int):
+    """Write the first ``rows`` x ``cols`` patterns of the .up1/.up2 file ``src`` to ``dst``.
+
+    The header (version, pattern size, data offset at bytes 0:16; n_cols, n_rows at 17:25; the GUID at 42:58 in
+    version 4) is copied byte for byte up to the data offset, and only n_cols / n_rows are patched to the
+    cropped grid, so the file keeps its GUID and links to the cropped project. The patterns are read row by row
+    from the source grid (row-major, width x height x 1 or 2 bytes each). Prints one line per file. Returns the
+    GUID as a string ("" for a header without one), or None for a header before version 3, which has no grid
+    and is skipped.
+    """
     with open(src, "rb") as f:
         head = f.read(64)
         version, w, h, offset = struct.unpack_from("<IIII", head, 0)
@@ -119,14 +147,14 @@ def crop_pattern_file(src: Path, dst: Path, rows: int, cols: int):
                 g.write(f.read(keep_c * pat))
     guid = ""
     if offset >= 58:
-        import uuid
-
         guid = str(uuid.UUID(bytes_le=bytes(header[42:58])))
     print(f"  {src.name}: v{version} {w}x{h} px, {n_cols}x{n_rows} -> {keep_c}x{keep_r}, GUID {guid or '-'}")
     return guid
 
 
 def main():
+    """Command line (see the module docstring): write the cropped project, the cropped pattern files and a copy
+    of every .ang next to them into --out."""
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("edaxh5")
     ap.add_argument("--out", required=True, help="output folder (created)")
@@ -155,7 +183,8 @@ def main():
     for extra in pat_dir.glob("*.ang"):
         shutil.copy(extra, out / extra.name)
         print(f"  copied {extra.name}")
-    print(f"\nDone. Add the folder to the repository:\n  git add \"{out}\"\n  git commit -m \"Montage sample\"\n  git push")
+    print(f"\nDone. Add the folder to the repository:\n  git add \"{out}\"\n  git commit -m \"Montage sample\"\n"
+          "  git push")
 
 
 if __name__ == "__main__":

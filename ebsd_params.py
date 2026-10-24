@@ -52,9 +52,13 @@ Note: pattern pixel size (binning/pattern resolution) is NOT stored in either an
 (.up1/.up2) header instead. A pattern processor, or EMSphInx's EBSPDims utility,
 will report it from the .up1/.up2 file directly.
 """
-import sys, os, re, argparse, struct
+import argparse
+import os
+import re
+import struct
+import sys
 
-try:  # only needed for .edaxh5 files
+try:  # only needed for .edaxh5 files; .ang files and .up1 headers need the standard library only
     import h5py
     import numpy as np
 except ImportError:
@@ -62,22 +66,35 @@ except ImportError:
     np = None
 
 # ----------------------------------------------------------------------------
-# .edaxh5 support (unchanged from edaxh5_params.py)
+# .edaxh5 support
 # ----------------------------------------------------------------------------
 
+# the sections of a map group printed for indexing, in this order
 SECTIONS = ["Camera", "Column", "Sample", "EBSD/ANG/HEADER", "EBSD/OHP/HEADER"]
+# datasets and groups whose name contains one of these are large tables or images: shown as shape/dtype only
 SKIP = ("HKL Families", "DATA", "Annotations", "Images", "FOVIMAGE")
 
 def fmt(v):
+    """A dataset value as text: a scalar (APEX stores scalars as length-1 arrays) or a short list as is,
+    bytes decoded, anything with more than 12 elements as ``<shape dtype>``."""
     v = np.asarray(v)
-    if v.dtype.kind in "SO":
-        v = np.char.decode(v.astype("S"), errors="replace") if v.dtype.kind == "S" else v
+    if v.dtype.kind == "S":
+        v = np.char.decode(v, errors="replace")
     if v.size == 1:
         v = v.reshape(-1)[0]
         return v.decode(errors="replace") if isinstance(v, bytes) else str(v)
     if v.size <= 12:
-        return "[" + ", ".join(str(x.decode(errors="replace") if isinstance(x, bytes) else x) for x in v.reshape(-1)) + "]"
+        return "[" + ", ".join(str(x.decode(errors="replace") if isinstance(x, bytes) else x)
+                               for x in v.reshape(-1)) + "]"
     return f"<{v.shape} {v.dtype}>"
+
+def _ebsd_map_groups(f):
+    """The paths of every EBSD map group of an open .edaxh5 file, in file order: a group whose own name
+    contains " Map" ("OIM Map 1", "EBSD+EDS Map 2", ...) and which holds an ``EBSD`` group."""
+    maps = []
+    f.visititems(lambda n, o: maps.append(n)
+                 if isinstance(o, h5py.Group) and " Map" in n.split("/")[-1] and "EBSD" in o else None)
+    return maps
 
 def read_up_dims(path):
     """(width, height) in pixels of the patterns of a .up1/.up2 file (from its header)."""
@@ -87,7 +104,12 @@ def read_up_dims(path):
 def read_up_header(path):
     """Header of an EDAX .up1/.up2 file as a dict: version, pattern_width, pattern_height,
     offset, n_patterns, size_gb and, for version 3 and later, n_cols, n_rows, grid, step_x,
-    step_y. Version 1 files store neither the map size nor the step size."""
+    step_y. Version 1 files store neither the map size nor the step size.
+
+    Little-endian layout: version, width, height and data offset as uint32 at bytes 0:16; from version 3 on
+    n_cols and n_rows (uint32) at 17:25, the hexagonal-grid flag (uint8) at 25 and the steps in um (float64)
+    at 26:42. n_patterns is what the file size holds after the offset, not the grid; size_gb is the file size
+    in GB. Raises OSError when the file cannot be read, struct.error when it is shorter than its header."""
     path = os.path.expanduser(str(path))
     itemsize = 2 if path.lower().endswith(".up2") else 1
     size = os.path.getsize(path)
@@ -106,17 +128,21 @@ def read_up_header(path):
     return info
 
 def pattern_size(a):
-    """(W, H) from --px or --up1, or None."""
+    """(W, H) in pixels from the parsed arguments: ``--px W[xH]`` (H defaults to W), else the ``--up1`` header,
+    else None. Raises ValueError for a ``--px`` that is not a number."""
     if a.px:
         parts = a.px.lower().replace("×", "x").split("x")
-        w = int(parts[0]); h = int(parts[1]) if len(parts) > 1 and parts[1] else w
+        w = int(parts[0])
+        h = int(parts[1]) if len(parts) > 1 and parts[1] else w
         return w, h
     if a.up1:
         return read_up_dims(a.up1)
     return None
 
 def print_pattern_center(xs, ys, zs, a, indent="  "):
-    """Print the EDAX pattern center and, if the pattern size is known, the EMsoft one."""
+    """Print the EDAX pattern center (x*, y*, z*) and, when the pattern size is known from the arguments, the
+    EMsoft one: xpc = W (x* - 1/2), ypc = W y* - H/2 in pixels and L = W delta z* in um, with delta (um per
+    pattern pixel) from ``--delta`` or ``--det-mm`` (detector width in mm) / W."""
     print(f"{indent}EDAX   x* = {xs:.6f}   y* = {ys:.6f}   z* = {zs:.6f}")
     dims = pattern_size(a)
     if dims is None:
@@ -125,24 +151,34 @@ def print_pattern_center(xs, ys, zs, a, indent="  "):
     W, H = dims
     delta = a.delta if a.delta else a.det_mm * 1000.0 / W
     src = f"--delta {a.delta:g}" if a.delta else f"--det-mm {a.det_mm:g} / {W} px"
-    xpc = W * (xs - 0.5); ypc = W * ys - H / 2.0; L = W * delta * zs
+    xpc = W * (xs - 0.5)
+    ypc = W * ys - H / 2.0
+    L = W * delta * zs
     print(f"{indent}EMsoft xpc = {xpc:.3f} px   ypc = {ypc:.3f} px   L = {L:.1f} um"
           f"   [{W}x{H} px, delta = {delta:.4f} um/px from {src}]")
 
 def dump_group(g, indent, out):
+    """Append one line per dataset of ``g`` (recursively, subgroups as ``[name]`` blocks) to the list ``out``:
+    ``name = value``, or ``name: <shape dtype>`` for the large datasets named in SKIP, which are not read."""
     for k in sorted(g.keys()):
-        if any(s in k for s in SKIP):
-            obj = g[k]
-            if isinstance(obj, h5py.Dataset): out.append(f"{indent}{k}: <{obj.shape} {obj.dtype}>")
-            continue
         obj = g[k]
+        if any(s in k for s in SKIP):
+            if isinstance(obj, h5py.Dataset):
+                out.append(f"{indent}{k}: <{obj.shape} {obj.dtype}>")
+            continue
         if isinstance(obj, h5py.Group):
-            out.append(f"{indent}[{k}]"); dump_group(obj, indent + "  ", out)
+            out.append(f"{indent}[{k}]")
+            dump_group(obj, indent + "  ", out)
         else:
-            try: out.append(f"{indent}{k} = {fmt(obj[()])}")
-            except Exception as e: out.append(f"{indent}{k} = <unreadable: {e}>")
+            try:
+                out.append(f"{indent}{k} = {fmt(obj[()])}")
+            except Exception as e:
+                out.append(f"{indent}{k} = <unreadable: {e}>")
 
 def run_edaxh5(a):
+    """The command-line report of a .edaxh5 file: with ``--all`` every dataset of the file, raw; otherwise the
+    sections of every EBSD map (filtered by ``--map``) and its pattern center. Exits with a message when h5py is
+    missing or no map matches."""
     if h5py is None:
         sys.exit("h5py and numpy are needed to read .edaxh5 files: python -m pip install h5py numpy")
     with h5py.File(a.file, "r") as f:
@@ -150,29 +186,38 @@ def run_edaxh5(a):
             def walk(name, obj):
                 if isinstance(obj, h5py.Dataset):
                     print(f"{name} = {fmt(obj[()]) if obj.size <= 12 else f'<{obj.shape} {obj.dtype}>'}")
-            f.visititems(walk); return
-        maps = []
-        # any map group holding an EBSD section ("OIM Map N", "EBSD+EDS Map N", ...)
-        f.visititems(lambda n, o: maps.append(n) if isinstance(o, h5py.Group) and " Map" in n.split("/")[-1] and "EBSD" in o else None)
-        if a.map: maps = [m for m in maps if a.map.lower() in m.lower()]
-        if not maps: sys.exit(f"no EBSD map groups found{' matching ' + repr(a.map) if a.map else ''} in {a.file}")
+            f.visititems(walk)
+            return
+        maps = _ebsd_map_groups(f)
+        if a.map:
+            maps = [m for m in maps if a.map.lower() in m.lower()]
+        if not maps:
+            sys.exit(f"no EBSD map groups found{' matching ' + repr(a.map) if a.map else ''} in {a.file}")
         for m in maps:
-            print("=" * 100); print(m); print("=" * 100)
+            print("=" * 100)
+            print(m)
+            print("=" * 100)
             g = f[m]
             # small datasets directly under the map (pattern dims, binning, etc. if present)
             out = []
             for k in sorted(g.keys()):
                 if isinstance(g[k], h5py.Dataset) and not any(s in k for s in SKIP):
                     out.append(f"  {k} = {fmt(g[k][()])}")
-            if out: print("\n".join(out))
+            if out:
+                print("\n".join(out))
             for sec in SECTIONS:
                 if sec in g:
-                    print(f"--- {sec}"); out = []; dump_group(g[sec], "  ", out); print("\n".join(out))
+                    print(f"--- {sec}")
+                    out = []
+                    dump_group(g[sec], "  ", out)
+                    print("\n".join(out))
             pc = "EBSD/ANG/HEADER/Pattern Center Calibration"
             if pc in g:
                 try:
-                    xs, ys, zs = (float(np.asarray(g[pc][k][()]).reshape(-1)[0]) for k in ("X-Star", "Y-Star", "Z-Star"))
-                    print("--- Pattern center"); print_pattern_center(xs, ys, zs, a)
+                    xs, ys, zs = (float(np.asarray(g[pc][k][()]).reshape(-1)[0])
+                                  for k in ("X-Star", "Y-Star", "Z-Star"))
+                    print("--- Pattern center")
+                    print_pattern_center(xs, ys, zs, a)
                 except Exception as e:
                     print(f"--- Pattern center: <unreadable: {e}>")
             print()
@@ -189,12 +234,13 @@ ANG_TOP_LEVEL_KEYS = [
 ]
 ANG_PHASE_KEYS = ["MaterialName", "Formula", "Info", "Symmetry", "LatticeConstants", "NumberFamilies"]
 
+# a header line after the '#': the key, then whatever follows (possibly nothing)
 _KV_RE = re.compile(r"^(\S+)\s*(.*)$")
 
 def _parse_ang_header_line(stripped):
-    """stripped is a '#' header line with the leading '#' and surrounding
+    """(key, value) of a '#' header line with the leading '#' and surrounding
     whitespace already removed. Handles both 'KEY value' and 'KEY: value'
-    forms, and keys with no value at all. Never raises."""
+    forms, and keys with no value at all (value ""). Never raises."""
     m = _KV_RE.match(stripped)
     if not m:
         return stripped, ""
@@ -203,9 +249,11 @@ def _parse_ang_header_line(stripped):
     return key, value
 
 def parse_ang(path):
-    """Stream-parses an .ang file: header lines ('#'-prefixed) are parsed into
-    top-level params / Phase blocks / an 'other' catch-all; data rows are only
-    counted, never loaded, so this is safe on a 10+ MB data section."""
+    """Stream-parse an .ang file. Returns (top, phases, other, n_data_rows): the top-level header values by key
+    of ANG_TOP_LEVEL_KEYS (as strings), one dict per Phase block (its "number" and the ANG_PHASE_KEYS, None when
+    absent), the header lines recognized as neither ("key: value" strings) and the count of data rows. Keys are
+    matched case insensitively. Data rows are only counted, never loaded, so this is safe on a 10+ MB data
+    section. Raises OSError when the file cannot be read."""
     top = {}
     phases = []
     other = []
@@ -257,6 +305,8 @@ def parse_ang(path):
     return top, phases, other, n_data_rows
 
 def run_ang(a):
+    """The command-line report of an .ang file: the top-level header values in a fixed order, the pattern
+    center, every Phase block, the number of data rows and the header lines not recognized."""
     if a.map or a.all:
         print("note: --map/--all only apply to .edaxh5 files; ignoring for .ang input", file=sys.stderr)
     top, phases, other, n_data_rows = parse_ang(a.file)
@@ -269,9 +319,12 @@ def run_ang(a):
     print()
     try:
         xs, ys, zs = (float(top[k]) for k in ("x-star", "y-star", "z-star"))
-        print("Pattern center"); print_pattern_center(xs, ys, zs, a); print()
+        print("Pattern center")
+        print_pattern_center(xs, ys, zs, a)
+        print()
     except (KeyError, ValueError):
-        print("Pattern center: x-star/y-star/z-star not found in header"); print()
+        print("Pattern center: x-star/y-star/z-star not found in header")
+        print()
 
     if phases:
         for ph in phases:
@@ -303,17 +356,21 @@ SCAN_INFO_KEYS = [
 ]
 
 def _to_float(value):
+    """The first word of ``value`` as a float ("2.0 um" -> 2.0), None when there is none or it is not a number."""
     try:
         return float(str(value).split()[0])
     except (ValueError, IndexError, TypeError):
         return None
 
 def _to_int(value):
+    """:func:`_to_float` truncated to an int, None when it is None."""
     number = _to_float(value)
     return None if number is None else int(number)
 
 def _scan_info_ang(path, info):
-    top, phases, other, n_data_rows = parse_ang(path)
+    """Fill the scan-file keys of ``info`` (see :func:`scan_info`) from an .ang header. Only NCOLS_ODD is taken
+    as the column count. A note is added when the file looks like an EMSphInx result rather than the acquisition's."""
+    top, phases, _, _ = parse_ang(path)
     pc = tuple(_to_float(top.get(k)) for k in ("x-star", "y-star", "z-star"))
     info["pc"] = None if None in pc else pc
     info["working_distance"] = _to_float(top.get("WorkingDistance"))
@@ -330,19 +387,26 @@ def _scan_info_ang(path, info):
         info["notes"].append("this .ang looks like an indexing result (EMSphInx), not the one from data collection")
 
 def _scan_info_edaxh5(path, info, map_filter):
-    """Best effort: the pattern center is read from its known place, everything else is looked up by name."""
+    """Fill the scan-file keys of ``info`` (see :func:`scan_info`) from the first EBSD map of a .edaxh5 file
+    whose path contains ``map_filter`` (case insensitive; every map when None).
+
+    Best effort: the pattern center is read from its known place
+    (``EBSD/ANG/HEADER/Pattern Center Calibration/X-Star|Y-Star|Z-Star``), the phases from
+    ``EBSD/ANG/HEADER/Phase/<n>/Material Name``; everything else is looked up by dataset name, ignoring case,
+    spaces and underscores, in the sections EBSD/ANG/HEADER, Sample, Camera and Column (first hit wins), and a
+    note says so. Raises ImportError without h5py."""
     if h5py is None:
         raise ImportError("h5py and numpy are needed to read .edaxh5 files")
     with h5py.File(path, "r") as f:
-        maps = []
-        f.visititems(lambda n, o: maps.append(n) if isinstance(o, h5py.Group) and " Map" in n.split("/")[-1] and "EBSD" in o else None)
+        maps = _ebsd_map_groups(f)
         if map_filter:
             maps = [m for m in maps if map_filter.lower() in m.lower()]
         if not maps:
             info["notes"].append("no EBSD map groups found" + (f" matching {map_filter!r}" if map_filter else ""))
             return
         if len(maps) > 1:
-            info["notes"].append(f"{len(maps)} maps in the file, using the first; choose one with the map filter: " + "; ".join(maps))
+            info["notes"].append(f"{len(maps)} maps in the file, using the first; choose one with the map filter: "
+                                 + "; ".join(maps))
         g = f[maps[0]]
         info["map"] = maps[0]
 
@@ -389,12 +453,14 @@ def _scan_info_edaxh5(path, info, map_filter):
         info["n_rows"] = _to_int(lookup("numberofrows", "nrows"))
         grid = lookup("gridtype", "grid")
         info["grid"] = None if grid is None else str(grid)
-        # Phases: EBSD/ANG/HEADER/Phase/<n>/Material Name
         phase_group = "EBSD/ANG/HEADER/Phase"
         if phase_group in g:
+            # the keys are the phase numbers: numeric order, "10" after "9"; non-numeric keys last
             names = sorted(g[phase_group].keys(), key=lambda s: (not s.isdigit(), int(s) if s.isdigit() else s))
-            info["phases"] = [scalar(g[phase_group][k]["Material Name"]) for k in names if "Material Name" in g[phase_group][k]]
-        info["notes"].append("values other than the pattern center were looked up by name in the .edaxh5 file; check them")
+            info["phases"] = [scalar(g[phase_group][k]["Material Name"]) for k in names
+                              if "Material Name" in g[phase_group][k]]
+        info["notes"].append("values other than the pattern center were looked up by name in the .edaxh5 file; "
+                             "check them")
 
 def scan_info(scan_file=None, pattern_file=None, map_filter=None):
     """Acquisition parameters of a scan as a dict with the keys SCAN_INFO_KEYS (None = unknown).
@@ -403,8 +469,12 @@ def scan_info(scan_file=None, pattern_file=None, map_filter=None):
     pattern_file  .up1/.up2 pattern file, or None; gives the pattern width and height
     map_filter    .edaxh5 only: part of the name of the map to use
 
-    The pattern center "pc" is (x*, y*, z*) in the EDAX convention. The map size and step size
-    are those of the pattern file when it stores them (version 3 and later), else of the scan file.
+    The pattern center "pc" is (x*, y*, z*) in the EDAX convention; the tilts are in degrees, the
+    working distance in mm, the steps in um, "grid" is "SqrGrid" or "HexGrid". The map size and
+    step size are those of the pattern file when it stores them (version 3 and later; then
+    "up_has_map_size" is True), else of the scan file. "notes" lists what to check (a map size that
+    differs between the files, values looked up by name, an unknown extension). Raises OSError when
+    a file cannot be read, ImportError for a .edaxh5 without h5py.
     """
     info = dict.fromkeys(SCAN_INFO_KEYS)
     info["notes"] = []
@@ -438,7 +508,8 @@ def scan_info(scan_file=None, pattern_file=None, map_filter=None):
                 if None not in scan_size and scan_size != (up["n_cols"], up["n_rows"]):
                     info["notes"].append(
                         f"the map size of the scan file ({scan_size[0]} x {scan_size[1]}) differs from the one of the "
-                        f"pattern file ({up['n_cols']} x {up['n_rows']}); are they from the same scan? Using the pattern file's"
+                        f"pattern file ({up['n_cols']} x {up['n_rows']}); are they from the same scan? "
+                        "Using the pattern file's"
                     )
                 for k in ("n_cols", "n_rows", "grid", "step_x", "step_y"):
                     info[k] = up[k]
@@ -447,7 +518,8 @@ def scan_info(scan_file=None, pattern_file=None, map_filter=None):
     return info
 
 def print_scan_info(info):
-    """Print the dict returned by scan_info()."""
+    """Print the dict returned by scan_info() as the labelled summary the workbench shows: pattern file, scan
+    file, map size and step, then every note as an "NB!" line."""
     def show(label, value, unit=""):
         print(f"  {label:<26}{'(not found)' if value is None else str(value) + unit}")
 
@@ -473,7 +545,8 @@ def print_scan_info(info):
     else:
         print("Scan file: none given")
     print()
-    print("Map" + (" (from the pattern file)" if info.get("up_has_map_size") else " (from the scan file)" if info.get("n_cols") else ""))
+    print("Map" + (" (from the pattern file)" if info.get("up_has_map_size")
+                   else " (from the scan file)" if info.get("n_cols") else ""))
     size = None if info.get("n_cols") is None else f"{info['n_cols']} x {info['n_rows']}"
     show("Columns x rows:", size)
     show("Grid:", info.get("grid"))
@@ -485,6 +558,7 @@ def print_scan_info(info):
 # ----------------------------------------------------------------------------
 
 def main():
+    """Command line (see the module docstring): the report of one .ang or .edaxh5 file, chosen by extension."""
     # Windows consoles are often not UTF-8: never fail on a character they cannot show
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -495,10 +569,15 @@ def main():
     ap.add_argument("file")
     ap.add_argument("--map", default=None, help="substring filter on the map path (.edaxh5 only)")
     ap.add_argument("--all", action="store_true", help="dump every small dataset in the file, raw (.edaxh5 only)")
-    ap.add_argument("--px", default=None, metavar="W[xH]", help="pattern size in pixels, e.g. 115 or 479x479 (enables the EMsoft pattern center)")
-    ap.add_argument("--up1", default=None, metavar="FILE", help="read the pattern size from this .up1/.up2 header instead of --px")
-    ap.add_argument("--delta", type=float, default=None, metavar="UM", help="pixel size in um per pattern pixel (RKD: 55); overrides --det-mm")
-    ap.add_argument("--det-mm", type=float, default=30.0, metavar="MM", help="detector width in mm used to derive delta when --delta is absent (default 30 = Quattro EDAX detector)")
+    ap.add_argument("--px", default=None, metavar="W[xH]",
+                    help="pattern size in pixels, e.g. 115 or 479x479 (enables the EMsoft pattern center)")
+    ap.add_argument("--up1", default=None, metavar="FILE",
+                    help="read the pattern size from this .up1/.up2 header instead of --px")
+    ap.add_argument("--delta", type=float, default=None, metavar="UM",
+                    help="pixel size in um per pattern pixel (RKD: 55); overrides --det-mm")
+    ap.add_argument("--det-mm", type=float, default=30.0, metavar="MM",
+                    help="detector width in mm used to derive delta when --delta is absent "
+                         "(default 30 = Quattro EDAX detector)")
     a = ap.parse_args()
     a.file = os.path.expanduser(a.file)   # '~/...' inside quotes reaches us unexpanded
 
