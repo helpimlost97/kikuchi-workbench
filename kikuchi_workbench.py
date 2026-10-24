@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Kikuchi workbench: the Kikuchi Pattern Processor and GPU spherical indexing in one window.
 
-    python kikuchi_workbench.py                              # finds the pattern processor next to this folder
-    python kikuchi_workbench.py --processor-dir C:\\path\\to\\kikuchi-pattern-processor
+    python kikuchi_workbench.py
     python kikuchi_workbench.py --preset preset_RKD.txt      # start with the indexing settings of a preset file
     python kikuchi_workbench.py --no-processor               # the indexing and montage tabs only
-    set KPP_DIR=C:\\path\\to\\kikuchi-pattern-processor       # alternative to --processor-dir (Windows cmd)
 
 Three tabs:
 
-1. **Pattern processor**: the unchanged Kikuchi Pattern Processor (gpu_pattern_viewer.py of
-   https://github.com/helpimlost97/kikuchi-pattern-processor), imported from its own folder. Load a UP1/UP2,
+1. **Pattern processor**: the Kikuchi Pattern Processor (pattern_processor/gpu_pattern_viewer.py, which also
+   runs on its own as a stand-alone window). Load a UP1/UP2,
    set the aperture, IQ range, NLPAR and the processing chain as usual. "Apply && Save" still writes a file; the
    saved file is then offered to the indexing tab automatically.
 2. **Spherical indexing**: the settings of sph_core.Settings as a form. The patterns come from a
@@ -25,9 +23,7 @@ result, loading in the indexing tab unloads the processor. The long steps (loadi
 a worker thread (``Worker``) with their console output routed to the log pane; the GUI thread only refuses new
 actions while one runs.
 
-The processor's clone is looked for in ``--processor-dir``, then ``KPP_DIR``, then as ``kikuchi-pattern-processor``
-or ``kikuchi_pattern_processor`` inside this folder, next to it, in the current folder and in the home folder, and
-finally in this folder itself (``find_processor_dir``). Without it the indexing tab still works from files.
+The processor's own switches (``KPP_GPU=0``, ``KPP_THREADS``, ``KPP_IN_MEMORY``) apply inside the workbench too.
 
 Needs the environment of README.md (the kikuchipy fork, CuPy for the GPU) plus the pattern processor's packages
 (PyQt5, pyebsdindex, scipy, scikit-image).
@@ -59,48 +55,22 @@ import numpy as np  # noqa: E402
 # ----------------------------------------------------------------------------------------------
 
 
-def find_processor_dir(explicit: str | None = None) -> Path | None:
-    """The folder holding the pattern processor's gpu_pattern_viewer.py, or None.
+def import_processor():
+    """Import the pattern processor, ``pattern_processor/gpu_pattern_viewer.py``: (module, info) or (None, reason).
 
-    ``explicit`` (the --processor-dir option) is tried first, then the KPP_DIR environment variable, then
-    ``kikuchi-pattern-processor`` and ``kikuchi_pattern_processor`` inside this folder, next to it, in the current
-    folder and in the home folder, and finally this folder itself. The first candidate that holds the file wins.
+    Importing it prints what it found (GPU, threads) to the console and sets the numba thread count, which is why
+    it happens before Qt and before sph_core are imported. A failed import (a missing package, typically) leaves
+    the indexing and montage tabs working and shows the reason in place of the processor tab.
     """
-    candidates = []
-    if explicit:
-        candidates.append(Path(explicit))
-    if os.environ.get("KPP_DIR"):
-        candidates.append(Path(os.environ["KPP_DIR"]))
-    for base in (HERE, HERE.parent, Path.cwd(), Path.home()):
-        candidates.append(base / "kikuchi-pattern-processor")
-        candidates.append(base / "kikuchi_pattern_processor")
-    candidates.append(HERE)
-    for c in candidates:
-        if (c / "gpu_pattern_viewer.py").is_file():
-            return c.resolve()
-    return None
-
-
-def import_processor(directory: Path | None):
-    """Import gpu_pattern_viewer from ``directory``: (module, folder as text), or (None, reason).
-
-    The folder is put at the front of sys.path, so the processor's own helper modules import as well. Importing
-    the module prints what it found (GPU, threads) to the console; it is done before Qt starts for that reason.
-    """
-    if directory is None:
-        return None, ("kikuchi-pattern-processor not found: put it next to this folder, or pass --processor-dir / "
-                      "set KPP_DIR")
-    sys.path.insert(0, str(directory))
     try:
-        import gpu_pattern_viewer  # noqa: F401
+        from pattern_processor import gpu_pattern_viewer
 
-        return gpu_pattern_viewer, f"{directory}"
+        return gpu_pattern_viewer, f"pattern_processor v{gpu_pattern_viewer.__version__}"
     except Exception as e:  # noqa: BLE001
-        return None, f"could not import gpu_pattern_viewer.py from {directory}: {type(e).__name__}: {e}"
+        return None, f"could not import pattern_processor/gpu_pattern_viewer.py: {type(e).__name__}: {e}"
 
 
 _args = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-_args.add_argument("--processor-dir", default=None, help="folder of kikuchi-pattern-processor (gpu_pattern_viewer.py)")
 _args.add_argument("--preset", default=None, help="preset file (NAME = value lines) to start with")
 _args.add_argument("--no-processor", action="store_true", help="do not load the pattern processor tab")
 # parse_known_args: the scripts that import this module pass their own argv through untouched
@@ -109,7 +79,7 @@ ARGS, _ = _args.parse_known_args()
 if ARGS.no_processor:
     gpv, PROCESSOR_INFO = None, "pattern processor tab disabled (--no-processor)"
 else:
-    gpv, PROCESSOR_INFO = import_processor(find_processor_dir(ARGS.processor_dir))
+    gpv, PROCESSOR_INFO = import_processor()
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402

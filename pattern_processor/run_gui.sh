@@ -4,7 +4,7 @@
 # core count / memory / GPU there; the app sizes its thread pools and RAM budgets from
 # the allocation automatically).
 #
-#   bash /path/to/kikuchi-pattern-processor/run_gui.sh
+#   bash /path/to/gpu-accelerated-ebsd/pattern_processor/run_gui.sh
 #
 # Site-specific settings live in local/env.sh next to this script (git-ignored), e.g.:
 #   PYTHON_MODULE=python/3.12      # `module load` name, or empty if no modules

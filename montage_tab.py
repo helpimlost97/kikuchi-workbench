@@ -438,7 +438,7 @@ class MontageTab(QWidget):
             QMessageBox.information(self, "Busy", "Wait for the pattern processor's NLPAR step to finish")
             return
         if not hasattr(proc, "batch_process"):
-            QMessageBox.critical(self, "Pattern processor", "This pattern processor has no batch_process(): update the kikuchi-pattern-processor folder (git pull)")
+            QMessageBox.critical(self, "Pattern processor", "This pattern processor has no batch_process(): update the repository (git pull)")
             return
         all_tiles = self._raw_tiles()
         tiles = [t for t in all_tiles if t.ok]

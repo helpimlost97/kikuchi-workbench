@@ -1,8 +1,7 @@
 # GPU-accelerated spherical indexing of EBSD / RKD patterns
 
-The **Kikuchi workbench**: a PyQt5 GUI that puts the
-[Kikuchi Pattern Processor](https://github.com/helpimlost97/kikuchi-pattern-processor) and GPU
-spherical indexing in one window, with a third tab that runs both over every tile of an EDAX APEX
+The **Kikuchi workbench**: a PyQt5 GUI that puts the Kikuchi Pattern Processor (`pattern_processor/`,
+formerly its own repository) and GPU spherical indexing in one window, with a third tab that runs both over every tile of an EDAX APEX
 montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
 indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, which lives in his fork of kikuchipy;
 nothing of it is in upstream kikuchipy or on PyPI, so it is installed from a git clone (section 3).
@@ -21,6 +20,7 @@ only the path syntax in the examples changes.
 | `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/jwestraadt/kikuchipy, branch `develop`, pinned at commit `4c7a0035`, plus the local patches below. Installed in editable mode. |
 | `update_fork.py` | Clones or updates that clone, checks out the pinned commit, applies the patch and installs it, in one command. Also undoes an earlier patch first, so re-running it after Johan pushes new commits is safe. See step 3. |
 | `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Applied by `update_fork.py`, or by hand, see step 3. |
+| `pattern_processor/` | The Kikuchi Pattern Processor: `gpu_pattern_viewer.py` (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`, the montage batch API), its patched OpenCL NLPAR kernel, its own README, plan notes and HPC launch script. Tab 1 of the workbench, and still runnable on its own (`python pattern_processor/gpu_pattern_viewer.py`). Merged from `helpimlost97/kikuchi-pattern-processor` with its history. |
 | `kikuchi_workbench.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare; usable from scripts), `live_view.py` the animated progress view. |
 | `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.2. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's third tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
 | `preset_RKD.txt` | Example preset file for the GUI (an RKD data set, detector parallel to the sample): the indexing parameters as `NAME = value` lines. The paths in it are placeholders and are not read by the GUI. |
@@ -181,10 +181,10 @@ automatic batch size is the same in both runs, and both runs give the same orien
 
 ### 6.1 The GUI: pattern processor and spherical indexing in one window
 
-`kikuchi_workbench.py` puts the [Kikuchi Pattern Processor](https://github.com/helpimlost97/kikuchi-pattern-processor)
+`kikuchi_workbench.py` puts the Kikuchi Pattern Processor (`pattern_processor/gpu_pattern_viewer.py`)
 and the spherical indexing of `sph_core.py` into one PyQt5 window with three tabs:
 
-1. **Pattern processor**: the unchanged `gpu_pattern_viewer.py`, imported from its own folder
+1. **Pattern processor**: `gpu_pattern_viewer.py` as it is, so it also runs on its own
    (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`).
 2. **Spherical indexing**: the indexing settings as a form on the left (drag the divider to
    resize it), the live view, the result maps and a log on the right.
@@ -263,16 +263,13 @@ Workflow in the indexing tab:
   in a preset file are listed in the log and ignored.
 
 ```bash
-python kikuchi_workbench.py                                   # processor found next to this folder
-python kikuchi_workbench.py --processor-dir C:\path\to\kikuchi-pattern-processor
+python kikuchi_workbench.py
 python kikuchi_workbench.py --preset preset_RKD.txt
+python kikuchi_workbench.py --no-processor                    # indexing and montage tabs only
 ```
 
-On Windows `Open workbench.bat` does the same (set `PYTHON` and, if needed, `KPP_DIR` at its top).
-The processor's clone is looked for in `--processor-dir`, `KPP_DIR`, then as `kikuchi-pattern-processor`
-next to this folder, inside it, in the current folder or in the home folder. Without it the indexing
-tab still works from files. The environment is the one of this README (fork, CuPy) plus the
-processor's packages: `pip install pyqt5 pyebsdindex scipy scikit-image` (and `pyopencl` for NLPAR
+On Windows `Open workbench.bat` does the same (set `PYTHON` at its top). The environment is the one
+of this README (fork, CuPy) plus the processor's packages: `pip install pyqt5 pyebsdindex scipy scikit-image` (and `pyopencl` for NLPAR
 on the GPU). The processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...) apply
 inside the workbench too.
 

@@ -5,7 +5,7 @@ Name=Kikuchi Pattern Processor
 Comment=NPAR/NLPAR Kikuchi pattern viewer (uses all cores of the current desktop job)
 # Edit the path to where you cloned the repository, then copy this file to your
 # desktop or ~/.local/share/applications/.
-Exec=bash -lc "bash $HOME/kikuchi-pattern-processor/run_gui.sh; echo; echo '[app exited - press Enter to close]'; read"
+Exec=bash -lc "bash $HOME/gpu-accelerated-ebsd/pattern_processor/run_gui.sh; echo; echo '[app exited - press Enter to close]'; read"
 Icon=applications-science
 Terminal=true
 Categories=Science;Education;

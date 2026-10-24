@@ -10,6 +10,8 @@
 !example_data/**
 !sph_core.py
 !kikuchi_workbench.py
+!pattern_processor/
+!pattern_processor/**
 !live_view.py
 !montage.py
 !montage_tab.py

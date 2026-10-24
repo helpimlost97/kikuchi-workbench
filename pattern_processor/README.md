@@ -1,5 +1,9 @@
 # Kikuchi Pattern Processor (NPAR/NLPAR)
 
+Part of the [Kikuchi workbench](../README.md) since 2026-10-24 (tab 1 of `kikuchi_workbench.py`, one
+folder up); it was its own repository, `helpimlost97/kikuchi-pattern-processor`, whose history is in
+this one. Everything below still applies to running it on its own from this folder.
+
 A GPU-accelerated GUI for viewing and processing EBSD / TKD / RKD Kikuchi pattern
 files (EDAX UP1/UP2 format). Provides on-demand and full-dataset NPAR and NLPAR
 denoising, plus the standard pattern-processing pipeline (static / dynamic
