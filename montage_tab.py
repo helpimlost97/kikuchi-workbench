@@ -434,11 +434,8 @@ class MontageTab(QWidget):
             return
         if self.wb._refuse_while_busy():
             return
-        if getattr(proc, "_nlpar_busy", False):
+        if proc._nlpar_busy:
             QMessageBox.information(self, "Busy", "Wait for the pattern processor's NLPAR step to finish")
-            return
-        if not hasattr(proc, "batch_process"):
-            QMessageBox.critical(self, "Pattern processor", "This pattern processor has no batch_process(): update the repository (git pull)")
             return
         all_tiles = self._raw_tiles()
         tiles = [t for t in all_tiles if t.ok]
@@ -488,7 +485,7 @@ class MontageTab(QWidget):
 
             results = proc.batch_process(jobs, shared_background=shared, progress=progress, cancel=lambda: self.cancel_requested)
         except Exception as e:  # noqa: BLE001
-            results = list(getattr(proc, "batch_results", []) or [])
+            results = list(proc.batch_results or [])
             # the processor's BatchCancelled is matched by name: its module is not imported here
             if type(e).__name__ in ("BatchCancelled", "_Cancelled"):
                 self.log("Batch processing cancelled")
@@ -497,7 +494,7 @@ class MontageTab(QWidget):
                 QMessageBox.critical(self, "Batch processing", f"{type(e).__name__}: {e}")
         finally:
             try:
-                if getattr(proc, "f_orig", None) is not None:
+                if proc.f_orig is not None:
                     proc.unload()
             except Exception:  # noqa: BLE001
                 pass
