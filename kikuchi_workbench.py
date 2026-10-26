@@ -103,16 +103,17 @@ from sph_core import Settings  # noqa: E402
 
 __version__ = "0.4.0"
 
-# The EDAX detector is 30 mm wide: the pixel size of the EDAX/TSL projection center convention follows from the
-# pattern width alone, which is why the GUI fills it in (ebsd_params.py uses the same default, --det-mm 30).
-DETECTOR_WIDTH_UM = 30000.0
-# How the map is indexed with the live view on: bands of rows that each take about this long
-LIVE_BLOCK_SECONDS = 8.0
+# Every default of the indexing form is the ``sph_core.Settings`` default (``SettingsForm`` reads them from the
+# ``Settings`` it is built with); the choices of the combo boxes and the ranges are sph_core's constants too.
+# The file dialog filters, shared with the point tab:
+PATTERN_FILE_FILTER = "Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)"
+MASTER_FILE_FILTER = "Master patterns (*.sht *.h5 *.hdf5);;All files (*)"
 # What a GUI preset holds: the indexing parameters only, never files, folders or the projection center values
 PRESET_FIELDS = [
     "MASTER_BANDWIDTH", "PC_CONVENTION", "SAMPLE_TILT", "CAMERA_TILT", "PX_SIZE", "TWIST",
     "REMOVE_STATIC_BACKGROUND", "REMOVE_DYNAMIC_BACKGROUND",
     "BANDWIDTH", "N_WORKERS", "REFINE", "N_REGIONS", "CIRCULAR_MASK", "GAUSSIAN_BACKGROUND", "NORMALIZE", "CHUNKSIZE",
+    "TEST_SIZE",
 ]
 
 
@@ -304,18 +305,26 @@ def side_by_side(left: QWidget, right: QWidget, left_width: int = 470) -> QSplit
     return splitter
 
 
+#: ``SettingsForm.add_*`` default: take the field's default from the ``Settings`` the form was built with.
+FROM_DEFAULTS = object()
+
+
 class SettingsForm(QWidget):
     """Widgets for a subset of the ``Settings`` fields, in titled groups.
 
     Each ``add_*`` method adds one field under its ``Settings`` name and records a ``(getter, setter)`` pair in
     ``_fields`` (``getter()`` gives the field's value as a Python object, ``setter(value)`` fills the widget).
+    The widget starts at the field's default in ``defaults`` (a ``Settings``; so a default is changed in
+    ``sph_core.Settings`` only), unless ``default=`` is given: a form of names that are not settings (the montage
+    tab's) passes its own or gets the widget's natural blank (None, False).
     ``settings(base)`` and ``set_settings(st)`` convert the whole form from and to a ``Settings`` object; other
     modules and scripts reach single fields through ``_fields[name]``. Fields are added to the group opened by the
     last ``group()`` call.
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, defaults: Settings | None = None, parent=None):
         super().__init__(parent)
+        self.defaults = defaults
         self._fields: dict[str, tuple] = {}
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(4, 4, 4, 4)
@@ -357,42 +366,53 @@ class SettingsForm(QWidget):
             widget.setWordWrap(True)
         self._form.addRow(widget)
 
+    def _default(self, name, given, fallback=FROM_DEFAULTS):
+        """The start value of field ``name``: ``given`` unless it is ``FROM_DEFAULTS``, then the ``defaults``
+        object's value, then ``fallback``; a field with none of them is an error."""
+        if given is not FROM_DEFAULTS:
+            return given
+        if self.defaults is not None and hasattr(self.defaults, name):
+            return getattr(self.defaults, name)
+        if fallback is FROM_DEFAULTS:
+            raise ValueError(f"{name}: no default in the form's Settings and none given")
+        return fallback
+
     # one line of a group per setting
-    def add_bool(self, name, label, tip="", default=False):
+    def add_bool(self, name, label, tip="", default=FROM_DEFAULTS):
         """A checkbox for a bool setting; returns the QCheckBox."""
         w = QCheckBox(label)
-        w.setChecked(bool(default))
+        w.setChecked(bool(self._default(name, default, False)))
         w.setToolTip(tip)
         self._form.addRow(w)
         self._fields[name] = (w.isChecked, w.setChecked)
         return w
 
-    def add_int(self, name, label, default, lo=0, hi=100000, tip=""):
+    def add_int(self, name, label, lo=0, hi=100000, tip="", default=FROM_DEFAULTS):
         """A spin box for an int setting in ``lo..hi``; returns the QSpinBox."""
         w = QSpinBox()
         w.setRange(lo, hi)
-        w.setValue(int(default))
+        w.setValue(int(self._default(name, default)))
         w.setToolTip(tip)
         self._form.addRow(label, _fit(w))
         self._fields[name] = (w.value, lambda v: w.setValue(int(v)))
         return w
 
-    def add_float(self, name, label, default, lo=-1e9, hi=1e9, decimals=4, tip=""):
+    def add_float(self, name, label, lo=-1e9, hi=1e9, decimals=4, tip="", default=FROM_DEFAULTS):
         """A spin box for a float setting in ``lo..hi`` with ``decimals`` places; returns the QDoubleSpinBox."""
         w = QDoubleSpinBox()
         w.setRange(lo, hi)
         w.setDecimals(decimals)
-        w.setValue(float(default))
+        w.setValue(float(self._default(name, default)))
         w.setToolTip(tip)
         self._form.addRow(label, _fit(w))
         self._fields[name] = (w.value, lambda v: w.setValue(float(v)))
         return w
 
-    def add_text(self, name, label, default=None, tip="", placeholder="", literal=True):
+    def add_text(self, name, label, tip="", placeholder="", literal=True, default=FROM_DEFAULTS):
         """Free text, parsed as a Python literal (blank = None): numbers, tuples such as (0, 100, 0, 50), paths.
         ``literal=False`` keeps the text as it is (blank = None), e.g. for a name filter such as '8'.
         Returns the QLineEdit."""
-        w = QLineEdit(_to_text(default))
+        w = QLineEdit(_to_text(self._default(name, default, None)))
         w.setToolTip(tip)
         w.setPlaceholderText(placeholder)
         self._form.addRow(label, _fit(w))
@@ -400,12 +420,12 @@ class SettingsForm(QWidget):
         self._fields[name] = (getter, lambda v: w.setText(_to_text(v)))
         return w
 
-    def add_combo(self, name, label, options, default, tip=""):
+    def add_combo(self, name, label, options, tip="", default=FROM_DEFAULTS):
         """A combo box over ``options``; the value has the type of the first option (so a list of ints gives an
         int, a list of strings the text). Returns the QComboBox."""
         w = QComboBox()
         w.addItems([str(o) for o in options])
-        w.setCurrentText(str(default))
+        w.setCurrentText(str(self._default(name, default)))
         w.setToolTip(tip)
         self._form.addRow(label, _fit(w))
         kind = type(options[0]) if options and not isinstance(options[0], str) else None
@@ -416,8 +436,8 @@ class SettingsForm(QWidget):
         self._fields[name] = (get, lambda v: w.setCurrentText(str(v)))
         return w
 
-    def add_path(self, name, label, default=None, tip="", filter="All files (*)", save=False, directory=False, multi=False,
-                 start_dir=None, on_chosen=None):
+    def add_path(self, name, label, tip="", filter="All files (*)", save=False, directory=False, multi=False,
+                 start_dir=None, on_chosen=None, default=FROM_DEFAULTS):
         """A path field with a browse button; returns the QLineEdit.
 
         ``directory`` browses for a folder, ``save`` for a file to write, ``multi`` for several files (the field
@@ -429,7 +449,7 @@ class SettingsForm(QWidget):
         row = QWidget()
         lay = QHBoxLayout(row)
         lay.setContentsMargins(0, 0, 0, 0)
-        edit = QLineEdit(_to_text(default))
+        edit = QLineEdit(_to_text(self._default(name, default, None)))
         edit.setToolTip(tip)
         btn = QPushButton("...")
         btn.setFixedWidth(28)
@@ -560,7 +580,7 @@ class Workbench(QMainWindow):
     - ``prepared``: the signal a step indexed, with keys ``key`` (``_prepare_key``), ``signal``, ``scan``, ``source``
       and ``source_file``; None when the next step must prepare again.
     - ``harmonics`` / ``harmonics_key``: the expanded master pattern(s) (list) and the settings they belong to
-      (``(MASTER_FILE, MASTER_BANDWIDTH, MASTER_ENERGY, demo)``), shared with the montage tab.
+      (``sph_core.harmonics_key``), shared with the montage tab through ``harmonics_for``.
     - ``last_run``: the result of the last 'Index test region' / 'Index full map', see ``run_indexing``.
     - ``live_run``: the run the live view shows while it runs, see ``on_run_event``; None otherwise.
     - ``worker``: the last Worker started (scripts poll ``worker.isRunning()``); ``batch_running``: the montage
@@ -721,7 +741,7 @@ class Workbench(QMainWindow):
         and the tab widget as ``indexing_tab``."""
         tab = QWidget()
         outer = QHBoxLayout(tab)
-        self.form = form = SettingsForm()
+        self.form = form = SettingsForm(self.base)
 
         form.group("Pattern source")
         self.btn_load_processed = QPushButton("Load processed patterns")
@@ -734,8 +754,7 @@ class Workbench(QMainWindow):
             "PATTERN_FILE", "Pattern file:", tip="EDAX .up1/.up2 or any format kp.load() reads (an HDF5 pattern file of the h5ebsd layout, "
                                            "whatever its extension); an APEX .edaxh5 project is a scan file, its patterns are in the .up1 next "
                                            "to it. Blank = the nickel demo data",
-            filter="Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)",
-            on_chosen=lambda path: self.load_patterns_clicked())
+            filter=PATTERN_FILE_FILTER, on_chosen=lambda path: self.load_patterns_clicked())
         self.scan_file_edit = form.add_path(
             "SCAN_FILE", "Scan file (.ang/.edaxh5):", tip="The .ang or .edaxh5 written at acquisition: gives the projection center, map size and step",
             filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)", start_dir=self._pattern_file_dir)
@@ -752,14 +771,13 @@ class Workbench(QMainWindow):
         form.add_widget(self.btn_scan)
         form.add_text("NAV_SHAPE", "Map (rows, cols):", tip="Only when the pattern file does not store the map size; blank = from the file or the scan file", placeholder="None")
         form.add_text("STEP_SIZE", "Step (x, y) um:", tip="Only when the pattern file does not store it", placeholder="None")
-        form.add_combo("LAZY", "Lazy loading:", ["auto", "True", "False"], "auto",
-                       tip="auto = memory-map files bigger than 25 % of RAM")
+        form.add_combo("LAZY", "Lazy loading:", sph_core.LAZY_CHOICES, tip="auto = memory-map files bigger than 25 % of RAM")
         form.add_text("ROI", "ROI (c0, c1, r0, r1):", tip="Index only this part of the map: (col_start, col_stop, row_start, row_stop)", placeholder="None = everything")
         form.add_bool("FLIP_PATTERNS_UD", "Flip patterns upside down", "Try this when the test maps look like noise")
 
         form.group("Pattern processing (off for a file the processor already processed)")
-        self.w_static = form.add_bool("REMOVE_STATIC_BACKGROUND", "Remove static background", "The background stored with the file, or else the mean pattern. Off by default: patterns from the processor are already corrected", False)
-        self.w_dynamic = form.add_bool("REMOVE_DYNAMIC_BACKGROUND", "Remove dynamic background", "Off by default: patterns from the processor are already corrected", False)
+        self.w_static = form.add_bool("REMOVE_STATIC_BACKGROUND", "Remove static background", "The background stored with the file, or else the mean pattern. Off by default: patterns from the processor are already corrected")
+        self.w_dynamic = form.add_bool("REMOVE_DYNAMIC_BACKGROUND", "Remove dynamic background", "Off by default: patterns from the processor are already corrected")
         note = QLabel("NLPAR: use the pattern processor tab (pyebsdindex)")
         note.setStyleSheet("color: gray")
         form.add_widget(note)
@@ -767,40 +785,41 @@ class Workbench(QMainWindow):
         form.group("Master pattern(s)")
         self.master_file_edit = form.add_path(
             "MASTER_FILE", "Master file(s):", tip="EMSphInx .sht or EMsoft master pattern .h5; several files (one per phase) as a list ['a.sht', 'b.sht']",
-            filter="Master patterns (*.sht *.h5 *.hdf5);;All files (*)", multi=True)
-        form.add_int("MASTER_BANDWIDTH", "Master bandwidth (.h5):", 384, 16, 1024, "Bandwidth of the harmonics computed from an EMsoft .h5 master pattern; keep >= 384")
+            filter=MASTER_FILE_FILTER, multi=True)
+        form.add_int("MASTER_BANDWIDTH", "Master bandwidth (.h5):", 16, 1024,
+                     f"Bandwidth of the harmonics computed from an EMsoft .h5 master pattern; keep >= {self.base.MASTER_BANDWIDTH}")
         form.add_text("MASTER_ENERGY", "Master energy keV (.h5):", tip="Only for .h5 masters with several energies; blank = all, weighted", placeholder="None")
         form.add_bool("OVERRIDE_MASTER_SAMPLE_TILT", "Override master sample tilt", "Use the sample tilt below even when the master pattern was simulated for another one; indexing refuses the mismatch otherwise")
 
         form.group("Detector geometry")
-        self.pc_edit = form.add_text("PC", "Projection center (x*, y*, z*):", (0.5, 0.5, 0.5), "Values from an .ang file are in the EDAX convention")
-        self.pc_convention_combo = form.add_combo("PC_CONVENTION", "PC convention:", ["edax", "tsl", "bruker", "oxford", "emsoft"], "edax")
+        self.pc_edit = form.add_text("PC", "Projection center (x*, y*, z*):", "Values from an .ang file are in the EDAX convention")
+        self.pc_convention_combo = form.add_combo("PC_CONVENTION", "PC convention:", sph_core.PC_CONVENTIONS)
         self.pc_convention_combo.currentTextChanged.connect(lambda *_: self.auto_px_size())
         form.add_text("SAMPLE_TILT", "Sample tilt deg:", tip="Blank = the tilt the master pattern was simulated for (as EMSphInx does)", placeholder="None = from master")
-        form.add_float("CAMERA_TILT", "Camera tilt deg:", 0.0, -180, 180, 2, "Detector tilt / camera elevation (EMSphInx thetac): 8 for EBSD, -90 for RKD")
-        self.px_size_spin = form.add_float("PX_SIZE", "Pixel size um:", 1.0, 1e-6, 1e6, 4,
-                                           f"Detector pixel size. Filled automatically as {DETECTOR_WIDTH_UM / 1000:.0f} mm / pattern width "
+        form.add_float("CAMERA_TILT", "Camera tilt deg:", -180, 180, 2, "Detector tilt / camera elevation (EMSphInx thetac): 8 for EBSD, -90 for RKD")
+        self.px_size_spin = form.add_float("PX_SIZE", "Pixel size um:", 1e-6, 1e6, 4,
+                                           f"Detector pixel size. Filled automatically as {ebsd_params.DETECTOR_WIDTH_UM / 1000:.0f} mm / pattern width "
                                            "for the EDAX/TSL convention once the pattern width is known; editable")
-        form.add_float("TWIST", "Twist deg:", 0.0, -180, 180, 2, "Rotation of the detector about its normal, e.g. 15 for RKD; applied to the orientations afterwards")
+        form.add_float("TWIST", "Twist deg:", -180, 180, 2, "Rotation of the detector about its normal, e.g. 15 for RKD; applied to the orientations afterwards")
 
         form.group("Indexing")
-        bandwidths = [16, 32, 53, 63, 68, 74, 88, 95, 113, 123, 158, 172, 188, 263, 383]
-        self.bandwidth_combo = form.add_combo("BANDWIDTH", "Bandwidth:", bandwidths, 68, "68 = EMSphInx default; 88 or 123 for more accuracy at lower speed (fast bandwidths only)")
-        form.add_combo("BACKEND", "Backend:", ["gpu", "cpu"], "gpu")
-        form.add_int("N_WORKERS", "Dask workers:", 2, 1, 256, "Raise to about the number of performance cores")
-        form.add_bool("REFINE", "Newton refinement", "", True)
-        self.w_regions = form.add_int("N_REGIONS", "AHE tiles (n_regions):", 10, 0, 64, "Adaptive histogram equalization tiles per axis; 0 = off")
-        self.w_circular = form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector", True)
+        self.bandwidth_combo = form.add_combo("BANDWIDTH", "Bandwidth:", sph_core.FAST_BANDWIDTHS,
+                                              f"{self.base.BANDWIDTH} = EMSphInx default; 88 or 123 for more accuracy at lower speed (fast bandwidths only)")
+        form.add_combo("BACKEND", "Backend:", sph_core.BACKENDS)
+        form.add_int("N_WORKERS", "Dask workers:", 1, 256, "Raise to about the number of performance cores")
+        form.add_bool("REFINE", "Newton refinement")
+        self.w_regions = form.add_int("N_REGIONS", "AHE tiles (n_regions):", 0, sph_core.N_REGIONS_MAX, "Adaptive histogram equalization tiles per axis; 0 = off")
+        self.w_circular = form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector")
         self.w_gaussian = form.add_bool("GAUSSIAN_BACKGROUND", "Gaussian background", "Fit and subtract a 2D Gaussian background (EMSphInx gausbckg)")
-        form.add_bool("NORMALIZE", "Normalized cross-correlation", "", True)
+        form.add_bool("NORMALIZE", "Normalized cross-correlation")
         form.add_text("CHUNKSIZE", "Chunk / GPU batch size:", tip="Patterns per chunk; blank = automatic from free VRAM", placeholder="None = automatic")
-        form.add_int("TEST_SIZE", "Test region side:", 50, 1, 10000, "Side length in map points of the test region")
+        form.add_int("TEST_SIZE", "Test region side:", 1, 10000, "Side length in map points of the test region")
 
         form.group("Output")
         form.add_path("OUTPUT_DIR", "Output folder:", tip="Blank = next to the pattern file", directory=True)
         form.add_text("OUTPUT_NAME", "Output name:", tip="Blank = <pattern file>_sph_bw<bandwidth>", placeholder="None")
-        form.add_bool("SAVE_ANG", "Save .ang", "", True)
-        form.add_bool("SAVE_H5", "Save .h5", "", True)
+        form.add_bool("SAVE_ANG", "Save .ang")
+        form.add_bool("SAVE_H5", "Save .h5")
         form.add_path("REFERENCE_FILE", "Reference map (optional):", tip="An .ang/.h5/.ctf of the same points to compare with",
                       filter="Crystal maps (*.ang *.h5 *.hdf5 *.ctf);;All files (*)")
         form.finish()
@@ -894,6 +913,11 @@ class Workbench(QMainWindow):
         applied = [n for n in PRESET_FIELDS if getattr(st, n) != getattr(current, n)]
         self.log(f"Preset loaded: {path}; changed: {', '.join(applied) if applied else 'nothing'}"
                  + " (files, folders and the projection center are never taken from a preset)")
+        # what the file had that was not applied: names that are not settings or whose value could not be read
+        # (``ignored``), and settings a GUI preset does not carry (files, folders, PC, and the rest outside PRESET_FIELDS)
+        not_carried = [n for n in sph_core.preset_keys(path) if n in st.names() and n not in PRESET_FIELDS]
+        if ignored or not_carried:
+            self.log("  not applied: " + ", ".join(ignored + not_carried))
 
     def save_preset(self):
         """Write the ``PRESET_FIELDS`` of the current settings to a preset file chosen in a dialog."""
@@ -1038,14 +1062,28 @@ class Workbench(QMainWindow):
             ebsd_params.print_scan_info(scan)
         self.log(buf.getvalue().rstrip())
         if scan.get("pc"):
-            self.form.set_value("PC", tuple(round(float(v), 6) for v in scan["pc"]))
-            self.form.set_value("PC_CONVENTION", "edax")
-            self.log(f"Projection center set to {tuple(scan['pc'])} (edax convention)")
+            self.set_pc_from_scan(scan["pc"])
         if scan.get("camera_elevation") is not None:
             self.log(f"Camera elevation in the scan file: {scan['camera_elevation']} deg (CAMERA_TILT is not changed automatically)")
         if scan.get("pattern_width"):
             self.set_pattern_width(int(scan["pattern_width"]))
         self.prepared = None
+
+    def set_pc_from_scan(self, pc, source: str = "the scan file"):
+        """Put a projection center read from an EDAX scan or project (always in the EDAX convention) into the form:
+        rounded to 6 places, with ``PC_CONVENTION`` set to ``"edax"``; logged. The montage tab uses it too."""
+        self.form.set_value("PC", tuple(round(float(v), 6) for v in pc))
+        self.form.set_value("PC_CONVENTION", "edax")
+        self.log(f"Projection center set to {tuple(pc)} (edax convention) from {source}")
+
+    def harmonics_for(self, st: Settings, log, demo: bool = False) -> tuple[list, tuple]:
+        """The harmonics of ``st``'s master pattern(s) and their key: the cached ones (``harmonics``,
+        ``harmonics_key``) when the key is unchanged, else ``sph_core.load_harmonics``. The caller stores what it
+        gets back (on the GUI thread) when it wants them cached."""
+        hkey = sph_core.harmonics_key(st, demo)
+        if self.harmonics is not None and self.harmonics_key == hkey:
+            return self.harmonics, hkey
+        return sph_core.load_harmonics(st, log, demo=demo), hkey
 
     # ---------------------------------------------------------------- pixel size, folders
     def _pattern_file_dir(self):
@@ -1059,16 +1097,17 @@ class Workbench(QMainWindow):
         self.auto_px_size()
 
     def auto_px_size(self):
-        """Pixel size = 30 mm / pattern width for the EDAX/TSL convention (the EDAX detector is 30 mm wide).
+        """Pixel size = detector width / pattern width for the EDAX/TSL convention (``ebsd_params.pixel_size_um``,
+        the EDAX detector being 30 mm wide).
 
         Nothing happens for the other conventions or before the pattern width is known; a change is logged.
         """
         if not self.pattern_width or self.pc_convention_combo.currentText() not in ("edax", "tsl"):
             return
-        px = DETECTOR_WIDTH_UM / self.pattern_width
+        px = ebsd_params.pixel_size_um(self.pattern_width)
         if abs(self.px_size_spin.value() - px) > 1e-6:
             self.px_size_spin.setValue(round(px, 4))
-            self.log(f"Pixel size set to {px:.4f} um = {DETECTOR_WIDTH_UM / 1000:.0f} mm / {self.pattern_width} px (editable)")
+            self.log(f"Pixel size set to {px:.4f} um = {ebsd_params.DETECTOR_WIDTH_UM / 1000:.0f} mm / {self.pattern_width} px (editable)")
 
     # ---------------------------------------------------------------- loading patterns and the quasi-IQ map
     def _load_key(self, st: Settings):
@@ -1321,11 +1360,7 @@ class Workbench(QMainWindow):
                     loaded["preprocessed"] = wanted
             prepared = {"key": key, "signal": s, "scan": scan, "source": "file", "source_file": st.PATTERN_FILE}
         demo = st.PATTERN_FILE is None
-        hkey = (st.MASTER_FILE, st.MASTER_BANDWIDTH, st.MASTER_ENERGY, demo)
-        if self.harmonics is None or self.harmonics_key != hkey:
-            harmonics = sph_core.load_harmonics(st, log, demo=demo)
-        else:
-            harmonics = self.harmonics
+        harmonics, hkey = self.harmonics_for(st, log, demo)
         det = sph_core.make_detector(st, prepared["signal"], harmonics, log, demo=demo)
         return prepared, harmonics, hkey, det
 
@@ -1435,8 +1470,7 @@ class Workbench(QMainWindow):
                 # a test region is small: shorter bands, so that the animation shows several of them
                 xmap_indexed, dt, speed = sph_core.index_blocks(
                     s_run, harmonics, det, st, log, on_event=on_event,
-                    target_seconds=1.0 if test else LIVE_BLOCK_SECONDS,
-                    first_patterns=max(nav_shape[1], min(300, max(1, n_run // 10))))
+                    target_seconds=1.0 if test else sph_core.LIVE_BLOCK_SECONDS)
                 xmap = sph_core.apply_twist(xmap_indexed, st.TWIST)
                 log(f"{xmap.size} patterns in {dt:.1f} s; steady speed {speed:.0f} patterns/s ({st.BACKEND}, bandwidth {st.BANDWIDTH})")
                 if st.TWIST:

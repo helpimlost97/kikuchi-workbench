@@ -31,6 +31,7 @@ only the path syntax in the examples changes.
 | `ebsd_params.py` | Reads acquisition parameters (pattern size, projection center, map size, step) from an EDAX `.ang` or `.edaxh5` file and a `.up1`/`.up2` file. Used by the GUI's *Read scan parameters* and usable from the command line. |
 | `sph_benchmark.py` | CPU vs GPU speed and parity benchmark on the nickel demo data set. Use it to verify the install. |
 | `test_gpu_memory_fix.py` | Checks that VRAM is released between two GPU runs (tests one of the fork's workbench changes). |
+| `check_defaults.py` | Builds the GUI headless and checks that every widget starts at the default its owner holds (`sph_core.Settings`, the processor's defaults). CPU, seconds. |
 | `osc_refinement_handoff/` | Full pattern-matching refinement with a PC per map point (hours to days, CPU) as a stand-alone script for a cluster, with its own hand-off notes. |
 
 ---
@@ -267,9 +268,11 @@ Workflow in the indexing tab:
 - **Save .ang / .h5**, **Compare with reference**, and **Load/Save preset**. A GUI preset holds the
   indexing parameters only: master bandwidth, PC convention, sample and camera tilt, pixel size,
   twist, the two background removals, bandwidth, workers, refinement, AHE tiles, circular mask,
-  Gaussian background, normalization and chunk size. Files, folders and the projection center
-  values are never written to or taken from a preset. `preset_RKD.txt` is an example; other names
-  in a preset file are listed in the log and ignored.
+  Gaussian background, normalization, chunk size and test region side (`PRESET_FIELDS` in
+  `kikuchi_workbench.py`). Files, folders and the projection center values are never written to or
+  taken from a preset. `preset_RKD.txt` is an example; names in a preset file that are not applied
+  are listed in the log. Every default of the form is the `sph_core.Settings` default, so a default
+  is changed there alone (`python check_defaults.py` verifies this headlessly).
 
 ```bash
 python kikuchi_workbench.py

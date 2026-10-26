@@ -21,6 +21,7 @@
 !ebsd_params.py
 !sph_benchmark.py
 !test_gpu_memory_fix.py
+!check_defaults.py
 !osc_refinement_handoff/
 osc_refinement_handoff/*
 !osc_refinement_handoff/OSC_REFINEMENT_HANDOFF.md

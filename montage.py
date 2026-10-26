@@ -27,7 +27,7 @@ The orientation table's ``Orientations`` field is the 3x3 rotation matrix (row-m
 same convention as a kikuchipy/orix rotation's ``to_matrix()``, checked against the Hough results of a real tile
 (median misorientation 0.9 deg with a nickel master on austenite; the transpose gives 40 deg).
 
-Command line: ``python montage.py project.edaxh5 [--patterns FOLDER] [--suffix _proc]`` prints the tile table.
+Command line: ``python montage.py project.edaxh5 [--patterns FOLDER] [--suffix SUFFIX]`` prints the tile table.
 """
 from __future__ import annotations
 
@@ -43,6 +43,14 @@ from typing import Callable, Sequence
 
 import h5py
 import numpy as np
+
+import sph_core
+
+#: How the montage batch names its output: processed tiles get this suffix before the extension
+#: (``<tile>_proc.up1``), and they and the output project go into this folder next to the project unless the
+#: GUI's output folder says otherwise. The montage tab and the command line below read these.
+DEFAULT_SUFFIX = "_proc"
+DEFAULT_OUTPUT_SUBDIR = "processed"
 
 # values of the ``GroupType`` attribute that sets the level of a group in an APEX project
 GROUP_PROJECT, GROUP_SPECIMEN, GROUP_AREA, GROUP_MAP = 0, 1, 2, 3
@@ -498,9 +506,9 @@ def tile_stats(s, progress: Callable[[float], None] | None = None) -> tuple[np.n
     Returns the per-pattern standard deviation as float32 of the navigation shape (rows, cols), and the bool
     mask of the same shape of the patterns that are all zero, or None when there is none. All-zero patterns
     cannot be indexed (processor versions before 1.7.0 wrote zeros for the patterns outside the IQ range; later
-    ones keep them unprocessed), so the caller excludes them. A dask signal is reduced chunk by chunk in 64 MB
-    blocks (``progress`` gets the fraction done, 0..1, through sph_core's dask callback); an in-memory signal
-    in 64 MB slabs.
+    ones keep them unprocessed), so the caller excludes them. A dask signal is reduced chunk by chunk in blocks
+    of ``sph_core.SLAB_BYTES`` (``progress`` gets the fraction done, 0..1, through sph_core's dask callback); an
+    in-memory signal in slabs of that size. The IQ is ``sph_core.pattern_std``, as everywhere.
     """
     nav_shape = tuple(int(v) for v in s.axes_manager.navigation_shape[::-1])
     sig_shape = tuple(int(v) for v in s.axes_manager.signal_shape[::-1])
@@ -512,27 +520,25 @@ def tile_stats(s, progress: Callable[[float], None] | None = None) -> tuple[np.n
         da = None
     if da is not None and isinstance(data, da.Array):
         flat = data.reshape((-1,) + sig_shape)
-        flat = flat.rechunk({0: "auto", 1: -1, 2: -1}, block_size_limit=64 * 1024 ** 2)
-        std = flat.astype(np.float32).std(axis=(-2, -1))
+        flat = flat.rechunk({0: "auto", 1: -1, 2: -1}, block_size_limit=sph_core.SLAB_BYTES)
+        std = sph_core.pattern_std(flat)
         mx = flat.max(axis=(-2, -1))
         if progress is None:
             std, mx = dask.compute(std, mx)
         else:
-            from sph_core import _FractionCallback
-
-            with _FractionCallback(progress):
+            with sph_core._FractionCallback(progress):
                 std, mx = dask.compute(std, mx)
             progress(1.0)
         std, mx = np.asarray(std), np.asarray(mx)
     else:
         arr = np.asarray(data).reshape((-1,) + sig_shape)
         n = arr.shape[0]
-        slab = max(1, (64 * 1024 ** 2) // max(1, int(np.prod(sig_shape)) * 4))
+        slab = max(1, sph_core.SLAB_BYTES // max(1, int(np.prod(sig_shape)) * 4))
         std = np.empty(n, np.float32)
         mx = np.empty(n, arr.dtype)
         for i0 in range(0, n, slab):
             block = arr[i0 : i0 + slab]
-            std[i0 : i0 + slab] = block.astype(np.float32).std(axis=(-2, -1))
+            std[i0 : i0 + slab] = sph_core.pattern_std(block)
             mx[i0 : i0 + slab] = block.max(axis=(-2, -1))
             if progress is not None:
                 progress(min(1.0, (i0 + slab) / n))
@@ -737,7 +743,7 @@ def main():
     ap = argparse.ArgumentParser(description="List the tiles of an APEX montage project and their pattern files")
     ap.add_argument("project", help=".edaxh5 project")
     ap.add_argument("--patterns", help="folder with the .up1/.up2 files (default: the project's folder)")
-    ap.add_argument("--suffix", help="prefer pattern files whose name ends with this, e.g. _proc")
+    ap.add_argument("--suffix", help=f"prefer pattern files whose name ends with this, e.g. {DEFAULT_SUFFIX}")
     a = ap.parse_args()
     project = read_project(a.project)
     pattern_folder_tiles(project, a.patterns or project.folder, prefer_suffix=a.suffix, log=_print)

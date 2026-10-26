@@ -9,10 +9,10 @@ first, as in the fork's tutorial.
                             [--chunksize N] [--no-refine] [--compare] [--bandwidth 68]
 
 --backend     which backend(s) to time (default: both). --compare forces both.
---workers     Dask threads (default: 2); raise to about the number of performance cores.
+--workers     Dask threads (default: sph_core.Settings.N_WORKERS); raise to about the number of performance cores.
 --repeat      index the full map this many times per backend and report the best time (default: 1).
---chunksize   patterns per Dask chunk and, on the GPU, the device batch size (default: automatic).
---bandwidth   spherical harmonic bandwidth of the indexing (default: 68, the EMSphInx default).
+--chunksize   patterns per Dask chunk and, on the GPU, the device batch size (default: Settings.CHUNKSIZE, automatic).
+--bandwidth   spherical harmonic bandwidth of the indexing (default: Settings.BANDWIDTH, the EMSphInx default 68).
 --no-refine   skip the Newton refinement, so only the coarse grid search is timed.
 --compare     index on both backends and print the CPU vs GPU misorientation and score difference.
 
@@ -24,14 +24,16 @@ import time
 
 import numpy as np
 import dask
-import kikuchipy as kp
+
+import sph_core
+from sph_core import Settings
 
 p = argparse.ArgumentParser()
-p.add_argument("--backend", default="both", choices=["cpu", "gpu", "both"])
-p.add_argument("--workers", type=int, default=2)
+p.add_argument("--backend", default="both", choices=list(sph_core.BACKENDS) + ["both"])
+p.add_argument("--workers", type=int, default=Settings.N_WORKERS)
 p.add_argument("--repeat", type=int, default=1, help="best-of-N timing")
-p.add_argument("--chunksize", type=int, default=None)
-p.add_argument("--bandwidth", type=int, default=68)
+p.add_argument("--chunksize", type=int, default=Settings.CHUNKSIZE)
+p.add_argument("--bandwidth", type=int, default=Settings.BANDWIDTH)
 p.add_argument("--no-refine", action="store_true")
 p.add_argument("--compare", action="store_true", help="CPU vs GPU misorientation check")
 a = p.parse_args()
@@ -39,22 +41,11 @@ a = p.parse_args()
 refine = not a.no_refine
 dask.config.set(num_workers=a.workers)
 
-print("Loading nickel_ebsd_large ...", flush=True)
-s = kp.data.nickel_ebsd_large(allow_download=True)
-s.remove_static_background()
-s.remove_dynamic_background()
+# The nickel demo with both backgrounds removed, its harmonics (computed once at sph_core.DEMO_HARMONICS_BANDWIDTH;
+# the indexer resizes them down to --bandwidth) and its detector with one PC for the whole map.
+s, harm, det = sph_core.demo_setup()
 n_pat = int(np.prod(s.axes_manager.navigation_shape))
 print(f"  {s.axes_manager.navigation_shape} nav, {s.axes_manager.signal_shape} sig, {n_pat} patterns")
-
-# The harmonics are computed once at bandwidth 188; the indexer resizes them down to --bandwidth, so one set
-# serves every bandwidth up to 188.
-mp = kp.data.nickel_ebsd_master_pattern_small(projection="lambert", hemisphere="both")
-t0 = time.perf_counter()
-harm = mp.get_spherical_harmonics(bandwidth=188)
-print(f"  harmonics (bw 188) in {time.perf_counter()-t0:.1f} s")
-# The demo detector carries a PC per pattern; the indexer needs one PC for the whole map.
-det = s.detector.deepcopy()
-det.pc = det.pc_average
 
 backends = ["cpu", "gpu"] if a.backend == "both" else [a.backend]
 if a.compare and a.backend != "both":

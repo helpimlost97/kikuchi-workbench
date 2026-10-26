@@ -61,12 +61,8 @@ def _mirror(a, b):
     getattr(b, signal).connect(copy_to(a))
 
 
-def _grey_limits(pattern):
-    """(vmin, vmax) for a grey image: the 1st and 99th percentile of the finite values, as the live view."""
-    pf = np.asarray(pattern, dtype=np.float32)
-    finite = pf[np.isfinite(pf)]
-    lo, hi = (np.percentile(finite, [1, 99]) if finite.size else (0.0, 1.0))
-    return float(lo), float(hi if hi > lo else lo + 1.0)
+#: (vmin, vmax) for a grey image: ``sph_core.grey_limits`` (the same percentiles as the live view and the maps).
+_grey_limits = sph_core.grey_limits
 
 
 class ClickMap(QWidget):
@@ -261,14 +257,13 @@ class PointTab(QWidget):
         self.last_point = None
         self._shown_rc = None   # (row, col) of the measured pattern on the right
 
-        form = kw.SettingsForm()
+        form = kw.SettingsForm(wb.base)
         self.form = form
         form.group("Pattern source (shared with the spherical indexing tab)")
         self.pattern_file_edit = form.add_path(
             "PATTERN_FILE", "Pattern file:", tip="EDAX .up1/.up2 or any format kp.load() reads; the same field as in the spherical "
                                            "indexing tab. Blank = the nickel demo data",
-            filter="Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)",
-            on_chosen=lambda path: self.load_patterns())
+            filter=kw.PATTERN_FILE_FILTER, on_chosen=lambda path: self.load_patterns())
         self.scan_file_edit = form.add_path(
             "SCAN_FILE", "Scan file (.ang/.h5):", tip="The .ang or .edaxh5 of the scan, or an indexing result (.ang, the workbench's .h5): "
                                                   "its IQ column becomes the map here, and 'Read scan parameters' takes the projection "
@@ -296,22 +291,25 @@ class PointTab(QWidget):
         self.master_file_edit = form.add_path(
             "MASTER_FILE", "Master file(s):", tip="EMSphInx .sht or EMsoft master pattern .h5; several files (one per phase) as a "
                                              "list ['a.sht', 'b.sht']. The same field as in the spherical indexing tab",
-            filter="Master patterns (*.sht *.h5 *.hdf5);;All files (*)", multi=True)
+            filter=kw.MASTER_FILE_FILTER, multi=True)
 
         form.group("Indexing (shared with the spherical indexing tab)")
+        # the four shared fields start at the indexing tab's current values (its form holds the Settings defaults)
         self.pc_edit = form.add_text(
-            "PC", "Projection center (x*, y*, z*):", (0.5, 0.5, 0.5),
+            "PC", "Projection center (x*, y*, z*):",
             "The same value as in the spherical indexing tab (in its PC convention): adjust it here and index the point "
-            "again to see the match change; 'Read scan parameters' fills it from the scan file")
-        bandwidths = [wb.bandwidth_combo.itemText(i) for i in range(wb.bandwidth_combo.count())]
+            "again to see the match change; 'Read scan parameters' fills it from the scan file",
+            default=wb.form._fields["PC"][0]())
         self.bandwidth_combo = form.add_combo(
-            "BANDWIDTH", "Bandwidth:", [int(b) for b in bandwidths], wb.bandwidth_combo.currentText(),
+            "BANDWIDTH", "Bandwidth:", sph_core.FAST_BANDWIDTHS,
             "The indexing bandwidth (fast values only), the same as in the spherical indexing tab; changing it rebuilds the "
-            "single-pattern indexer on the next click (a second or so at 68, longer at high values)")
-        self.w_regions = form.add_int("N_REGIONS", "AHE tiles (n_regions):", wb.w_regions.value(), 0, 64,
-                                      "Adaptive histogram equalization tiles per axis; 0 = off. The same as in the spherical indexing tab")
+            f"single-pattern indexer on the next click (a second or so at {wb.base.BANDWIDTH}, longer at high values)",
+            default=wb.bandwidth_combo.currentText())
+        self.w_regions = form.add_int("N_REGIONS", "AHE tiles (n_regions):", 0, sph_core.N_REGIONS_MAX,
+                                      "Adaptive histogram equalization tiles per axis; 0 = off. The same as in the spherical indexing tab",
+                                      default=wb.w_regions.value())
         self.w_circular = form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector. "
-                                        "The same as in the spherical indexing tab", wb.w_circular.isChecked())
+                                        "The same as in the spherical indexing tab", default=wb.w_circular.isChecked())
         note = QLabel("The master bandwidth, the tilts, pixel size and twist, the background steps and the other "
                       "indexing settings are those of the spherical indexing tab.")
         note.setStyleSheet("color: gray")

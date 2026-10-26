@@ -45,6 +45,8 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
+import sph_core
+
 _ORANGE = np.array([1.0, 0.55, 0.0], dtype=np.float32)
 _TINT = 0.35         # weight of orange in the current band
 _SWEEP_TINT = 0.70   # weight of orange in the part of the band the coarse search has passed
@@ -232,11 +234,7 @@ class LiveView(QWidget):
         if p.ndim != 2 or p.size == 0:
             return
         pf = p.astype(np.float32, copy=False)
-        finite = pf[np.isfinite(pf)]
-        if finite.size:
-            lo, hi = np.percentile(finite, [1, 99])
-        else:
-            lo, hi = 0.0, 1.0
+        lo, hi = sph_core.grey_limits(pf)
         if not hi > lo:
             hi = lo + 1.0
         if self._pat_artist is None or self._pat_shape != p.shape:

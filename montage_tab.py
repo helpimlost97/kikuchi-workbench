@@ -39,7 +39,9 @@ from PyQt5.QtWidgets import (
 import montage
 import sph_core
 
-DEFAULT_SUFFIX = "_proc"
+#: The Settings fields that describe one tile's file and grid: cleared when a tile is put into the indexing tab
+#: and overridden per tile in the batch, so that nothing of the previously loaded scan applies to a tile.
+PER_TILE_FIELDS = ("SCAN_FILE", "EDAXH5_MAP", "NAV_SHAPE", "STEP_SIZE", "ROI")
 
 
 class _Cancelled(Exception):
@@ -90,10 +92,12 @@ class MontageTab(QWidget):
         form.add_widget(self.btn_project)
         self.pattern_dir_edit = form.add_path("PATTERN_DIR", "Raw pattern folder:", tip="Folder with the tiles' .up1/.up2 files as written by APEX; blank = the project's folder",
                                               directory=True, start_dir=self._project_dir)
-        self.output_dir_edit = form.add_path("OUTPUT_DIR", "Output folder:", tip="Where the processed tiles and the output project go; blank = 'processed' next to the project",
+        self.output_dir_edit = form.add_path("OUTPUT_DIR", "Output folder:",
+                                             tip=f"Where the processed tiles and the output project go; blank = '{montage.DEFAULT_OUTPUT_SUBDIR}' next to the project",
                                              directory=True, start_dir=self._project_dir)
-        self.suffix_edit = form.add_text("SUFFIX", "Processed file suffix:", DEFAULT_SUFFIX,
-                                         "Appended to the tile's file name: <tile>_proc.up1 (must not be blank)", literal=False)
+        self.suffix_edit = form.add_text("SUFFIX", "Processed file suffix:",
+                                         f"Appended to the tile's file name: <tile>{montage.DEFAULT_SUFFIX}.up1 (must not be blank)",
+                                         literal=False, default=montage.DEFAULT_SUFFIX)
         self.btn_rescan = QPushButton("Rescan folders")
         self.btn_rescan.clicked.connect(self.rescan)
         form.add_widget(self.btn_rescan)
@@ -139,7 +143,7 @@ class MontageTab(QWidget):
                                       "On: the IQ column keeps the Hough IQ written at acquisition; CI is the cross-correlation either way")
         form.add_widget(self.keep_iq_check)
         self.phase_edit = form.add_text(
-            "PHASE_MAP", "Project phase of each master:", None,
+            "PHASE_MAP", "Project phase of each master:",
             "The project's phase number (1-based, as listed when the project is loaded) for each master pattern of the indexing tab, "
             "comma separated, e.g. '2' or '2,1'. Blank = matched by name, else by order when the counts agree; the batch refuses to "
             "run when no match can be made, so that the Phase column of the output is never wrong", placeholder="by name", literal=False)
@@ -221,11 +225,12 @@ class MontageTab(QWidget):
         return self._get("PATTERN_DIR") or (self.project.folder if self.project else None)
 
     def output_dir(self) -> str | None:
-        """The output folder: the field, else ``processed`` next to the project, else None without a project."""
+        """The output folder: the field, else ``montage.DEFAULT_OUTPUT_SUBDIR`` next to the project, else None
+        without a project."""
         out = self._get("OUTPUT_DIR")
         if out:
             return out
-        return os.path.join(self.project.folder, "processed") if self.project else None
+        return os.path.join(self.project.folder, montage.DEFAULT_OUTPUT_SUBDIR) if self.project else None
 
     def suffix(self) -> str:
         """The processed file suffix as typed, stripped ("" when blank)."""
@@ -394,15 +399,13 @@ class MontageTab(QWidget):
         if self.project is None or not self.project.tiles:
             return
         t = self.project.tiles[0]
-        fields = self.wb.form._fields
         if t.pc is not None:
-            fields["PC"][1](tuple(round(v, 6) for v in t.pc))
-            fields["PC_CONVENTION"][1]("edax")
+            self.wb.set_pc_from_scan(t.pc, "the project's first tile")
         if t.sample_tilt is not None:
-            fields["SAMPLE_TILT"][1](round(float(t.sample_tilt), 3))
+            self.wb.form.set_value("SAMPLE_TILT", round(float(t.sample_tilt), 3))
         if t.camera_elevation is not None:
-            fields["CAMERA_TILT"][1](float(t.camera_elevation))
-        self.log(f"Indexing tab: PC {t.pc} (edax), sample tilt {t.sample_tilt}, camera tilt {t.camera_elevation} from the project; check them")
+            self.wb.form.set_value("CAMERA_TILT", float(t.camera_elevation))
+        self.log(f"Indexing tab: sample tilt {t.sample_tilt}, camera tilt {t.camera_elevation} from the project; check them")
 
     # ------------------------------------------------------------------------------------------ 1. processing
     def load_selected_in_processor(self):
@@ -522,10 +525,9 @@ class MontageTab(QWidget):
             return
         if self.wb._refuse_while_busy():
             return
-        fields = self.wb.form._fields
-        fields["PATTERN_FILE"][1](t.pattern.path)
-        for name in ("SCAN_FILE", "EDAXH5_MAP", "NAV_SHAPE", "STEP_SIZE", "ROI"):
-            fields[name][1](None)
+        self.wb.form.set_value("PATTERN_FILE", t.pattern.path)
+        for name in PER_TILE_FIELDS:
+            self.wb.form.set_value(name, None)
         self.wb.prepared = None
         self.wb.tabs.setCurrentWidget(self.wb.indexing_tab)
         self.wb.load_patterns_clicked()
@@ -580,7 +582,7 @@ class MontageTab(QWidget):
         wb.unload_indexing("the batch indexing starts")
         out_dir = self.output_dir()
         os.makedirs(out_dir, exist_ok=True)
-        out_project = os.path.join(out_dir, f"{self.project.stem}_sph_bw{st.BANDWIDTH}.edaxh5")
+        out_project = os.path.join(out_dir, sph_core.output_stem(self.project.stem, st) + ".edaxh5")
         project = self.project
         live = self.live
         self.cancel_requested = False
@@ -595,8 +597,7 @@ class MontageTab(QWidget):
 
         def work(log, emit):
             t_all = time.perf_counter()
-            hkey = (st.MASTER_FILE, st.MASTER_BANDWIDTH, st.MASTER_ENERGY, False)
-            harmonics = wb.harmonics if wb.harmonics is not None and wb.harmonics_key == hkey else sph_core.load_harmonics(st, log)
+            harmonics, hkey = wb.harmonics_for(st, log)
             # which project phase each master is: refused when it cannot be told, so the Phase column is never wrong
             master_names = [str(getattr(getattr(h, "phase", None), "name", "") or "") for h in harmonics]
             phase_map = montage.phase_mapping(master_names, tiles[0].phases, phase_spec, log)
@@ -622,8 +623,7 @@ class MontageTab(QWidget):
                     continue
                 log(f"Tile {i + 1} / {len(tiles)}: {tile.name} ({tile.pattern.name})")
                 try:
-                    st_t = dataclasses.replace(st, PATTERN_FILE=tile.pattern.path, SCAN_FILE=None, EDAXH5_MAP=None, NAV_SHAPE=None,
-                                               STEP_SIZE=None, ROI=None)
+                    st_t = dataclasses.replace(st, PATTERN_FILE=tile.pattern.path, **{name: None for name in PER_TILE_FIELDS})
                     s, _ = sph_core.load_patterns(st_t, scan=montage.scan_dict(tile), log=log)
                     # all-zero patterns are found on the raw data: the background removal would rescale them
                     iq, nav_mask = montage.tile_stats(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
@@ -653,8 +653,7 @@ class MontageTab(QWidget):
 
                     t0 = time.perf_counter()
                     xmap_indexed, dt, speed = sph_core.index_blocks(
-                        s, harmonics, det, st_t, log, navigation_mask=nav_mask, on_event=on_block_event,
-                        target_seconds=kw.LIVE_BLOCK_SECONDS, first_patterns=max(nav_shape[-1], min(300, max(1, n_run // 10))))
+                        s, harmonics, det, st_t, log, navigation_mask=nav_mask, on_event=on_block_event)
                     xmap = sph_core.apply_twist(xmap_indexed, st.TWIST)
                     counts = montage.write_tile_result(out_project, tile, xmap, iq_prop=iq_prop, comment=comment, phase_map=phase_map)
                     emit("run_end", {"success": True})

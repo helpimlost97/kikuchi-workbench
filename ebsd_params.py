@@ -102,6 +102,17 @@ def read_up_dims(path):
     h = read_up_header(path)
     return int(h["pattern_width"]), int(h["pattern_height"])
 
+#: Width of the EDAX detector in um (30 mm, the Quattro's EDAX camera). In the EDAX/TSL projection center
+#: convention the pixel size follows from it and the pattern width alone (:func:`pixel_size_um`); the workbench
+#: fills its pixel size field with that, and ``--det-mm`` below defaults to it.
+DETECTOR_WIDTH_UM = 30000.0
+
+
+def pixel_size_um(pattern_width_px, detector_width_um=DETECTOR_WIDTH_UM):
+    """Detector pixel size in um for the EDAX/TSL convention: the detector width over the pattern width."""
+    return float(detector_width_um) / float(pattern_width_px)
+
+
 def read_up_header(path):
     """Header of an EDAX .up1/.up2 file as a dict: version, pattern_width, pattern_height,
     offset, n_patterns, size_gb and, for version 3 and later, n_cols, n_rows, grid, step_x,
@@ -150,7 +161,7 @@ def print_pattern_center(xs, ys, zs, a, indent="  "):
         print(f"{indent}EMsoft xpc, ypc, L: need the pattern size in pixels -> add --px 115 (or --up1 <patterns.up1>)")
         return
     W, H = dims
-    delta = a.delta if a.delta else a.det_mm * 1000.0 / W
+    delta = a.delta if a.delta else pixel_size_um(W, a.det_mm * 1000.0)
     src = f"--delta {a.delta:g}" if a.delta else f"--det-mm {a.det_mm:g} / {W} px"
     xpc = W * (xs - 0.5)
     ypc = W * ys - H / 2.0
@@ -686,9 +697,9 @@ def main():
                     help="read the pattern size from this .up1/.up2 header instead of --px")
     ap.add_argument("--delta", type=float, default=None, metavar="UM",
                     help="pixel size in um per pattern pixel (RKD: 55); overrides --det-mm")
-    ap.add_argument("--det-mm", type=float, default=30.0, metavar="MM",
+    ap.add_argument("--det-mm", type=float, default=DETECTOR_WIDTH_UM / 1000.0, metavar="MM",
                     help="detector width in mm used to derive delta when --delta is absent "
-                         "(default 30 = Quattro EDAX detector)")
+                         f"(default {DETECTOR_WIDTH_UM / 1000.0:g} = Quattro EDAX detector)")
     a = ap.parse_args()
     a.file = os.path.expanduser(a.file)   # '~/...' inside quotes reaches us unexpanded
 

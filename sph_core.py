@@ -71,7 +71,7 @@ class Settings:
         part of the map. ``FLIP_PATTERNS_UD``: flip every pattern upside down after loading.
     Processing
         ``REMOVE_STATIC_BACKGROUND``, ``REMOVE_DYNAMIC_BACKGROUND``: kikuchipy's background removals, done by
-        :func:`preprocess` (the GUI unticks both by default, the processor having done them already).
+        :func:`preprocess` (both off by default: the pattern processor has done them already).
     Master pattern
         ``MASTER_FILE``: an EMSphInx ``.sht`` or an EMsoft master pattern ``.h5``, or a list of them for several
         phases (phase id = position in the list). ``MASTER_BANDWIDTH``: bandwidth of the harmonics computed from an
@@ -107,8 +107,8 @@ class Settings:
     ROI: tuple | None = None
     FLIP_PATTERNS_UD: bool = False
     # processing
-    REMOVE_STATIC_BACKGROUND: bool = True
-    REMOVE_DYNAMIC_BACKGROUND: bool = True
+    REMOVE_STATIC_BACKGROUND: bool = False
+    REMOVE_DYNAMIC_BACKGROUND: bool = False
     # master
     MASTER_FILE: str | list | None = None
     MASTER_BANDWIDTH: int = 384
@@ -128,7 +128,7 @@ class Settings:
     N_WORKERS: int = 2
     REFINE: bool = True
     N_REGIONS: int = 10
-    CIRCULAR_MASK: bool = False
+    CIRCULAR_MASK: bool = True
     GAUSSIAN_BACKGROUND: bool = False
     NORMALIZE: bool = True
     CHUNKSIZE: int | None = None
@@ -143,6 +143,26 @@ class Settings:
     def names(self) -> list[str]:
         """The setting names, in declaration order (the order of a written preset)."""
         return [f.name for f in dataclasses.fields(self)]
+
+
+# The choices and limits of the settings that have them. The GUI builds its combo boxes and spin-box ranges from
+# these, so a value is added or changed here only. ``Settings`` above holds every default.
+#: The bandwidths the fork's spherical harmonic transform is fast at (``kp.indexing.fast_bandwidths()`` up to 383).
+FAST_BANDWIDTHS = (16, 32, 53, 63, 68, 74, 88, 95, 113, 123, 158, 172, 188, 263, 383)
+#: Projection center conventions of kikuchipy's ``EBSDDetector`` that the GUI offers.
+PC_CONVENTIONS = ("edax", "tsl", "bruker", "oxford", "emsoft")
+BACKENDS = ("gpu", "cpu")
+#: ``LAZY``: memory-map when the file is bigger than a quarter of the RAM, always, never.
+LAZY_CHOICES = ("auto", True, False)
+#: Largest ``N_REGIONS`` (adaptive histogram equalization tiles per axis) the GUI offers.
+N_REGIONS_MAX = 64
+#: Percentiles of :func:`stretch` and :func:`grey_limits`: how maps and patterns are shown.
+STRETCH_PERCENTILES = (1.0, 99.0)
+#: :func:`index_blocks`: seconds of work per band of the live view, and the fewest patterns of the first band.
+LIVE_BLOCK_SECONDS = 8.0
+FIRST_BAND_MIN = 300
+#: Bandwidth of the nickel demo harmonics of :func:`demo_setup` (the indexer resizes them down to ``BANDWIDTH``).
+DEMO_HARMONICS_BANDWIDTH = 188
 
 
 _PRESET_LINE = re.compile(r"^([A-Z][A-Z0-9_]*) = (.*)$")
@@ -181,6 +201,12 @@ def read_preset(path: str | Path, settings: Settings | None = None) -> tuple[Set
         except (ValueError, SyntaxError):
             ignored.append(f"{name} (value not understood: {value})")
     return settings, ignored
+
+
+def preset_keys(path: str | Path) -> list[str]:
+    """The setting names a preset file sets (every ``NAME = value`` line, in file order, whether or not NAME is a
+    setting), so that a GUI can report the ones it did not apply."""
+    return [m.group(1) for m in map(_PRESET_LINE.match, Path(path).read_text(encoding="utf-8").splitlines()) if m]
 
 
 def write_preset(path: str | Path, settings: Settings, header: str = "", fields: Sequence[str] | None = None) -> None:
@@ -368,7 +394,9 @@ def preprocess(s, st: Settings, log: Log = _print) -> None:
         log("Dynamic background removed")
 
 
-_SLAB_BYTES = 64 * 1024**2
+#: Patterns are read and reduced in slabs of about this many bytes of float32 (:func:`quasi_iq`, ``montage.tile_stats``).
+SLAB_BYTES = 64 * 1024**2
+_SLAB_BYTES = SLAB_BYTES  # the former name
 
 
 class _Throttle:
@@ -422,7 +450,7 @@ def quasi_iq(s, progress: Callable[[float], None] | None = None) -> np.ndarray:
         chunks = {i: "auto" for i in range(n_nav)}
         chunks.update({n_nav: -1, n_nav + 1: -1})
         data = data.rechunk(chunks, block_size_limit=limit)
-        result = data.astype(np.float32).std(axis=(-2, -1))
+        result = pattern_std(data)
         if progress is None:
             out = result.compute()
         else:
@@ -447,13 +475,29 @@ def quasi_iq(s, progress: Callable[[float], None] | None = None) -> np.ndarray:
         out = np.empty((n,), dtype=np.float32)
     throttle = _Throttle()
     for k, idx in enumerate(slabs):
-        out[idx] = data[idx].astype(np.float32).std(axis=(-2, -1))
+        out[idx] = pattern_std(data[idx])
         if progress is not None and (k == len(slabs) - 1 or throttle.ready()):
             progress((k + 1) / len(slabs))
     return out.reshape(nav_shape)
 
 
-def stretch(image: np.ndarray, lo_pct: float = 1.0, hi_pct: float = 99.0) -> np.ndarray:
+def pattern_std(patterns):
+    """The quasi image quality of patterns: the float32 standard deviation over the last two axes (one value per
+    pattern) of a numpy or dask array of patterns. The one definition used by :func:`quasi_iq`, the montage batch
+    and the pattern processor's IQ."""
+    return patterns.astype(np.float32).std(axis=(-2, -1))
+
+
+def grey_limits(pattern) -> tuple[float, float]:
+    """``(vmin, vmax)`` for showing one pattern in grey: its ``STRETCH_PERCENTILES`` over the finite values, (0, 1)
+    when there are none, and ``vmax = vmin + 1`` for a constant pattern."""
+    pf = np.asarray(pattern, dtype=np.float32)
+    finite = pf[np.isfinite(pf)]
+    lo, hi = (np.percentile(finite, list(STRETCH_PERCENTILES)) if finite.size else (0.0, 1.0))
+    return float(lo), float(hi if hi > lo else lo + 1.0)
+
+
+def stretch(image: np.ndarray, lo_pct: float = STRETCH_PERCENTILES[0], hi_pct: float = STRETCH_PERCENTILES[1]) -> np.ndarray:
     """``image`` scaled to [0, 1] (float32, same shape) between the ``lo_pct`` and ``hi_pct`` percentiles of its
     finite values, clipped; non-finite values become 0, as does all of a constant image."""
     image = np.asarray(image, dtype=np.float64)
@@ -554,6 +598,35 @@ def preprocess_pattern_for_preview(pattern: np.ndarray, st: Settings, good_pixel
 # ----------------------------------------------------------------------------------------------
 # Master pattern(s) and detector
 # ----------------------------------------------------------------------------------------------
+
+
+def harmonics_key(st: Settings, demo: bool = False) -> tuple:
+    """What the loaded harmonics depend on: ``(MASTER_FILE, MASTER_BANDWIDTH, MASTER_ENERGY, demo)``. A GUI keeps
+    the harmonics of :func:`load_harmonics` as long as this key is unchanged."""
+    return (st.MASTER_FILE, st.MASTER_BANDWIDTH, st.MASTER_ENERGY, demo)
+
+
+def demo_setup(bandwidth: int = DEMO_HARMONICS_BANDWIDTH, log: Log = _print):
+    """The nickel demo ready to index, for the benchmark and the GPU memory test: ``(signal, harmonics, detector)``.
+
+    kikuchipy's ``nickel_ebsd_large`` (4125 patterns of 60 x 60 px, downloaded once) with both background
+    removals applied as in the fork's tutorial; the small nickel master's harmonics at ``bandwidth`` (the indexer
+    resizes them down to any smaller bandwidth, so one set serves every run); and the demo detector with one PC
+    for the whole map (its average), since the indexer takes a single PC.
+    """
+    import kikuchipy as kp
+
+    log("Loading nickel_ebsd_large ...")
+    s = kp.data.nickel_ebsd_large(allow_download=True)
+    s.remove_static_background()
+    s.remove_dynamic_background()
+    mp = kp.data.nickel_ebsd_master_pattern_small(projection="lambert", hemisphere="both")
+    t0 = time.perf_counter()
+    harmonics = mp.get_spherical_harmonics(bandwidth=bandwidth)
+    log(f"  harmonics (bandwidth {bandwidth}) in {time.perf_counter() - t0:.1f} s")
+    det = s.detector.deepcopy()
+    det.pc = det.pc_average
+    return s, harmonics, det
 
 
 def load_harmonics(st: Settings, log: Log = _print, demo: bool = False) -> list:
@@ -663,8 +736,8 @@ def back_project(pattern: np.ndarray, det, bandwidth: int):
 
 
 def point_indexer_key(st: Settings, det, hkey: tuple) -> tuple:
-    """What identifies a cached :func:`make_point_indexer` indexer: the workbench's harmonics key ``hkey``
-    (``(MASTER_FILE, MASTER_BANDWIDTH, MASTER_ENERGY, demo)``), the detector's geometry (shape, PC, sample tilt,
+    """What identifies a cached :func:`make_point_indexer` indexer: the harmonics key ``hkey``
+    (:func:`harmonics_key`), the detector's geometry (shape, PC, sample tilt,
     camera tilt, pixel size, binning) and the indexing settings the indexer is built with (``BANDWIDTH``,
     ``NORMALIZE``, ``REFINE``, ``N_REGIONS``, ``GAUSSIAN_BACKGROUND``, ``CIRCULAR_MASK``). The backend is always
     the CPU and is not in the key."""
@@ -1148,14 +1221,15 @@ def assemble_blocks(blocks: Sequence, nav_shape: tuple[int, int], step_size: tup
 
 
 def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, navigation_mask=None,
-                 on_event: Callable[[str, dict], None] | None = None, target_seconds: float = 4.0,
+                 on_event: Callable[[str, dict], None] | None = None, target_seconds: float = LIVE_BLOCK_SECONDS,
                  first_patterns: int | None = None, verbose: int = 0):
     """Spherical indexing of a 2D map band by band (whole map rows, from the top), so that a GUI can show the
     map growing; the result is that of one ``spherical_indexing`` call (every pattern is indexed on its own,
     and :func:`assemble_blocks` copies the results bit for bit).
 
-    The first band has about ``first_patterns`` patterns (default max(columns, 300)), later bands about
-    ``target_seconds`` of work at the best speed of a band so far. Bands are sized by the patterns they index, so
+    The first band has about ``first_patterns`` patterns (default: one row at least, and a tenth of the run up to
+    ``FIRST_BAND_MIN``, so a small test region still shows several bands), later bands about ``target_seconds``
+    (default ``LIVE_BLOCK_SECONDS``) of work at the best speed of a band so far. Bands are sized by the patterns they index, so
     rows that are mostly masked out neither inflate the speed nor shrink the band. ``navigation_mask`` is a
     boolean (rows, cols) array, True = do not index (ValueError when its shape is not the map's). ``verbose`` is
     the fork's (0: silent). Sets dask's worker count and frees CuPy's memory pools before the run; the fork's
@@ -1291,7 +1365,7 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
 
     n_rows, n_cols = nav_shape
     if first_patterns is None:
-        first_patterns = max(n_cols, 300)
+        first_patterns = max(n_cols, min(FIRST_BAND_MIN, max(1, total_patterns // 10)))
     blocks = []
     timings = []  # (patterns indexed, seconds) of every band that was indexed
     done_patterns = 0
@@ -1493,8 +1567,13 @@ def output_location(st: Settings, source_file: str | None) -> tuple[Path, str]:
     else:
         out_dir = Path.cwd()
     source_stem = Path(source_file).stem if source_file else "nickel_demo"
-    stem = st.OUTPUT_NAME or f"{source_stem}_sph_bw{st.BANDWIDTH}"
-    return out_dir, stem
+    return out_dir, output_stem(source_stem, st)
+
+
+def output_stem(source_stem: str, st: Settings) -> str:
+    """The name (without extension) of what a run writes: ``OUTPUT_NAME``, else ``<source_stem>_sph_bw<BANDWIDTH>``.
+    The montage batch names its output project with the same rule."""
+    return st.OUTPUT_NAME or f"{source_stem}_sph_bw{st.BANDWIDTH}"
 
 
 def compare_with_reference(xmap_indexed, reference_file: str | Path, roi=None, full_nav_shape=None) -> np.ndarray:

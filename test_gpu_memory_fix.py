@@ -9,7 +9,8 @@ demo dataset twice on the GPU and checks that
 3. both runs give the same orientations.
 
 Usage:
-    python test_gpu_memory_fix.py            # bandwidth 123
+    python test_gpu_memory_fix.py            # bandwidth 123: deliberately high, so that a leak of the big cuFFT
+                                             # work areas shows (the indexing default, Settings.BANDWIDTH, is 68)
     python test_gpu_memory_fix.py 68         # another bandwidth
 
 Needs CuPy and a GPU. Prints the free VRAM and batch size before and after each run and ends with
@@ -25,7 +26,10 @@ import dask
 import kikuchipy as kp
 from kikuchipy.indexing._spherical import _gpu
 
-BANDWIDTH = int(sys.argv[1]) if len(sys.argv) > 1 else 123
+import sph_core
+from sph_core import Settings
+
+BANDWIDTH = int(sys.argv[1]) if len(sys.argv) > 1 else 123   # a stress value on purpose, see the docstring
 TOLERANCE_GB = 0.5
 
 
@@ -43,18 +47,12 @@ def auto_batch():
     return _gpu._default_batch_size(BANDWIDTH, int(cupy.cuda.runtime.memGetInfo()[0]))
 
 
-dask.config.set(num_workers=2)
+dask.config.set(num_workers=Settings.N_WORKERS)
 print("kikuchipy", kp.__version__, "from", kp.__file__)
 print("GPU:", cupy.cuda.runtime.getDeviceProperties(0)["name"].decode())
 
-s = kp.data.nickel_ebsd_large(allow_download=True)
-s.remove_static_background()
-s.remove_dynamic_background()
-mp = kp.data.nickel_ebsd_master_pattern_small(projection="lambert", hemisphere="both")
-harmonics = mp.get_spherical_harmonics(bandwidth=188)
-# The demo detector carries a PC per pattern; the indexer needs one PC for the whole map.
-det = s.detector.deepcopy()
-det.pc = det.pc_average
+# the nickel demo with both backgrounds removed, its harmonics and its detector with one PC for the whole map
+s, harmonics, det = sph_core.demo_setup()
 
 # Touch the device once, so that the CUDA context itself is not counted as a leak
 cupy.zeros(1).sum()
