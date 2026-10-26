@@ -7,7 +7,7 @@ shows the master pattern at the orientation found, and a tab that runs processin
 EDAX APEX montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
 indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, which lives in his fork of kikuchipy;
 nothing of it is in upstream kikuchipy or on PyPI, so `requirements.txt` installs it from
-https://github.com/helpimlost97/kikuchipy-workbench, a GitHub fork of his with this workbench's changes on top (section 3).
+https://github.com/helpimlost97/kikuchipy, a GitHub fork of his with this workbench's changes on top (section 3).
 Everything in this repository is the GUI and the functions it calls; there are no notebooks. Everything here is
 vibe coded; read the code before trusting a number. GPLv3, see section 10.
 
@@ -23,7 +23,7 @@ only the path syntax in the examples changes.
 |---|---|
 | `requirements.txt` | Everything the GUI and scripts need except CuPy: the kikuchipy fork at the pinned commit `31d2882d` (installed by pip straight from GitHub), PyQt5, pyebsdindex and the rest. See step 3. |
 | `LICENSE` | GPLv3, for everything in this repository. See section 10. |
-| `kikuchipy/` | (Not in the repository, and not needed to run the workbench.) Optional developer clone of https://github.com/helpimlost97/kikuchipy-workbench for editing the fork in place; see "Developer install" in step 3. |
+| `kikuchipy/` | (Not in the repository, and not needed to run the workbench.) Optional developer clone of https://github.com/helpimlost97/kikuchipy for editing the fork in place; see "Developer install" in step 3. |
 | `pattern_processor/` | The Kikuchi Pattern Processor: `gpu_pattern_viewer.py` (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`, the montage batch API), its patched OpenCL NLPAR kernel, its own README, plan notes and HPC launch script. Tab 1 of the workbench, and still runnable on its own (`python pattern_processor/gpu_pattern_viewer.py`). Formerly its own repository (`helpimlost97/kikuchi-pattern-processor`, now retired), merged here with its history. |
 | `kikuchi_workbench.py`, `point_tab.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare, plus the single-pattern functions; usable from scripts), `point_tab.py` the *Index a point* tab, `live_view.py` the animated progress view. |
 | `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.2. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's fourth tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
@@ -64,7 +64,7 @@ pip install -r requirements.txt
 ```
 
 That is the whole of this step. The first line of `requirements.txt` makes pip clone the fork
-https://github.com/helpimlost97/kikuchipy-workbench at commit `31d2882d`, the commit everything here
+https://github.com/helpimlost97/kikuchipy at commit `31d2882d`, the commit everything here
 was tested with, and install it like any other package (pip needs `git` on the PATH for that). The
 rest of the file is PyQt5, pyebsdindex and the other packages the GUI and scripts use. CuPy is the
 next step because its wheel depends on your driver.
@@ -106,7 +106,7 @@ the copy that `requirements.txt` installed, and running `pip install -r requirem
 replaces it back:
 
 ```bash
-git clone https://github.com/helpimlost97/kikuchipy-workbench.git kikuchipy
+git clone https://github.com/helpimlost97/kikuchipy.git kikuchipy
 git -C kikuchipy checkout 31d2882d        # or develop, or develop-fused-wigner
 pip install -e kikuchipy
 ```
@@ -508,7 +508,7 @@ patterns per Dask chunk and, on the GPU, the device batch size.
 
 ## 9. References
 
-- Fork: https://github.com/helpimlost97/kikuchipy-workbench (branch `develop`, commit `31d2882d`), a fork of
+- Fork: https://github.com/helpimlost97/kikuchipy (branch `develop`, commit `31d2882d`), a fork of
   Johan Westraadt's https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `4c7a0035`).
   Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, design notes in `specs/`,
   tutorial in `doc/tutorials/spherical_indexing.ipynb`.

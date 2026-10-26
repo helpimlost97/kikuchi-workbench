@@ -5,7 +5,7 @@
 # The first line installs Johan Westraadt's kikuchipy fork with the workbench's patches straight
 # from GitHub, at the commit everything here was tested with (README section 3). pip needs git on
 # the PATH for it. Developers who want an editable clone instead: see "Developer install" in the README.
-kikuchipy @ git+https://github.com/helpimlost97/kikuchipy-workbench@31d2882d34bec58ab9710c3aedeb83bc0061d9bd
+kikuchipy @ git+https://github.com/helpimlost97/kikuchipy@31d2882d34bec58ab9710c3aedeb83bc0061d9bd
 
 # GUI and scripts
 PyQt5>=5.15
