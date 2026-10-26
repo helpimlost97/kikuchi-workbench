@@ -6,7 +6,7 @@ shows the master pattern at the orientation found, and a tab that runs processin
 EDAX APEX montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
 indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, which lives in his fork of kikuchipy;
 nothing of it is in upstream kikuchipy or on PyPI, so it is installed from a git clone (section 3) of
-https://github.com/helpimlost97/kikuchipy, a GitHub fork of his with this workbench's changes on top.
+https://github.com/helpimlost97/kikuchipy-workbench, a GitHub fork of his with this workbench's changes on top.
 Everything in this repository is the GUI and the functions it calls; there are no notebooks.
 
 Tested on: Windows 11, Python 3.14.0, RTX 5070 Laptop GPU (8 GB VRAM), driver with CUDA 13
@@ -19,7 +19,7 @@ only the path syntax in the examples changes.
 
 | File / folder | Purpose |
 |---|---|
-| `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/helpimlost97/kikuchipy, branch `workbench`, pinned at commit `31d2882d`: Johan's `develop` at `4c7a0035` plus the two workbench changes listed in step 3. Installed in editable mode. |
+| `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/helpimlost97/kikuchipy-workbench, branch `workbench`, pinned at commit `31d2882d`: Johan's `develop` at `4c7a0035` plus the two workbench changes listed in step 3. Installed in editable mode. |
 | `update_fork.py` | Clones or updates that clone, checks out the pinned commit and installs it, in one command. A clone made with the old patch file (Johan's repository plus `kikuchipy_local_patches.patch`) is moved over to the fork's commit without losing anything. See step 3. |
 | `pattern_processor/` | The Kikuchi Pattern Processor: `gpu_pattern_viewer.py` (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`, the montage batch API), its patched OpenCL NLPAR kernel, its own README, plan notes and HPC launch script. Tab 1 of the workbench, and still runnable on its own (`python pattern_processor/gpu_pattern_viewer.py`). Merged from `helpimlost97/kikuchi-pattern-processor` with its history. |
 | `kikuchi_workbench.py`, `point_tab.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare, plus the single-pattern functions; usable from scripts), `point_tab.py` the *Index a point* tab, `live_view.py` the animated progress view. |
@@ -62,7 +62,7 @@ python update_fork.py --dir D:\path\to\kikuchipy   # if the clone lives elsewher
 That is the whole of this step; the manual equivalent is
 
 ```bash
-git clone https://github.com/helpimlost97/kikuchipy.git
+git clone https://github.com/helpimlost97/kikuchipy-workbench.git
 cd kikuchipy
 git checkout 31d2882d         # the commit everything here was tested with
 pip install -e .
@@ -79,10 +79,10 @@ and the workbench's indexing of the demo data were re-run against it.
 ```bash
 python update_fork.py --show-latest         # lists Johan's develop commits newer than 4c7a0035
 python update_fork.py --commit workbench    # the newest commit of the branch instead of the pin
+python update_fork.py --commit workbench-dev    # the fork's test branch: experimental changes, not for production
 ```
 
-`--commit workbench` currently adds an experimental fused Wigner kernel for the GPU backend
-(`505263ab`), not yet benchmarked end to end. When moving the pin, change `PINNED_COMMIT` in
+When moving the pin, change `PINNED_COMMIT` in
 `update_fork.py` and this README together. `update_fork.py` refuses to touch any local change in
 the clone, except one whose files already equal the target commit (a clone of Johan's repository
 with the old `kikuchipy_local_patches.patch` applied), which it resets since nothing is lost.
@@ -504,7 +504,7 @@ patterns per Dask chunk and, on the GPU, the device batch size.
 
 ## 9. References
 
-- Fork: https://github.com/helpimlost97/kikuchipy (branch `workbench`, commit `31d2882d`), a fork of
+- Fork: https://github.com/helpimlost97/kikuchipy-workbench (branch `workbench`, commit `31d2882d`), a fork of
   Johan Westraadt's https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `4c7a0035`).
   Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, design notes in `specs/`,
   tutorial in `doc/tutorials/spherical_indexing.ipynb`.

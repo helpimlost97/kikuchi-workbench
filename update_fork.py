@@ -4,18 +4,19 @@
     python update_fork.py                      # clone (if needed), check out the pinned commit, install
     python update_fork.py --dir D:\\kikuchipy   # the clone lives elsewhere (default: kikuchipy next to this script)
     python update_fork.py --commit workbench   # another commit/branch (e.g. the newest workbench) instead of the pin
+    python update_fork.py --commit workbench-dev   # the branch with experimental changes under test
     python update_fork.py --no-install         # skip "pip install -e ."
     python update_fork.py --show-latest        # only list Johan's develop commits newer than the fork's base and exit
 
-The fork is https://github.com/helpimlost97/kikuchipy, a GitHub fork of Johan Westraadt's
+The fork is https://github.com/helpimlost97/kikuchipy-workbench, a GitHub fork of Johan Westraadt's
 https://github.com/jwestraadt/kikuchipy. Its branch ``workbench`` is Johan's develop at BASE_COMMIT
-plus the workbench's own commits (fast lazy .up1 loading, VRAM release after GPU runs, and newer
-experimental work on top), so nothing has to be patched after the checkout.
+plus the workbench's own commits (fast lazy .up1 loading, VRAM release after GPU runs), so nothing
+has to be patched after the checkout. Its branch ``workbench-dev`` adds experimental work on top.
 
 What it does, in order:
 
-1. Clones the fork into --dir when that folder does not exist, otherwise fetches its ``workbench``
-   branch (by URL, so a clone whose ``origin`` is still Johan's repository works too).
+1. Clones the fork into --dir when that folder does not exist, otherwise fetches its branches
+   (by URL, so a clone whose ``origin`` is still Johan's repository works too).
 2. Makes sure the working tree is clean. A tree whose files already equal the target commit (e.g. a
    clone of Johan's repository with the old kikuchipy_local_patches.patch applied) is reset, since
    nothing is lost; any other local change stops the script, so nothing of yours is lost.
@@ -30,15 +31,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-FORK_URL = "https://github.com/helpimlost97/kikuchipy.git"
+FORK_URL = "https://github.com/helpimlost97/kikuchipy-workbench.git"
 UPSTREAM_URL = "https://github.com/jwestraadt/kikuchipy.git"
 BRANCH = "workbench"
 # The commit of the fork's workbench branch that everything in this folder was last run against: Johan's
 # develop at BASE_COMMIT plus the two workbench patches. Update it together with README.md.
 PINNED_COMMIT = "31d2882d"
 BASE_COMMIT = "4c7a0035"
-# Where step 1 fetches the workbench branch to, independent of how the clone's remotes are named.
-BRANCH_REF = f"refs/remotes/workbench-fork/{BRANCH}"
+# Where step 1 fetches the fork's branches to, independent of how the clone's remotes are named.
+FORK_REFS = "refs/remotes/workbench-fork"
+BRANCH_REF = f"{FORK_REFS}/{BRANCH}"
 
 
 def run(args, cwd=None, check=True, capture=False):
@@ -110,7 +112,7 @@ def main():
         if clone.exists() and any(clone.iterdir()):
             sys.exit(f"{clone} exists and is not a git clone; move it away or pass --dir")
         run(["git", "clone", FORK_URL, clone])
-    run(["git", "fetch", FORK_URL, f"+refs/heads/{BRANCH}:{BRANCH_REF}"], cwd=clone)
+    run(["git", "fetch", "--prune", FORK_URL, f"+refs/heads/*:{FORK_REFS}/*"], cwd=clone)
 
     latest = short_hash(clone, BRANCH_REF)
     print(f"newest commit of the fork's {BRANCH} branch: {latest}")
@@ -119,10 +121,13 @@ def main():
         run(["git", "log", "--oneline", f"{BASE_COMMIT}..FETCH_HEAD"], cwd=clone)
         return
 
-    # Step 2: a clean tree. "workbench" means the fetched branch, not a stale local branch of that name.
+    # Step 2: a clean tree. A branch name of the fork means the fetched branch, not a stale local branch of
+    # that name.
     target = a.commit
-    if target in (BRANCH, f"origin/{BRANCH}"):
-        target = BRANCH_REF
+    name = target.removeprefix("origin/")
+    fetched = run(["git", "rev-parse", "--verify", "--quiet", f"{FORK_REFS}/{name}"], cwd=clone, check=False, capture=True)
+    if fetched.returncode == 0:
+        target = f"{FORK_REFS}/{name}"
     dirty = local_changes(clone)
     if dirty:
         same = run(["git", "diff", "--quiet", target], cwd=clone, check=False)
