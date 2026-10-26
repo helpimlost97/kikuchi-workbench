@@ -5,18 +5,21 @@
     python kikuchi_workbench.py --preset preset_RKD.txt      # start with the indexing settings of a preset file
     python kikuchi_workbench.py --no-processor               # the indexing and montage tabs only
 
-Three tabs:
+Four tabs:
 
 1. **Pattern processor**: the Kikuchi Pattern Processor (pattern_processor/gpu_pattern_viewer.py, which also
    runs on its own as a stand-alone window). Load a UP1/UP2,
    set the aperture, IQ range, NLPAR and the processing chain as usual. "Apply && Save" still writes a file; the
    saved file is then offered to the indexing tab automatically.
-2. **Spherical indexing**: the settings of sph_core.Settings as a form. The patterns come from a
+2. **Index a point** (point_tab.py): load a pattern file, click a point on its map (the scan file's IQ column,
+   or a quasi-IQ map built on request), index that one pattern on the CPU and see it next to the master pattern
+   simulated at the orientation found. The file fields are shared with the indexing tab.
+3. **Spherical indexing**: the settings of sph_core.Settings as a form. The patterns come from a
    file (anything kikuchipy loads, memory-mapped when big): "Load processed patterns" takes the file the
    processor's "Apply && Save" just wrote (every pattern of it is indexed, the ones outside the processor's IQ
    range too: the processor writes them unprocessed), the browse button any other file. Check the geometry on
    one pattern, index a test region, index the full map, save .ang/.h5. Load and save presets.
-3. **Montage batch** (montage_tab.py): the two steps above for every tile of an EDAX APEX montage.
+4. **Montage batch** (montage_tab.py): processing and indexing for every tile of an EDAX APEX montage.
 
 Only one data set is in memory at a time: loading a file in the processor unloads the indexer's patterns and
 result, loading in the indexing tab unloads the processor. The long steps (loading, indexing, comparing) run on
@@ -95,6 +98,7 @@ import ebsd_params  # noqa: E402
 import sph_core  # noqa: E402
 from live_view import LiveView  # noqa: E402
 from montage_tab import MontageTab  # noqa: E402
+from point_tab import PointTab  # noqa: E402
 from sph_core import Settings  # noqa: E402
 
 __version__ = "0.4.0"
@@ -493,7 +497,8 @@ class SettingsForm(QWidget):
 
 
 class MapCanvas(QWidget):
-    """A matplotlib figure with its navigation toolbar: the Results tab and the geometry check panels."""
+    """A matplotlib figure with its navigation toolbar: the Results tab, the geometry check panels and the
+    point tab's measured | simulated panels."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -510,15 +515,15 @@ class MapCanvas(QWidget):
         self.figure.clear()
         self.canvas.draw_idle()
 
-    def show_panels(self, panels, title=""):
-        """Replace the figure by a grid of images, up to three per row.
+    def show_panels(self, panels, title="", per_row=3):
+        """Replace the figure by a grid of images, up to ``per_row`` per row.
 
         ``panels``: list of ``(title, image, imshow kwargs, colorbar label or None)``; an image is a 2D array or an
         RGB array. ``title`` is the figure's suptitle.
         """
         self.figure.clear()
         n = len(panels)
-        ncols = min(n, 3)
+        ncols = min(n, int(per_row))
         nrows = (n + ncols - 1) // ncols
         axes = self.figure.subplots(nrows, ncols, squeeze=False)
         for ax in axes.ravel():
@@ -540,16 +545,18 @@ class MapCanvas(QWidget):
 
 
 class Workbench(QMainWindow):
-    """The main window: the three tabs and the state of the indexing tab.
+    """The main window: the four tabs and the state of the indexing tab (shared with the point tab).
 
     State of the indexing tab (all on the GUI thread; the worker closures read the dicts they were given):
 
     - ``loaded``: the pattern file as loaded by 'Load patterns', or None. Keys: ``key`` (``_load_key`` of the
       settings it was loaded with), ``signal`` (the kikuchipy EBSD signal, raw or, once ``preprocessed`` is set,
       with the background removals done in place), ``scan`` (the scan file's parameters, dict or None), ``iq``
-      (the stretched quasi-IQ map, 2D float array or 1D for a line scan), ``static_bg`` (the sample mean pattern,
-      for the click preview), ``source`` (always "file"), ``source_file`` (the pattern file path, None for the
-      demo), ``nav_shape`` ((rows, cols)) and ``preprocessed`` ((static, dynamic) once a removal was done in place).
+      (the stretched map of the live views, 2D float array or 1D for a line scan; None until ``build_map`` made
+      one), ``iq_source`` ("quasi" for the quasi-IQ map, "scan" for the scan file's IQ column, None without a
+      map), ``static_bg`` (the sample mean pattern, for the click preview), ``source`` (always "file"),
+      ``source_file`` (the pattern file path, None for the demo), ``nav_shape`` ((rows, cols)) and
+      ``preprocessed`` ((static, dynamic) once a removal was done in place).
     - ``prepared``: the signal a step indexed, with keys ``key`` (``_prepare_key``), ``signal``, ``scan``, ``source``
       and ``source_file``; None when the next step must prepare again.
     - ``harmonics`` / ``harmonics_key``: the expanded master pattern(s) (list) and the settings they belong to
@@ -587,12 +594,15 @@ class Workbench(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
         self.proc = None
-        self.montage_tab = None   # log() is called before the montage tab exists
+        self.montage_tab = None   # log() is called before the montage and point tabs exist
+        self.point_tab = None
         self._build_processor_tab()
         self._build_indexing_tab()
         self._live_view = self.live   # the live view of the current run: this tab's or the montage tab's
+        self.point_tab = PointTab(self)   # after the indexing tab: its file fields are mirrored
+        self.tabs.insertTab(1, self.point_tab, "2. Index a point")
         self.montage_tab = MontageTab(self)
-        self.tabs.addTab(self.montage_tab, "3. Montage batch")
+        self.tabs.addTab(self.montage_tab, "4. Montage batch")
         self.tabs.setCurrentIndex(1 if self.proc is None else 0)
         if preset:
             self.load_preset(preset)
@@ -606,9 +616,12 @@ class Workbench(QMainWindow):
     def _build_processor_tab(self):
         """Add the processor's own MainWindow as tab 1, or a note when it was not found.
 
-        Two of the processor's entry points are wrapped without changing its code: the file its 'Apply && Save'
-        writes is captured (to offer it to the indexing tab), and its ``load_path`` first unloads the indexer's
-        data set.
+        Three of the processor's entry points are wrapped without changing its code: the file its 'Apply && Save'
+        writes is captured (to offer it to the indexing tab); its ``load_path`` first unloads the indexer's data
+        set and, once the file is loaded, puts its path into the pattern file field shared by the point and
+        indexing tabs (not during a montage batch, which loads tile after tile); and its 'Load UP1 / UP2' dialog
+        opens on that shared pattern file, so the file loaded in the other tabs is one click away here. One data
+        set stays in memory at a time: the path is shared, the patterns are loaded by the tab that needs them.
         """
         if gpv is None:
             w = QWidget()
@@ -634,6 +647,17 @@ class Workbench(QMainWindow):
                 result = base_dialog.getSaveFileName(*a, **k)
                 recorder["path"] = result[0] if result else None
                 return result
+
+            @staticmethod
+            def getOpenFileName(*a, **k):
+                # the processor's 'Load UP1 / UP2' dialog (caption, blank start folder) opens on the pattern file
+                # shared by the point and indexing tabs: that file pre-selected, or its folder for another type
+                a = list(a)
+                if len(a) >= 3 and a[1] == "Open UP1/UP2 File" and not a[2]:
+                    shared = self.pattern_file_edit.text().strip()
+                    if shared:
+                        a[2] = shared
+                return base_dialog.getOpenFileName(*a, **k)
 
         gpv.QFileDialog = _RecordingFileDialog
         original_apply_and_save = self.proc.apply_and_save
@@ -662,6 +686,10 @@ class Workbench(QMainWindow):
                 return
             self.unload_indexing("a file is being loaded in the pattern processor")
             original_load_path(path)
+            # the loaded file becomes the pattern file of the point and indexing tabs (their field is shared)
+            if not self.batch_running and self.proc.orig_path == path and self.pattern_file_edit.text().strip() != path:
+                self.pattern_file_edit.setText(path)
+                self.log(f"Pattern file of the point and indexing tabs set to {path} ('Load patterns' there loads it)")
 
         self.proc.load_path = load_path_exclusive
 
@@ -684,9 +712,13 @@ class Workbench(QMainWindow):
         self.prepared = None
         self.load_patterns_clicked()
 
-    # ---------------------------------------------------------------- tab 2: spherical indexing
+    # ---------------------------------------------------------------- tab 3: spherical indexing
     def _build_indexing_tab(self):
-        """Build tab 2: the settings form on the left, the buttons, live view, result maps and log on the right."""
+        """Build tab 3: the settings form on the left, the buttons, live view, result maps and log on the right.
+        Keeps the widgets the point tab mirrors: the pattern, scan and master file edits (``pattern_file_edit``,
+        ``scan_file_edit``, ``master_file_edit``), the projection center edit (``pc_edit``), the bandwidth combo
+        (``bandwidth_combo``), the AHE tiles spin box (``w_regions``) and the circular mask box (``w_circular``);
+        and the tab widget as ``indexing_tab``."""
         tab = QWidget()
         outer = QHBoxLayout(tab)
         self.form = form = SettingsForm()
@@ -704,8 +736,9 @@ class Workbench(QMainWindow):
                                            "to it. Blank = the nickel demo data",
             filter="Pattern files (*.up1 *.up2 *.h5 *.hdf5 *.oh5 *.edaxh5 *.ebsp *.dat);;All files (*)",
             on_chosen=lambda path: self.load_patterns_clicked())
-        form.add_path("SCAN_FILE", "Scan file (.ang/.edaxh5):", tip="The .ang or .edaxh5 written at acquisition: gives the projection center, map size and step",
-                      filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)", start_dir=self._pattern_file_dir)
+        self.scan_file_edit = form.add_path(
+            "SCAN_FILE", "Scan file (.ang/.edaxh5):", tip="The .ang or .edaxh5 written at acquisition: gives the projection center, map size and step",
+            filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)", start_dir=self._pattern_file_dir)
         form.add_text("EDAXH5_MAP", "edaxh5 map filter:", tip="Only for .edaxh5 files with several maps: part of the map's name, e.g. 'Area 8'",
                       placeholder="None", literal=False)
         self.btn_load = QPushButton("Load patterns (quasi-IQ map)")
@@ -732,14 +765,15 @@ class Workbench(QMainWindow):
         form.add_widget(note)
 
         form.group("Master pattern(s)")
-        form.add_path("MASTER_FILE", "Master file(s):", tip="EMSphInx .sht or EMsoft master pattern .h5; several files (one per phase) as a list ['a.sht', 'b.sht']",
-                      filter="Master patterns (*.sht *.h5 *.hdf5);;All files (*)", multi=True)
+        self.master_file_edit = form.add_path(
+            "MASTER_FILE", "Master file(s):", tip="EMSphInx .sht or EMsoft master pattern .h5; several files (one per phase) as a list ['a.sht', 'b.sht']",
+            filter="Master patterns (*.sht *.h5 *.hdf5);;All files (*)", multi=True)
         form.add_int("MASTER_BANDWIDTH", "Master bandwidth (.h5):", 384, 16, 1024, "Bandwidth of the harmonics computed from an EMsoft .h5 master pattern; keep >= 384")
         form.add_text("MASTER_ENERGY", "Master energy keV (.h5):", tip="Only for .h5 masters with several energies; blank = all, weighted", placeholder="None")
         form.add_bool("OVERRIDE_MASTER_SAMPLE_TILT", "Override master sample tilt", "Use the sample tilt below even when the master pattern was simulated for another one; indexing refuses the mismatch otherwise")
 
         form.group("Detector geometry")
-        form.add_text("PC", "Projection center (x*, y*, z*):", (0.5, 0.5, 0.5), "Values from an .ang file are in the EDAX convention")
+        self.pc_edit = form.add_text("PC", "Projection center (x*, y*, z*):", (0.5, 0.5, 0.5), "Values from an .ang file are in the EDAX convention")
         self.pc_convention_combo = form.add_combo("PC_CONVENTION", "PC convention:", ["edax", "tsl", "bruker", "oxford", "emsoft"], "edax")
         self.pc_convention_combo.currentTextChanged.connect(lambda *_: self.auto_px_size())
         form.add_text("SAMPLE_TILT", "Sample tilt deg:", tip="Blank = the tilt the master pattern was simulated for (as EMSphInx does)", placeholder="None = from master")
@@ -751,12 +785,12 @@ class Workbench(QMainWindow):
 
         form.group("Indexing")
         bandwidths = [16, 32, 53, 63, 68, 74, 88, 95, 113, 123, 158, 172, 188, 263, 383]
-        form.add_combo("BANDWIDTH", "Bandwidth:", bandwidths, 68, "68 = EMSphInx default; 88 or 123 for more accuracy at lower speed (fast bandwidths only)")
+        self.bandwidth_combo = form.add_combo("BANDWIDTH", "Bandwidth:", bandwidths, 68, "68 = EMSphInx default; 88 or 123 for more accuracy at lower speed (fast bandwidths only)")
         form.add_combo("BACKEND", "Backend:", ["gpu", "cpu"], "gpu")
         form.add_int("N_WORKERS", "Dask workers:", max(1, (os.cpu_count() or 8) // 2), 1, 256, "About the number of performance cores")
         form.add_bool("REFINE", "Newton refinement", "", True)
         self.w_regions = form.add_int("N_REGIONS", "AHE tiles (n_regions):", 10, 0, 64, "Adaptive histogram equalization tiles per axis; 0 = off")
-        form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector", True)
+        self.w_circular = form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector", True)
         self.w_gaussian = form.add_bool("GAUSSIAN_BACKGROUND", "Gaussian background", "Fit and subtract a 2D Gaussian background (EMSphInx gausbckg)")
         form.add_bool("NORMALIZE", "Normalized cross-correlation", "", True)
         form.add_text("CHUNKSIZE", "Chunk / GPU batch size:", tip="Patterns per chunk; blank = automatic from free VRAM", placeholder="None = automatic")
@@ -822,7 +856,8 @@ class Workbench(QMainWindow):
         split.setSizes([600, 300])
         rl.addWidget(split)
         outer.addWidget(side_by_side(form, right))
-        self.tabs.addTab(tab, "2. Spherical indexing")
+        self.indexing_tab = tab
+        self.tabs.addTab(tab, "3. Spherical indexing")
 
     # ---------------------------------------------------------------- settings, presets, log
     def settings(self) -> Settings:
@@ -870,18 +905,21 @@ class Workbench(QMainWindow):
         self.log(f"Preset saved: {path} ({len(PRESET_FIELDS)} indexing settings)")
 
     def log(self, text: str):
-        """Append a line to the log pane (and the montage tab's), scrolled to the end. GUI thread; the workers
-        reach it through their ``log`` signal."""
+        """Append a line to the log pane (and the point and montage tabs'), scrolled to the end. GUI thread; the
+        workers reach it through their ``log`` signal."""
         self.log_box.appendPlainText(text)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
-        if self.montage_tab is not None:
-            self.montage_tab.log(text)
+        for tab in (self.point_tab, self.montage_tab):
+            if tab is not None:
+                tab.log(text)
 
     def set_progress(self, text: str):
-        """Show ``text`` (its last 200 characters) in the status line under the views, and in the montage tab's."""
+        """Show ``text`` (its last 200 characters) in the status line under the views, and in the point and
+        montage tabs'."""
         self.progress_label.setText(text[-200:])
-        if self.montage_tab is not None:
-            self.montage_tab.set_progress(text)
+        for tab in (self.point_tab, self.montage_tab):
+            if tab is not None:
+                tab.set_progress(text)
 
     def _busy(self, busy: bool):
         """Disable (``busy``) or enable the action buttons of the indexing tab. 'Load processed patterns' is only
@@ -891,6 +929,8 @@ class Workbench(QMainWindow):
                   self.btn_preset_load, self.btn_scan, self.btn_load):
             b.setEnabled(not busy)
         self.btn_load_processed.setEnabled(not busy and bool(self.processed_file))
+        if self.point_tab is not None:
+            self.point_tab._busy(busy)
 
     def worker_running(self) -> bool:
         """True while a worker thread runs, or the montage tab's batch processing (GUI thread) is in progress."""
@@ -1043,8 +1083,8 @@ class Workbench(QMainWindow):
         """Drop the indexer's loaded patterns and everything derived from them (prepared signal, last run;
         ``keep_run`` is a run of the data set about to be loaded again, which stays).
 
-        Clears the live view's base map and, unless a run is kept, the result maps; logs it with ``why`` when
-        there was something to unload. Used by the processor's load and the montage tab as well.
+        Clears the live view's base map, the point tab and, unless a run is kept, the result maps; logs it with
+        ``why`` when there was something to unload. Used by the processor's load and the montage tab as well.
         """
         had = self.loaded is not None or self.prepared is not None
         self.loaded = None
@@ -1052,6 +1092,8 @@ class Workbench(QMainWindow):
         self.last_run = keep_run
         self._preview_rc = None
         self.live.set_base_map(None, "")
+        if self.point_tab is not None:
+            self.point_tab.unload()
         if keep_run is None:
             self.maps.clear()
         gc.collect()
@@ -1074,21 +1116,28 @@ class Workbench(QMainWindow):
         self.log("Pattern processor: data set unloaded (a file is being loaded in the indexing tab)")
         return True
 
-    def load_patterns_clicked(self):
-        """'Load patterns (quasi-IQ map)': load the pattern file on a worker, compute and show its quasi-IQ map.
+    def load_patterns_clicked(self, iq_source: str | None = "quasi"):
+        """'Load patterns (quasi-IQ map)': load the pattern file on a worker, then build and show its map.
 
-        Nothing is done when the same data set (``_load_key``) is already loaded, except showing it again. The
-        processor's data set is unloaded first (one data set at a time), then the indexer's own; a result of this
-        very data set is kept, so it can still be saved. On the worker: ``sph_core.load_patterns``, the quasi-IQ map
-        (progress events ``what="iq"``) and the sample mean pattern for the click preview. Done: ``loaded`` is set,
-        the pattern width taken from the signal and the map shown in the Live view. Refused while a step runs.
+        ``iq_source``: the map built right after the load by ``build_map``: "quasi" (the quasi-IQ map, the
+        indexing tab's button), "scan" (the IQ column of the scan file, the point tab's load with a scan file) or
+        None (no map yet; the point tab's load without a scan file, 'Build quasi-IQ map' makes one later).
+        Nothing is done when the same data set (``_load_key``) is already loaded, except showing it again, and
+        building the map asked for when the loaded one is of another source or missing. The processor's data set
+        is unloaded first (one data set at a time), then the indexer's own; a result of this very data set is
+        kept, so it can still be saved. On the worker: ``sph_core.load_patterns`` and the sample mean pattern
+        for the click preview. Done: ``loaded`` is set (without a map), the pattern width taken from the signal,
+        the data set shown and the map started. Refused while a step runs.
         """
         if self._refuse_while_busy():
             return
         st = self.settings()
         key = self._load_key(st)
         if self.loaded is not None and self.loaded["key"] == key:
-            self._show_loaded()
+            if iq_source is not None and self.loaded.get("iq_source") != iq_source:
+                self.build_map(iq_source)
+            else:
+                self._show_loaded()
             return
         if not self._unload_processor():
             return
@@ -1096,21 +1145,53 @@ class Workbench(QMainWindow):
         keep_run = self.last_run if self.last_run is not None and self.last_run.get("load_key") == key else None
         self.unload_indexing(keep_run=keep_run)
 
-        def work(log, emit):
+        def work(log):
             # worker thread
             s, scan = sph_core.load_patterns(st, log=log)
-            t0 = time.perf_counter()
-            iq = sph_core.quasi_iq(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
             static_bg = sph_core.sample_mean_pattern(s)
-            log(f"Quasi-IQ map (per-pattern standard deviation) in {time.perf_counter() - t0:.1f} s")
-            return {"key": key, "signal": s, "scan": scan, "iq": sph_core.stretch(iq), "source": "file", "static_bg": static_bg,
-                    "source_file": st.PATTERN_FILE, "nav_shape": tuple(s.axes_manager.navigation_shape[::-1])}
+            return {"key": key, "signal": s, "scan": scan, "iq": None, "iq_source": None, "source": "file",
+                    "static_bg": static_bg, "source_file": st.PATTERN_FILE,
+                    "nav_shape": tuple(s.axes_manager.navigation_shape[::-1])}
 
         def done(loaded):
             self.loaded = loaded
             self.prepared = None
             sig_shape = loaded["signal"].axes_manager.signal_shape
             self.set_pattern_width(int(sig_shape[0]))
+            self._show_loaded()
+            if iq_source is not None:
+                self.build_map(iq_source)
+
+        self._start(work, done)
+
+    def build_map(self, iq_source: str = "quasi"):
+        """Build the map of the loaded data set on a worker and show it in the live views: ``iq_source``
+        "quasi" = the quasi-IQ map (``sph_core.quasi_iq``, the standard deviation of every raw pattern, one read
+        of the file, progress events ``what="iq"``), "scan" = the IQ column of the scan file
+        (``sph_core.scan_iq_map``, which must be this scan's). Stored as ``loaded["iq"]`` / ``loaded["iq_source"]``
+        (stretched). Refused while a step runs or without a loaded data set (a message says so)."""
+        if self._refuse_while_busy():
+            return
+        loaded = self.loaded
+        if loaded is None or loaded.get("signal") is None:
+            QMessageBox.information(self, "Map", "Load patterns first")
+            return
+        st = self.settings()
+        s, nav_shape = loaded["signal"], loaded["nav_shape"]
+
+        def work(log, emit):
+            # worker thread
+            if iq_source == "scan":
+                return sph_core.scan_iq_map(st, nav_shape, log)
+            t0 = time.perf_counter()
+            iq = sph_core.quasi_iq(s, progress=lambda f: emit("progress", {"frac_index": f, "frac_refine": 1.0, "what": "iq"}))
+            log(f"Quasi-IQ map (per-pattern standard deviation) in {time.perf_counter() - t0:.1f} s")
+            return sph_core.stretch(iq)
+
+        def done(iq):
+            if self.loaded is not loaded:  # unloaded meanwhile (the busy guards make this unlikely)
+                return
+            loaded["iq"], loaded["iq_source"] = iq, iq_source
             self._show_loaded()
 
         self._start(work, done)
@@ -1119,9 +1200,10 @@ class Workbench(QMainWindow):
         """Show the pattern at (row, col) of the loaded file as the indexer will see it: the background
         removals and the equalization that are ticked, nothing else (the raw pattern when none is).
 
-        Slot of the live view's ``point_clicked``; ignored while a run is shown or nothing is loaded, or when
-        (row, col) is outside the map. Reads one pattern from the signal on the GUI thread (one slice of a memory
-        map), marks the point on the map and names the applied steps in the status line.
+        Slot of the ``point_clicked`` of both live views (this tab's and the point tab's); ignored while a run is
+        shown or nothing is loaded, or when (row, col) is outside the map. Reads one pattern from the signal on
+        the GUI thread (one slice of a memory map), shows it and marks the point in both views and names the
+        applied steps in the status line.
         """
         loaded = self.loaded
         if loaded is None or loaded.get("signal") is None or self.live_run is not None:
@@ -1140,8 +1222,9 @@ class Workbench(QMainWindow):
             self.log(f"Pattern preview failed: {type(e).__name__}: {e}")
             return
         self._preview_rc = (int(row), int(col))
-        self.live.show_pattern(shown, int(row), int(col))
-        self.live.set_marker(int(row), int(col))
+        for view in self._preview_views():
+            view.show_pattern(shown, int(row), int(col))
+            view.set_marker(int(row), int(col))
         steps = [name for name, on in (("static background", st.REMOVE_STATIC_BACKGROUND), ("dynamic background", st.REMOVE_DYNAMIC_BACKGROUND),
                                        ("Gaussian background", st.GAUSSIAN_BACKGROUND), (f"AHE {st.N_REGIONS} x {st.N_REGIONS}", bool(st.N_REGIONS)))
                  if on]
@@ -1152,20 +1235,31 @@ class Workbench(QMainWindow):
         if self._preview_rc is not None and self.live_run is None:
             self.preview_point(*self._preview_rc)
 
+    def _preview_views(self):
+        """The views that show the loaded map, the clicked pattern and its marker (``set_base_map``,
+        ``show_pattern``, ``set_marker``): this tab's live view and the point tab."""
+        return [self.live] + ([self.point_tab] if self.point_tab is not None else [])
+
     def _show_loaded(self):
-        """Put the loaded data set's quasi-IQ map into the Live view, bring that view to the front and preview the
-        centre pattern. A 1D map (a line scan) gets a note instead of a map."""
+        """Put the loaded data set's map into the live views (this tab's and the point tab's), bring this tab's
+        Live view to the front and preview the centre pattern. Without a map yet (``build_map`` not run) or for a
+        1D map (a line scan) the views get a note instead of a map; the centre pattern is still previewed."""
         if self.loaded is None:
             return
-        iq = self.loaded["iq"]
+        iq, source = self.loaded["iq"], self.loaded.get("iq_source")
+        nav_shape = self.loaded["nav_shape"]
         name = os.path.basename(self.loaded["source_file"]) if self.loaded["source_file"] else "nickel demo"
-        if iq.ndim == 2:
-            self.live.set_base_map(iq, f"Quasi-IQ of {name} ({iq.shape[1]} x {iq.shape[0]} points)")
+        if iq is not None and iq.ndim == 2:
+            base, title = iq, f"{'IQ' if source == 'scan' else 'Quasi-IQ'} of {name} ({iq.shape[1]} x {iq.shape[0]} points)"
+        elif iq is None:
+            base, title = None, f"{name}: no map yet (give a scan file and load again, or 'Build quasi-IQ map')"
         else:
-            self.live.set_base_map(None, f"{name}: 1D map, no live view")
+            base, title = None, f"{name}: 1D map, no live view"
+        for view in self._preview_views():
+            view.set_base_map(base, title)
         self.view_tabs.setCurrentWidget(self.live)
-        if iq.ndim == 2 and self.loaded.get("signal") is not None:
-            self.preview_point(iq.shape[0] // 2, iq.shape[1] // 2)
+        if len(nav_shape) == 2 and self.loaded.get("signal") is not None:
+            self.preview_point(nav_shape[0] // 2, nav_shape[1] // 2)
 
     # ---------------------------------------------------------------- preparing patterns, master, detector
     def _prepare_key(self, st: Settings):

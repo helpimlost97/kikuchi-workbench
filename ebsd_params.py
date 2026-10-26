@@ -28,6 +28,7 @@ From Python:
     scan = ebsd_params.scan_info("scan.ang", pattern_file="scan.up1")
     ebsd_params.print_scan_info(scan)
     scan["pc"], scan["pattern_width"], scan["pattern_height"]
+    iq, scan = ebsd_params.scan_iq_map("scan.ang")        # the IQ column as a (rows, cols) map
 
 --- .edaxh5 ---
 For each EBSD map group ("OIM Map N", "EBSD+EDS Map N", ...) it prints the sections that matter for indexing:
@@ -516,6 +517,116 @@ def scan_info(scan_file=None, pattern_file=None, map_filter=None):
         else:
             info["notes"].append("the pattern size is only read from .up1/.up2 files")
     return info
+
+ANG_IQ_COLUMN = 5  # the data columns of an .ang file: phi1, PHI, phi2, x, y, IQ, CI, phase, SEM, fit, ...
+
+def _ang_column(path, column):
+    """One data column of an .ang file as a float32 array, in file order (the data rows are in row-major grid
+    order). pandas when it is installed (several times faster on a map of millions of points), else numpy."""
+    if np is None:
+        raise ImportError("numpy is needed to read the data columns of an .ang file")
+    try:
+        import pandas as pd
+    except ImportError:
+        pd = None
+    if pd is not None:
+        table = pd.read_csv(path, sep=r"\s+", comment="#", header=None, usecols=[column], dtype=np.float32,
+                            engine="c")
+        return np.ascontiguousarray(table.iloc[:, 0].to_numpy(dtype=np.float32))
+    return np.loadtxt(path, comments="#", usecols=(column,), dtype=np.float32, ndmin=1)
+
+def _h5_scalar(obj):
+    """The single value of a scalar or one-element dataset, bytes decoded; None when it is not one."""
+    try:
+        v = np.asarray(obj[()]).reshape(-1)[0]
+    except Exception:
+        return None
+    return v.decode(errors="replace") if isinstance(v, bytes) else v
+
+def _h5_iq(f, map_filter=None):
+    """The IQ column and the grid of an open HDF5 scan or result file: ``(iq (n,) float32, n_rows, n_cols, grid,
+    where)``, from the first layout that fits:
+
+    - an EDAX APEX project (``<... Map N>/EBSD/ANG/DATA/DATA`` record field ``IQ``, the map chosen by
+      ``map_filter``; the grid from the ANG header, see :func:`_scan_info_edaxh5`);
+    - an orix crystal map (``crystal_map/data/iq``, ``crystal_map/header/nx|ny|grid_type``), which is what the
+      workbench's *Save .h5* and EMSphInx-style results hold;
+    - an h5ebsd file (EDAX OIM, kikuchipy, EMSphInx, Bruker): a top-level scan group with ``EBSD/Data/IQ`` and the
+      size in ``EBSD/Header`` as ``nColumns``/``nRows`` (EDAX), ``n_columns``/``n_rows`` (kikuchipy) or
+      ``NCOLS_ODD``/``NROWS``, with ``Grid Type`` when present; ``map_filter`` chooses the scan group.
+
+    ``where`` names the group the values came from. Raises ValueError when no layout fits."""
+    maps = _ebsd_map_groups(f)
+    if map_filter:
+        maps = [m for m in maps if map_filter.lower() in m.lower()]
+    if maps:
+        info = dict.fromkeys(SCAN_INFO_KEYS)
+        info["notes"], info["phases"] = [], []
+        _scan_info_edaxh5(f.filename, info, map_filter)
+        table = f[maps[0]]["EBSD/ANG/DATA/DATA"]
+        if "IQ" not in table.dtype.names:
+            raise ValueError(f"the orientation table of {maps[0]} has no IQ field")
+        return (np.asarray(table["IQ"], dtype=np.float32).reshape(-1), info.get("n_rows"), info.get("n_cols"),
+                info.get("grid"), maps[0])
+    if "crystal_map" in f and "data/iq" in f["crystal_map"]:
+        g = f["crystal_map"]
+        hd = g["header"]
+        grid = _h5_scalar(hd["grid_type"]) if "grid_type" in hd else None
+        # orix 0.14 writes the sizes of the whole x and y columns as nx and ny, not the grid: the grid is the
+        # number of distinct x and y values (the data is in row-major order, x varying fastest)
+        n_cols = np.unique(np.round(np.asarray(g["data/x"], dtype=np.float64), 6)).size
+        n_rows = np.unique(np.round(np.asarray(g["data/y"], dtype=np.float64), 6)).size if "data/y" in g else 1
+        return (np.asarray(g["data/iq"], dtype=np.float32).reshape(-1), int(n_rows), int(n_cols),
+                None if grid is None else str(grid), "crystal_map")
+    scans = [k for k in f if isinstance(f[k], h5py.Group) and "EBSD/Data/IQ" in f[k]]
+    if map_filter:
+        scans = [s for s in scans if map_filter.lower() in s.lower()]
+    if scans:
+        g = f[scans[0]]["EBSD"]
+        hd = g["Header"] if "Header" in g else {}
+        def header(*names):
+            for name in names:
+                if name in hd:
+                    return _h5_scalar(hd[name])
+            return None
+        grid = header("Grid Type", "grid_type", "GRID")
+        return (np.asarray(g["Data/IQ"], dtype=np.float32).reshape(-1),
+                _to_int(header("nRows", "n_rows", "NROWS")), _to_int(header("nColumns", "n_columns", "NCOLS_ODD")),
+                None if grid is None else str(grid), scans[0])
+    raise ValueError("no EBSD map, crystal map or h5ebsd scan with an IQ column found in the file"
+                     + (f" (map filter {map_filter!r})" if map_filter else ""))
+
+def scan_iq_map(scan_file, map_filter=None):
+    """The image quality map stored in a scan or result file, as a float32 (rows, cols) array in the file's grid
+    order, with the ``info`` dict of :func:`scan_info` for the file (``info["map"]`` names the HDF5 group used).
+    Sources: the IQ column of an .ang file (the acquisition's Hough IQ, or a result's), or for an HDF5 file the
+    layouts of :func:`_h5_iq`: an EDAX APEX project (the map chosen by ``map_filter``), an orix crystal map (the
+    workbench's own ``.h5`` results, whose ``iq`` is the spherical image quality) or an h5ebsd scan (EDAX OIM,
+    kikuchipy, EMSphInx). Raises ValueError for a hexagonal grid, when the file does not state the map size, or
+    when the column's length is not rows x cols; OSError when the file cannot be read; ImportError without
+    numpy (or h5py for an HDF5 file)."""
+    scan_file = os.path.expanduser(str(scan_file))
+    info = scan_info(scan_file, map_filter=map_filter)
+    ext = os.path.splitext(scan_file)[1].lower()
+    if ext == ".ang":
+        iq = _ang_column(scan_file, ANG_IQ_COLUMN)
+        n_rows, n_cols, grid = info.get("n_rows"), info.get("n_cols"), info.get("grid")
+    elif ext in (".edaxh5", ".h5", ".hdf5"):
+        if h5py is None:
+            raise ImportError("h5py and numpy are needed to read HDF5 scan files")
+        with h5py.File(scan_file, "r") as f:
+            iq, n_rows, n_cols, grid, where = _h5_iq(f, map_filter)
+        info["map"] = where
+        info["notes"] = [n for n in info["notes"] if not n.startswith("no EBSD map groups found")]
+    else:
+        raise ValueError(f"unrecognized extension {ext!r}: expected .ang, .edaxh5 or .h5")
+    if str(grid or "").lower().startswith("hex"):
+        raise ValueError("the scan is on a hexagonal grid: its IQ column cannot be shown as a rectangular map")
+    if not n_rows or not n_cols:
+        raise ValueError("the scan file does not state the map size (rows and columns)")
+    if iq.size != n_rows * n_cols:
+        raise ValueError(f"the IQ column has {iq.size} values, the map {n_cols} x {n_rows} = {n_rows * n_cols} points")
+    return iq.reshape(int(n_rows), int(n_cols)), info
 
 def print_scan_info(info):
     """Print the dict returned by scan_info() as the labelled summary the workbench shows: pattern file, scan

@@ -1,8 +1,9 @@
 # GPU-accelerated spherical indexing of EBSD / RKD patterns
 
 The **Kikuchi workbench**: a PyQt5 GUI that puts the Kikuchi Pattern Processor (`pattern_processor/`,
-formerly its own repository) and GPU spherical indexing in one window, with a third tab that runs both over every tile of an EDAX APEX
-montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
+formerly its own repository) and GPU spherical indexing in one window, with a tab that indexes one clicked pattern and
+shows the master pattern at the orientation found, and a tab that runs processing and indexing over every tile of an
+EDAX APEX montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
 indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, which lives in his fork of kikuchipy;
 nothing of it is in upstream kikuchipy or on PyPI, so it is installed from a git clone (section 3).
 Everything in this repository is the GUI and the functions it calls; there are no notebooks.
@@ -21,8 +22,8 @@ only the path syntax in the examples changes.
 | `update_fork.py` | Clones or updates that clone, checks out the pinned commit, applies the patch and installs it, in one command. Also undoes an earlier patch first, so re-running it after Johan pushes new commits is safe. See step 3. |
 | `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Applied by `update_fork.py`, or by hand, see step 3. |
 | `pattern_processor/` | The Kikuchi Pattern Processor: `gpu_pattern_viewer.py` (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`, the montage batch API), its patched OpenCL NLPAR kernel, its own README, plan notes and HPC launch script. Tab 1 of the workbench, and still runnable on its own (`python pattern_processor/gpu_pattern_viewer.py`). Merged from `helpimlost97/kikuchi-pattern-processor` with its history. |
-| `kikuchi_workbench.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare; usable from scripts), `live_view.py` the animated progress view. |
-| `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.2. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's third tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
+| `kikuchi_workbench.py`, `point_tab.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare, plus the single-pattern functions; usable from scripts), `point_tab.py` the *Index a point* tab, `live_view.py` the animated progress view. |
+| `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.2. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's fourth tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
 | `preset_RKD.txt` | Example preset file for the GUI (an RKD data set, detector parallel to the sample): the indexing parameters as `NAME = value` lines. The paths in it are placeholders and are not read by the GUI. |
 | `ebsd_params.py` | Reads acquisition parameters (pattern size, projection center, map size, step) from an EDAX `.ang` or `.edaxh5` file and a `.up1`/`.up2` file. Used by the GUI's *Read scan parameters* and usable from the command line. |
 | `sph_benchmark.py` | CPU vs GPU speed and parity benchmark on the nickel demo data set. Use it to verify the install. |
@@ -182,13 +183,15 @@ automatic batch size is the same in both runs, and both runs give the same orien
 ### 6.1 The GUI: pattern processor and spherical indexing in one window
 
 `kikuchi_workbench.py` puts the Kikuchi Pattern Processor (`pattern_processor/gpu_pattern_viewer.py`)
-and the spherical indexing of `sph_core.py` into one PyQt5 window with three tabs:
+and the spherical indexing of `sph_core.py` into one PyQt5 window with four tabs:
 
 1. **Pattern processor**: `gpu_pattern_viewer.py` as it is, so it also runs on its own
    (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`).
-2. **Spherical indexing**: the indexing settings as a form on the left (drag the divider to
+2. **Index a point**: click a point on the map, index that one pattern and see it next to the master
+   pattern simulated at the orientation found, see 6.1.1.
+3. **Spherical indexing**: the indexing settings as a form on the left (drag the divider to
    resize it), the live view, the result maps and a log on the right.
-3. **Montage batch**: the two steps above for every tile of an EDAX APEX montage, see 6.2.
+4. **Montage batch**: processing and indexing for every tile of an EDAX APEX montage, see 6.2.
 
 The settings of the indexing tab (the names are those of `sph_core.Settings` and of the preset files):
 
@@ -221,6 +224,10 @@ Workflow in the indexing tab:
   (the processor's scan and NLPAR result, or the indexer's patterns, map and last result), so two
   scans never sit in memory together. After `Apply && Save`, loading the processed file in the
   indexing tab therefore empties the processor tab; the saved file is kept.
+- **One pattern file for the first three tabs**: the file loaded in the processor becomes the pattern
+  file of the point and indexing tabs (one field, shown in both; *Load patterns* in either loads it),
+  and the processor's *Load UP1 / UP2* dialog opens on the file set in those tabs. The path is shared,
+  the patterns are loaded by the tab that needs them.
 - **Pattern source**: always a file. **Load processed patterns** is greyed out until the
   processor's `Apply && Save` has written a file; it then puts that file into the pattern file box
   and loads it. Every pattern of the file is indexed: the processor leaves the patterns outside its
@@ -265,7 +272,7 @@ Workflow in the indexing tab:
 ```bash
 python kikuchi_workbench.py
 python kikuchi_workbench.py --preset preset_RKD.txt
-python kikuchi_workbench.py --no-processor                    # indexing and montage tabs only
+python kikuchi_workbench.py --no-processor                    # the point, indexing and montage tabs only
 ```
 
 On Windows `Open workbench.bat` does the same (set `PYTHON` at its top). The environment is the one
@@ -280,7 +287,57 @@ pane.
 
 Verified headlessly on the nickel demo data written as a `.up1` (no GPU in that environment, CPU
 backend): processor load and `Apply && Save`, `Load processed patterns`, quasi-IQ map, band-wise test region and full map with the live events, save. The
-band-wise result is checked to be identical to a single call.
+band-wise result is checked to be identical to a single call. The point tab was checked the same way (2026-10-25):
+the mirrored fields, a load without a map, a scan file of another scan refused, the quasi-IQ map on request, a
+point indexed with the indexer reused on the next point and rebuilt on a bandwidth change; its orientation is
+identical to `spherical_indexing` on the same pattern (`diagnostics/point_index_check.py`).
+
+#### 6.1.1 Index a point: one pattern against the master
+
+The **2. Index a point** tab (`point_tab.py`) indexes a single clicked pattern and shows the master pattern
+at the orientation found next to it, to check a point, the projection center, the camera tilt or the twist
+sign without indexing a region.
+
+- **Layout**: the files, the shared settings and the buttons on the left; the map in the middle, with
+  the status line and the log under it; on the right the clicked pattern as the indexer sees it above
+  the pattern simulated from the master. The **opacity slider** between them lays the simulated
+  pattern (raw, no equalization) over the measured one: 0 % shows the measured pattern alone, 100 %
+  the simulated one alone, anything between blends them so the band positions can be compared in
+  place.
+- **Files and settings**: the pattern file, scan file, master file(s), projection center, bandwidth,
+  AHE tiles and circular mask are the same as the indexing tab's (a change in either tab is a change in
+  both; adjust the PC or the bandwidth here and index the point again to see the match change, the
+  indexer is rebuilt on the next click). The master bandwidth, the tilts, pixel size and twist, the
+  background steps and the other indexing settings (refinement, Gaussian background, ...) are read
+  from the indexing tab.
+- **Load patterns** loads the file (one data set in memory at a time, as everywhere) and shows the
+  map: with a scan file given, the **IQ column of the scan file**: an `.ang` (the acquisition's Hough IQ,
+  or an indexing result's), an APEX `.edaxh5` (the map chosen by the map filter), an `.h5` written by
+  the workbench's *Save .h5* (orix crystal map; its IQ is the spherical one) or an h5ebsd `.h5` (EDAX
+  OIM, kikuchipy, EMSphInx). It must be this scan's and on a square grid.
+  Without a scan file the map stays empty until **Build quasi-IQ map** computes the quasi-IQ map
+  (the standard deviation of every raw pattern, one read of the file); nothing is computed on its
+  own. The indexing tab still builds the quasi-IQ map by itself. **Read scan parameters** is the
+  indexing tab's button, for the projection center.
+- **Click a point** on the map: the pattern is shown on the right as the indexer will see it (as in
+  the indexing tab, which follows the same click) and marked in red; the simulated panel empties
+  until the point is indexed.
+- **Index this point** indexes that pattern alone, on the CPU whatever `BACKEND` says, and fills the
+  right column: the measured pattern as the indexer sees it (its pixel mask included) on top, and
+  below it the pattern simulated from the master at the orientation found (the fork's
+  `to_master_pattern()` of the cached harmonics, i.e. exactly what the indexer matched against,
+  projected with `get_patterns()` on the same detector, shown as it comes from the master). The
+  phase, the Euler angles (Bunge, with `TWIST` applied as in the saved maps), the score, the IQ, the
+  normalized cross-correlation between the measured pattern and the simulated one put through the
+  same equalization, and the timings are in the titles, the result line and the log. The indexer and the
+  Lambert master are built on the first click (a second at bandwidth 68, longer at higher
+  bandwidths; the first simulation also compiles for a few seconds) and reused until the master,
+  the detector or an indexing setting changes. A simulated pattern that looks nothing like the
+  measured one points at the projection center, the camera tilt or `FLIP_PATTERNS_UD`.
+
+From a script the same steps are `sph_core.make_point_indexer`, `index_pattern`, `lambert_master` and
+`simulate_pattern` (see the module docstring); `diagnostics/point_index_check.py` runs them on the nickel
+demo and checks the orientation against `spherical_indexing`.
 
 ### 6.2 Montage batch: process and index every tile of an APEX montage
 
@@ -291,7 +348,7 @@ how the files are linked (the project never names the pattern files); `STITCH_DA
 describes both formats. Nothing is stitched here: every tile is processed and indexed on its own
 grid, and the stitching is done afterwards in OIM Analysis or MTEX from the output project.
 
-The **3. Montage batch** tab:
+The **4. Montage batch** tab:
 
 - **Project**: browse for the `.edaxh5` (or type the path and *Load project*). The table lists every
   map of the project with its grid, the raw pattern file found for it in the *raw pattern folder*
@@ -313,7 +370,7 @@ The **3. Montage batch** tab:
 - **2. Batch indexing** uses the indexing tab's settings: one projection center, sample tilt,
   camera tilt and pixel size for the whole montage, as typed there (*Copy the project's PC and
   tilts to the indexing tab* fills them from the first tile; check them). *Load selected tile in
-  the indexer* puts one processed tile into tab 2 for a test region. *Index all tiles* loads each
+  the indexer* puts one processed tile into tab 3 for a test region. *Index all tiles* loads each
   processed tile memory mapped, indexes it band by band with the live view
   of this tab, and writes its orientation matrices, cross-correlation (`CI`), image quality
   (`IQ`, EMSphInx's discrete cosine measure, as EMSphInx's own .ang output; tick *Keep the

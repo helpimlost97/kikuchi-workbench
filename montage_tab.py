@@ -1,4 +1,4 @@
-"""Tab 3 of the Kikuchi workbench: batch processing and batch indexing of an EDAX APEX montage.
+"""Tab 4 of the Kikuchi workbench: batch processing and batch indexing of an EDAX APEX montage.
 
 Two separate jobs, run one after the other by the user:
 
@@ -150,12 +150,12 @@ class MontageTab(QWidget):
                                      "project is made and every tile is indexed again")
         form.add_widget(self.resume_check)
         self.btn_use_geometry = QPushButton("Copy the project's PC and tilts to the indexing tab")
-        self.btn_use_geometry.setToolTip("Puts the first tile's pattern center (EDAX), sample tilt and camera elevation into tab 2; "
+        self.btn_use_geometry.setToolTip("Puts the first tile's pattern center (EDAX), sample tilt and camera elevation into tab 3; "
                                          "check them there, they are your inputs")
         self.btn_use_geometry.clicked.connect(self.copy_geometry)
         form.add_widget(self.btn_use_geometry)
         self.btn_load_index = QPushButton("Load selected tile in the indexer")
-        self.btn_load_index.setToolTip("Loads the selected tile (processed file when there is one) in tab 2, to test the indexing on it")
+        self.btn_load_index.setToolTip("Loads the selected tile (processed file when there is one) in tab 3, to test the indexing on it")
         self.btn_load_index.clicked.connect(self.load_selected_in_indexer)
         form.add_widget(self.btn_load_index)
         self.btn_index = QPushButton("Index all tiles")
@@ -527,7 +527,7 @@ class MontageTab(QWidget):
         for name in ("SCAN_FILE", "EDAXH5_MAP", "NAV_SHAPE", "STEP_SIZE", "ROI"):
             fields[name][1](None)
         self.wb.prepared = None
-        self.wb.tabs.setCurrentIndex(1)
+        self.wb.tabs.setCurrentWidget(self.wb.indexing_tab)
         self.wb.load_patterns_clicked()
 
     def index_all(self):

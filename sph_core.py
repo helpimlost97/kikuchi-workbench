@@ -14,6 +14,9 @@ in here imports Qt, so the module can be used from a script too::
     det = sph_core.make_detector(st, s, harmonics)
     xmap, xmap_indexed, dt = sph_core.index(s, harmonics, det, st)
     sph_core.save_xmap(xmap, "results", "scan_sph_bw68")
+    # one pattern, and the master pattern at the orientation found (the workbench's 'Index this point')
+    res = sph_core.index_pattern(sph_core.make_point_indexer(harmonics, det, st), s.data[10, 20])
+    simulated = sph_core.simulate_pattern(sph_core.lambert_master(harmonics[0]), res["rotation"], det)
 
 :func:`index_blocks` gives the same map band by band (bands of whole map rows) with progress events, for a GUI;
 ``kikuchi_workbench.py`` and ``montage_tab.py`` drive their live views from it. A preset file (``NAME = value``
@@ -466,6 +469,34 @@ def stretch(image: np.ndarray, lo_pct: float = 1.0, hi_pct: float = 99.0) -> np.
     return out
 
 
+def scan_iq_map(st: Settings, nav_shape: tuple, log: Log = _print) -> np.ndarray:
+    """The image quality map of ``SCAN_FILE`` (the IQ column of the .ang, or the IQ field of the .edaxh5 map
+    chosen by ``EDAXH5_MAP``; ``ebsd_params.scan_iq_map``), cropped to ``ROI`` like the patterns, stretched to
+    0..1 (:func:`stretch`) for the live view. ``nav_shape`` is the loaded signal's (rows, cols): a map of another
+    size is a ValueError (the scan file is not this scan's, or the ROI is wrong). Raises ValueError without a
+    scan file. Logs the source and the time."""
+    import ebsd_params
+
+    if not st.SCAN_FILE:
+        raise ValueError("SCAN_FILE is not set: no IQ map to read")
+    t0 = time.perf_counter()
+    iq, info = ebsd_params.scan_iq_map(st.SCAN_FILE, map_filter=st.EDAXH5_MAP)
+    if st.ROI is not None:
+        c0, c1, r0, r1 = st.ROI
+        iq = iq[r0:r1, c0:c1]
+    if tuple(iq.shape) != tuple(int(v) for v in nav_shape):
+        raise ValueError(f"the IQ map of {Path(st.SCAN_FILE).name} is {iq.shape} (rows, cols) after the ROI, the loaded "
+                         f"patterns are {tuple(nav_shape)}: not the same scan?")
+    finite = iq[np.isfinite(iq)]
+    if finite.size == 0 or float(finite.max()) == float(finite.min()):
+        raise ValueError(f"the IQ column of {Path(st.SCAN_FILE).name} is constant ({float(finite[0]) if finite.size else 'NaN'}): "
+                         "it holds no map (an RKD scan collected without Hough indexing, for instance). Use an indexing "
+                         "result's .ang/.h5 as the scan file, or 'Build quasi-IQ map'")
+    log(f"IQ map read from {Path(st.SCAN_FILE).name}" + (f" ({info['map']})" if info.get("map") else "")
+        + f" in {time.perf_counter() - t0:.1f} s")
+    return stretch(iq)
+
+
 def sample_mean_pattern(s, max_patterns: int = 5000) -> np.ndarray:
     """The static background the indexing would use, float32 of the signal shape: the one stored with the file,
     else the mean of up to ``max_patterns`` patterns spread over the map. Same rule as :func:`preprocess`."""
@@ -509,12 +540,15 @@ def preview_pattern(pattern: np.ndarray, st: Settings, static_bg: np.ndarray | N
     return np.asarray(p, dtype=np.float32)
 
 
-def preprocess_pattern_for_preview(pattern: np.ndarray, st: Settings) -> np.ndarray:
+def preprocess_pattern_for_preview(pattern: np.ndarray, st: Settings, good_pixels: np.ndarray | None = None) -> np.ndarray:
     """One pattern through the indexer's own preprocessing (Gaussian background, adaptive histogram equalization
-    with ``N_REGIONS`` tiles), by the fork's private function so the preview matches what is indexed."""
+    with ``N_REGIONS`` tiles), by the fork's private function so the preview matches what is indexed.
+    ``good_pixels`` (a bool mask of the pattern shape, e.g. ``SphericalIndexer.good_pixels``, the circular mask)
+    restricts the equalization to those pixels as the indexer does; None uses the whole pattern."""
     from kikuchipy.indexing._spherical._preprocessing import _preprocess_pattern
 
-    return _preprocess_pattern(np.asarray(pattern), gaussian_background=st.GAUSSIAN_BACKGROUND, n_regions=st.N_REGIONS)
+    return _preprocess_pattern(np.asarray(pattern), good_pixels=good_pixels, gaussian_background=st.GAUSSIAN_BACKGROUND,
+                               n_regions=st.N_REGIONS)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -621,6 +655,98 @@ def back_project(pattern: np.ndarray, det, bandwidth: int):
     projector = kp.indexing.SphericalBackProjector(det, bandwidth=int(bandwidth))
     north, south, iq = projector.unproject(np.asarray(pattern), return_image_quality=True)
     return north, projector.window_mask()[0], float(iq)
+
+
+# ----------------------------------------------------------------------------------------------
+# Single-pattern indexing (the workbench's 'Index this point')
+# ----------------------------------------------------------------------------------------------
+
+
+def point_indexer_key(st: Settings, det, hkey: tuple) -> tuple:
+    """What identifies a cached :func:`make_point_indexer` indexer: the workbench's harmonics key ``hkey``
+    (``(MASTER_FILE, MASTER_BANDWIDTH, MASTER_ENERGY, demo)``), the detector's geometry (shape, PC, sample tilt,
+    camera tilt, pixel size, binning) and the indexing settings the indexer is built with (``BANDWIDTH``,
+    ``NORMALIZE``, ``REFINE``, ``N_REGIONS``, ``GAUSSIAN_BACKGROUND``, ``CIRCULAR_MASK``). The backend is always
+    the CPU and is not in the key."""
+    return (tuple(hkey), tuple(int(v) for v in det.shape), tuple(np.round(np.asarray(det.pc, dtype=float).ravel(), 8)),
+            float(det.sample_tilt), float(det.tilt), float(det.px_size), int(det.binning),
+            int(st.BANDWIDTH), bool(st.NORMALIZE), bool(st.REFINE), int(st.N_REGIONS),
+            bool(st.GAUSSIAN_BACKGROUND), bool(st.CIRCULAR_MASK))
+
+
+def make_point_indexer(harmonics: Sequence, det, st: Settings, log: Log = _print):
+    """The fork's ``SphericalIndexer`` of every master in ``harmonics`` on ``det``, for the CPU backend, with the
+    indexing settings of ``st`` (bandwidth, normalize, refine, n_regions, gaussian_background, circular_mask: the
+    fields :func:`index_kwargs` uses; ``BACKEND`` and ``CHUNKSIZE`` do not apply to one pattern). Takes about a
+    second at bandwidth 68 and longer at higher bandwidths, so the caller caches it under
+    :func:`point_indexer_key`; the indexer is immutable and reusable across calls. Like the runs, it refuses a
+    twisted detector, several PCs or a sample tilt other than the master's. Logs the build time."""
+    from kikuchipy.indexing import SphericalIndexer
+
+    t0 = time.perf_counter()
+    indexer = SphericalIndexer(
+        list(harmonics), det, bandwidth=int(st.BANDWIDTH), normalize=bool(st.NORMALIZE), refine=bool(st.REFINE),
+        n_regions=int(st.N_REGIONS), gaussian_background=bool(st.GAUSSIAN_BACKGROUND),
+        circular_mask=bool(st.CIRCULAR_MASK), backend="cpu",
+    )
+    log(f"Single-pattern indexer built in {time.perf_counter() - t0:.1f} s (cpu, bandwidth {st.BANDWIDTH})")
+    return indexer
+
+
+def lambert_master(h):
+    """The band limited square Lambert master pattern of one ``MasterPatternHarmonics`` (the fork's
+    ``to_master_pattern()``: both hemispheres, side ``2 * bandwidth + 1`` = 769 px at bandwidth 384, float64,
+    about 9.5 MB), the master :func:`simulate_pattern` projects from: exactly what the indexer matched against.
+    Raises ValueError when the harmonics carry no phase with a point group, which ``get_patterns`` needs."""
+    phase = getattr(h, "phase", None)
+    if phase is None or phase.point_group is None:
+        raise ValueError("The master pattern has no phase with a point group: patterns cannot be simulated from it")
+    return h.to_master_pattern()
+
+
+def index_pattern(indexer, pattern: np.ndarray, twist: float = 0.0) -> dict:
+    """One pattern through ``indexer.index_patterns`` (``n_best=1``, no progress bar). Returns a dict:
+
+    - ``rotation``: orix ``Rotation`` of shape (1,) as indexed (the fork's ``rotation_from_zyz`` of the ZYZ
+      angles, what ``spherical_indexing`` puts in its crystal map and what ``get_patterns`` takes);
+    - ``rotation_twisted``: rotated by ``twist`` degrees about the sample normal, as :func:`apply_twist` does to a
+      map; ``euler_deg``: its Bunge angles in degrees; ``euler_indexed_deg``: those of ``rotation``;
+    - ``zyz`` (radians), ``score``, ``iq``, ``phase_id`` (index into ``indexer.phases``, the order of the
+      harmonics), ``phase`` (its name) and ``seconds``.
+
+    The fork's warning about the memory of many workers is silenced (one pattern is one chunk); the one about a
+    pattern that could not be indexed is kept, and that case raises ValueError (phase id -1)."""
+    from kikuchipy.indexing._spherical._euler import rotation_from_zyz
+    from orix.quaternion import Rotation
+
+    t0 = time.perf_counter()
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Indexing on .* worker")
+        res = indexer.index_patterns(np.asarray(pattern)[None], n_best=1, progressbar=False)
+    dt = time.perf_counter() - t0
+    phase_id = int(res["phase_id"][0, 0])
+    if phase_id < 0:
+        raise ValueError("The pattern could not be indexed (phase id -1): see the warning in the log")
+    rotation = rotation_from_zyz(np.asarray(res["zyz"][0, 0]))
+    twisted = rotation * Rotation.from_axes_angles([0, 0, 1], float(twist), degrees=True) if twist else rotation
+    return dict(
+        rotation=rotation, rotation_twisted=twisted,
+        euler_deg=tuple(float(v) for v in np.asarray(twisted.to_euler(degrees=True)).reshape(-1)),
+        euler_indexed_deg=tuple(float(v) for v in np.asarray(rotation.to_euler(degrees=True)).reshape(-1)),
+        zyz=np.asarray(res["zyz"][0, 0]), score=float(res["scores"][0, 0]), iq=float(res["iq"][0]),
+        phase_id=phase_id, phase=str(indexer.phases[phase_id].phase.name), seconds=dt,
+    )
+
+
+def simulate_pattern(master, rotation, det) -> np.ndarray:
+    """The pattern of ``rotation`` (orix ``Rotation`` of shape (1,), e.g. ``index_pattern()["rotation"]``) on
+    ``det``, projected from ``master`` (:func:`lambert_master`) by the fork's ``EBSDMasterPattern.get_patterns``
+    (``compute=True``, no progress bar), as a uint8 (h, w) array: uint8 so that the indexer's preprocessing treats
+    it exactly like a uint8 pattern from a file. ``det`` must hold one PC and no twist: use the orientation as
+    indexed on the detector it was indexed with (``TWIST`` is applied to the orientations afterwards, never to the
+    detector). The first call in a fresh numba cache compiles for several seconds."""
+    s = master.get_patterns(rotation, det, compute=True, show_progressbar=False, dtype_out=np.uint8)
+    return np.asarray(s.data).reshape(tuple(int(v) for v in det.shape))
 
 
 # ----------------------------------------------------------------------------------------------
