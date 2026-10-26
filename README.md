@@ -189,6 +189,7 @@ and the spherical indexing of `sph_core.py` into one PyQt5 window with four tabs
 
 1. **Pattern processor**: `gpu_pattern_viewer.py` as it is, so it also runs on its own
    (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`).
+   Its defaults live in `pattern_processor/processor_defaults.py`.
 2. **Index a point**: click a point on the map, index that one pattern and see it next to the master
    pattern simulated at the orientation found, see 6.1.1.
 3. **Spherical indexing**: the indexing settings as a form on the left (drag the divider to

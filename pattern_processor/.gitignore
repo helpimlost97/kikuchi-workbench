@@ -23,10 +23,9 @@ Thumbs.db
 *.h5
 *.hdf5
 
-# Temp / intermediate files this app writes
-_temp_masked.up1
-_gpu_nlpar_result.up1
-_cpu_nlpar_result.up1
+# Temp / intermediate file the NLPAR batch writes next to the input (source extension)
+_nlpar_result.up1
+_nlpar_result.up2
 
 # Logs
 *.log

@@ -127,6 +127,8 @@ turned out to be useful enough to publish.
 
 ```
 gpu_pattern_viewer.py     Main application (single-file PyQt5 GUI)
+processor_defaults.py     Every default of the control panel, the slider scales and the RAM
+                          rules (`DEFAULTS`); change a default there and nowhere else
 gpu_pattern_viewer.bat    Windows launcher (calls `python` from PATH — edit
                           if your interpreter is named differently)
 run_gui.sh                Linux / HPC launcher (modules + venv from local/env.sh)

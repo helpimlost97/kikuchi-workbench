@@ -4,6 +4,21 @@ import os
 import gc
 import glob
 
+# Every default of the control panel, the slider scales and the RAM rules live in
+# processor_defaults.py (one owner; check_defaults.py in the repository root verifies the widgets).
+# This file is imported as pattern_processor.gpu_pattern_viewer by the workbench and loaded by path
+# (no package) by its own scripts, hence the two import forms.
+try:
+    from .processor_defaults import ProcessorDefaults, DEFAULTS
+except ImportError:
+    from processor_defaults import ProcessorDefaults, DEFAULTS
+
+
+def _env_disabled(name):
+    """True when the environment variable `name` is set to 0 / no / false (case-insensitive).
+    The KPP_* switches below all read "off" this way; unset means "not disabled"."""
+    return os.environ.get(name, '').strip().lower() in ('0', 'no', 'false')
+
 # ---------------------------------------------------------------------------
 # Linux / HPC CPU-node support (2026-09-25)
 # On a SLURM node the process only owns the cores/RAM it asked for, not the
@@ -38,7 +53,7 @@ from pyebsdindex import ebsd_pattern
 # pyebsdindex picks its NLPAR class at import: the OpenCL (pyopencl) version when a GPU is
 # visible, else the numba CPU version. KPP_GPU=0 must force CPU here too: it only hides
 # CUDA from CuPy (below), OpenCL would still find the device. PLAN_NLPAR_PYEBSDINDEX.md, Phase 0.
-if os.environ.get('KPP_GPU', '').strip() == '0':
+if _env_disabled('KPP_GPU'):
     from pyebsdindex import nlpar_cpu as nlpar
 else:
     from pyebsdindex import nlpar
@@ -181,7 +196,7 @@ _KNOWN_SHIPPED_CLNLPAR = {
     '14c0d609073680260f57d0d48aa71fcb29e18f3f',   # 0.3.9.1 and 0.3.10.1 (pip, 2026-10): same file
 }
 NLPAR_KERNEL_REDIRECTED = False   # set by the get_context wrapper the first time it redirects the build
-if os.environ.get('KPP_NLPAR_KERNEL_PATCH', '').strip() == '0':
+if _env_disabled('KPP_NLPAR_KERNEL_PATCH'):
     NLPAR_KERNEL_PATCH, NLPAR_KERNEL_PATCH_LEVEL = None, None
 else:
     NLPAR_KERNEL_PATCH, NLPAR_KERNEL_PATCH_LEVEL = _patch_pyebsdindex_nlpar_kernel()
@@ -220,7 +235,7 @@ try:
 except Exception:
     HAS_GPU = False
     _gpu_why = "CuPy not available"
-if HAS_GPU and os.environ.get('KPP_GPU', '').strip() == '0':
+if HAS_GPU and _env_disabled('KPP_GPU'):
     HAS_GPU = False
     _gpu_why = "KPP_GPU=0"
 if HAS_GPU:
@@ -296,7 +311,7 @@ def _cgroup_headroom():
 
 def available_ram():
     """Bytes we can actually allocate: min(what psutil sees, what the SLURM cgroup allows)."""
-    avail = int(psutil.virtual_memory().available) if HAS_PSUTIL else int(8e9)
+    avail = int(psutil.virtual_memory().available) if HAS_PSUTIL else int(DEFAULTS.ram_fallback_bytes)
     head = _cgroup_headroom()
     if head is not None:
         avail = min(avail, head)
@@ -648,7 +663,7 @@ class MainWindow(QMainWindow):
     def _remove_temp_files(self):
         """Delete the NLPAR batch result files this session created (next to their
         inputs). Called on app exit and when a new dataset is loaded (2026-09-27),
-        so a 5-32 GB _cpu_nlpar_result.up1 doesn't sit around until the app closes."""
+        so a 5-32 GB _nlpar_result.up1/.up2 doesn't sit around until the app closes."""
         for f in self._temp_files:
             try:
                 if os.path.isfile(f): os.remove(f); print(f"[TEMP] removed {f}")
@@ -660,11 +675,26 @@ class MainWindow(QMainWindow):
         self._remove_temp_files()
         event.accept()
 
+    # ---- Slider positions -> physical values (the scales are DEFAULTS') ----
+    def _dyn_sigma(self):
+        """Dynamic-background Gaussian sigma in pixels, from the slider."""
+        return self.dyn_sigma.value() / DEFAULTS.sigma_slider_scale
+
+    def _clahe_clip(self):
+        """CLAHE clip limit (skimage equalize_adapthist's clip_limit), from the slider."""
+        return self.clahe_clip.value() / DEFAULTS.clip_slider_scale
+
+    def _iq_bounds(self):
+        """(vmin, vmax): the IQ range the two sliders select, in the IQ map's units.
+        Requires a loaded IQ map."""
+        iq_lo, iq_hi = self.iq_map.min(), self.iq_map.max()
+        vmin = iq_lo + (iq_hi - iq_lo) * self.iq_min_slider.value() / DEFAULTS.iq_slider_max
+        vmax = iq_lo + (iq_hi - iq_lo) * self.iq_max_slider.value() / DEFAULTS.iq_slider_max
+        return vmin, vmax
+
     def _get_iq_mask(self):
         if self.iq_map is None: return None
-        iq_lo, iq_hi = self.iq_map.min(), self.iq_map.max()
-        vmin = iq_lo + (iq_hi - iq_lo) * self.iq_min_slider.value() / 1000.0
-        vmax = iq_lo + (iq_hi - iq_lo) * self.iq_max_slider.value() / 1000.0
+        vmin, vmax = self._iq_bounds()
         return (self.iq_map >= vmin) & (self.iq_map <= vmax)
 
     @staticmethod
@@ -674,16 +704,19 @@ class MainWindow(QMainWindow):
         calling theirs keeps the two in step. Disable for non-circular geometries (RKD)."""
         return np.asarray(nlpar.NLPAR.makeautomask(int(h), int(w)), dtype=np.uint8)
 
-    def _make_variance_mask(self, threshold_frac=0.05):
+    def _make_variance_mask(self, threshold_frac=None):
         """Auto-detect active detector pixels from per-pixel std across the dataset.
         Dead pixels (chip gaps, masked regions) have ~zero std; active pixels accumulate
-        signal that varies pattern-to-pattern. Threshold = threshold_frac * 95th-percentile
-        of std (95th percentile rather than max() avoids hot pixels setting the scale).
+        signal that varies pattern-to-pattern. Threshold = threshold_frac * the
+        DEFAULTS.variance_percentile-th percentile of std (a percentile rather than max()
+        avoids hot pixels setting the scale). threshold_frac None reads the panel's spin box.
         Returns uint8 mask (1=active, 0=dead) or None if pixel_std hasn't been computed."""
         if self.pixel_std is None:
             return None
-        p95 = float(np.percentile(self.pixel_std, 95))
-        thresh = threshold_frac * p95
+        if threshold_frac is None:
+            threshold_frac = self.aperture_thresh_spin.value()
+        p_ref = float(np.percentile(self.pixel_std, DEFAULTS.variance_percentile))
+        thresh = threshold_frac * p_ref
         return (self.pixel_std > thresh).astype(np.uint8)
 
     def _resolve_aperture_mask(self, ph, pw):
@@ -693,7 +726,7 @@ class MainWindow(QMainWindow):
             m = self._make_aperture_mask(ph, pw).astype(np.float32)
             return m, float(m.sum()), "CIRCULAR"
         if mode == "Auto-detect":
-            m_u8 = self._make_variance_mask(self.aperture_thresh_spin.value())
+            m_u8 = self._make_variance_mask()
             if m_u8 is None:
                 return None, float(ph * pw), "AUTO-DETECT (UNAVAILABLE - falling back to NONE)"
             m = m_u8.astype(np.float32)
@@ -727,6 +760,36 @@ class MainWindow(QMainWindow):
         the previous scan in RAM through the next load's RAM check (finding 8, 2026-10-24)."""
         self._nlobj = None; self._nlobj_key = None; self._nl_infile = None
 
+    def _reset_dataset_state(self):
+        """Forget everything that was derived from the loaded data set: the NLPAR result (file or RAM
+        copy) and the temp files, the clicked position, the IQ map and mask, the sigma map, the
+        global-stretch bounds, the lambda gate, the pyebsdindex object and the auto-detect aperture
+        cache. _load_dataset calls it before it touches any widget (the slider resets there emit
+        valueChanged -> update_display, which must not find the previous scan's state) and unload
+        calls it too, so the two lists cannot drift apart."""
+        self.f_nlpar = None; self.nlpar_patterns = None; self.nlpar_status.setText("No NLPAR file loaded")
+        self._remove_temp_files()          # previous dataset's NLPAR batch result
+        self.current_row = self.current_col = 0
+        self.iq_map = None; self.iq_mask = None
+        self._invalidate_sigma_map()      # sigma map belongs to the old scan
+        self._invalidate_global_range()   # so do the global-stretch bounds
+        self._lambda_optimized = False    # lambda gate re-arms for the new file
+        self._drop_nlobj()                # pyebsdindex object, its sigma and its input file object are per dataset
+        self._aperture_cache = None; self._aperture_cache_key = None  # auto-detect mask is per dataset
+
+    def output_path_for(self, path, src_ext=None, log=True):
+        """The path a processed data set is written to for the requested `path`: absolute, with the
+        extension forced to the source file's (`src_ext`, default the loaded file's). A different
+        extension would change the bit depth the file is read with (pyebsdindex and OIM take it from
+        the extension). Used by Apply && Save, save_processed, the montage batch and the workbench."""
+        ext = self.src_ext if src_ext is None else src_ext
+        path = os.path.abspath(path)
+        if os.path.splitext(path)[1].lower() != ext:
+            path = os.path.splitext(path)[0] + ext
+            if log:
+                print(f"[SAVE] output extension forced to {ext} (same bit depth as the source)")
+        return path
+
     def _current_aperture(self):
         """Resolved aperture as a (ph, pw) float32 array of 1.0/0.0, or None when the
         mode is 'None' (or auto-detect has no pixel_std yet). Cached per (mode, threshold,
@@ -748,7 +811,7 @@ class MainWindow(QMainWindow):
         Scale the cap with the thread count, but never exceed a quarter of what the
         SLURM cgroup actually lets us allocate. Split out of _host_chunk_rows (v1.7.0) so
         compute_shared_background can size its chunks for files that are not loaded."""
-        return min(1.0e9 * max(4, n_workers() // 2), 0.25 * available_ram())
+        return min(1.0e9 * max(4, n_workers() // 2), DEFAULTS.ram_chunk_fraction * available_ram())
 
     def _host_chunk_rows(self, bytes_per_pixel_live, budget=None, n_rows_total=None):
         """Rows per chunk that keep host RAM for one chunk inside `budget` bytes.
@@ -757,7 +820,8 @@ class MainWindow(QMainWindow):
         is alive at the same time (e.g. uint8 read + float32 cast + a float32 temporary = 9).
         Hardcoded row counts blew up on large scans: 430 cols x 479x479 px is ~99 MB/row as
         uint8 but ~790 MB/row as float64, so 50 rows of float64 is ~40 GB. Default budget is
-        the smaller of 3 GB and a quarter of the currently AVAILABLE RAM, so a busy machine
+        _host_chunk_budget (1 GB per two threads, at most DEFAULTS.ram_chunk_fraction of the
+        currently AVAILABLE RAM), so a busy machine
         chunks smaller instead of swapping (or dying with _ArrayMemoryError)."""
         if budget is None:
             budget = self._host_chunk_budget()
@@ -827,15 +891,15 @@ class MainWindow(QMainWindow):
         return out
 
     def _ensure_global_range(self):
-        """Compute dataset-wide (0.5, 99.5) percentile intensity bounds for the global
-        stretch, over ACTIVE pixels only (dead/vignetted corners excluded), AFTER applying
+        """Compute dataset-wide percentile intensity bounds (DEFAULTS.global_percentiles) for the
+        global stretch, over ACTIVE pixels only (dead/vignetted corners excluded), AFTER applying
         the current background settings so the range lives in the same domain it's applied
         in. Cached and keyed by the background config; recomputed when that changes.
 
         Two-pass streaming (background-applied values are signed floats, so a fixed uint8
         histogram won't work):
           pass 1 — global min/max of background-applied active pixels
-          pass 2 — 1024-bin histogram over [min,max] → 0.5/99.5 percentiles
+          pass 2 — 1024-bin histogram over [min,max] → the two percentiles
         Same (lo,hi) is then applied identically to every pattern → relative pattern-to-
         pattern band contrast (and thus IQ ordering) is preserved.
         """
@@ -843,13 +907,12 @@ class MainWindow(QMainWindow):
         if self.global_lo is not None and self._global_range_key == key:
             return
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
-        # Active-pixel mask over the pattern frame (exclude dead corners).
-        if self.pixel_std is not None:
-            p95 = float(np.percentile(self.pixel_std, 95))
-            active = self.pixel_std > (0.05 * p95)
-            if not active.any():
-                active = np.ones((ph, pw), dtype=bool)
-        else:
+        # Active-pixel mask over the pattern frame (exclude dead corners): the auto-detect rule at
+        # its default threshold, whatever the aperture panel says (the cache key below does not
+        # include the panel's threshold, so the mask must not follow it).
+        active_u8 = self._make_variance_mask(DEFAULTS.aperture_threshold)
+        active = active_u8.astype(bool) if active_u8 is not None else np.ones((ph, pw), dtype=bool)
+        if not active.any():
             active = np.ones((ph, pw), dtype=bool)
         active_flat = active.ravel()
         n_avail_rows = getattr(self, 'n_actual_rows', self.nrows)
@@ -899,13 +962,15 @@ class MainWindow(QMainWindow):
             return
         cdf = np.cumsum(hist) / total
         centers = 0.5 * (edges[:-1] + edges[1:])
-        lo = float(centers[np.searchsorted(cdf, 0.005)])
-        hi = float(centers[min(np.searchsorted(cdf, 0.995), NB - 1)])
+        p_lo, p_hi = DEFAULTS.global_percentiles
+        lo = float(centers[min(np.searchsorted(cdf, p_lo / 100.0), NB - 1)])
+        hi = float(centers[min(np.searchsorted(cdf, p_hi / 100.0), NB - 1)])
         if hi <= lo:
             hi = lo + (gmax - gmin) / NB
         self.global_lo, self.global_hi = lo, hi
         self._global_range_key = key
-        self.statusBar().showMessage(f"Global stretch range: [{lo:.2f}, {hi:.2f}] (0.5–99.5 pctile, bg-applied, active px)")
+        self.statusBar().showMessage(f"Global stretch range: [{lo:.2f}, {hi:.2f}] "
+                                     f"({DEFAULTS.global_percentile_text()} pctile, bg-applied, active px)")
         print(f"[GLOBAL STRETCH] in_range = [{lo:.3f}, {hi:.3f}] over {int(active.sum())}/{ph*pw} active px, bg_key={key}")
 
 
@@ -1387,10 +1452,10 @@ class MainWindow(QMainWindow):
             gc.collect()
         if self.patterns is None:
             return False
-        if os.environ.get('KPP_NLPAR_IN_MEMORY', '').strip().lower() in ('0', 'no', 'false'):
+        if _env_disabled('KPP_NLPAR_IN_MEMORY'):
             return False
         need = self.patterns.nbytes; avail = available_ram()
-        if need > 0.6 * avail:
+        if need > DEFAULTS.ram_fit_fraction * avail:
             print(f"{tag} result goes to disk: a second {need/1e9:.1f} GB copy does not fit "
                   f"({avail/1e9:.0f} GB available to this process)")
             return False
@@ -1402,7 +1467,7 @@ class MainWindow(QMainWindow):
 
     def _nlpar_result_to_ram(self, nlobj):
         """Point a pyebsdindex NLPAR object's OUTPUT at a second in-RAM array
-        (self.nlpar_patterns) instead of _cpu_nlpar_result.up1 (2026-09-28: only
+        (self.nlpar_patterns) instead of the _nlpar_result temp file (2026-09-28: only
         Apply && Save should write to disk). Allocation rules: _alloc_nlpar_ram. Returns
         False (caller writes the temp file as before) when it does not fit."""
         if not self._alloc_nlpar_ram():
@@ -1524,7 +1589,7 @@ class MainWindow(QMainWindow):
             if self.bg_mode.currentText() == "Subtract": p = p - bg
             else: p = p / (bg + 1e-10)
         if self.dyn_bg_chk.isChecked():
-            p = p - gaussian_filter(p, sigma=self.dyn_sigma.value() / 10.0)
+            p = p - gaussian_filter(p, sigma=self._dyn_sigma())
         bval, cval = self.bright.value() / 100.0, self.cont.value() / 100.0
         if global_stretch:
             # Dataset-wide stretch: SAME (lo,hi) for every pattern → relative
@@ -1535,7 +1600,7 @@ class MainWindow(QMainWindow):
             p = (p - 0.5) * (1.0 + cval) + 0.5 + bval
             if self.clahe_chk.isChecked():
                 p = np.clip(p, 0, 1)
-                p = equalize_adapthist(p, clip_limit=self.clahe_clip.value() / 1000.0)
+                p = equalize_adapthist(p, clip_limit=self._clahe_clip())
             p = np.clip(p, 0, 1)
             return p
         if normalize:
@@ -1547,7 +1612,7 @@ class MainWindow(QMainWindow):
             p = (p - 0.5) * (1.0 + cval) + 0.5 + bval
             if self.clahe_chk.isChecked():
                 p = np.clip(p, 0, 1)
-                p = equalize_adapthist(p, clip_limit=self.clahe_clip.value() / 1000.0)
+                p = equalize_adapthist(p, clip_limit=self._clahe_clip())
             p = np.clip(p, 0, 1)
             return p
         else:
@@ -1565,7 +1630,7 @@ class MainWindow(QMainWindow):
                 pmin, pmax = src.min(), src.max()
                 if pmax > pmin:
                     p_scaled = np.clip((p - pmin) / (pmax - pmin), 0, 1)
-                    p_scaled = equalize_adapthist(p_scaled, clip_limit=self.clahe_clip.value() / 1000.0)
+                    p_scaled = equalize_adapthist(p_scaled, clip_limit=self._clahe_clip())
                     p = p_scaled * (pmax - pmin) + pmin
             p = np.clip(p, 0, self.scale_max)
             return p
@@ -1596,10 +1661,10 @@ class MainWindow(QMainWindow):
             g_lo, g_hi = self.global_lo, self.global_hi
         # [0,1]-domain flag: both per-pattern normalize and global stretch land in [0,1].
         unit_domain = normalize or global_stretch
-        sigma = self.dyn_sigma.value() / 10.0
+        sigma = self._dyn_sigma()
         bval = self.bright.value() / 100.0
         cval = self.cont.value() / 100.0
-        clip_limit = self.clahe_clip.value() / 1000.0
+        clip_limit = self._clahe_clip()
         # Aperture gate, resolved once for the whole chunk. ap_bool is the CPU-side
         # active-pixel boolean used by the CLAHE branch below.
         ap = self._current_aperture()
@@ -1928,15 +1993,7 @@ class MainWindow(QMainWindow):
         # sigma map, the last clicked row/col, the auto-detect aperture cache) is used
         # against the new one: wrong shapes, IndexError, and with no excepthook installed
         # PyQt aborts the whole app on an exception inside a slot. [2026-09-27 review]
-        self.f_nlpar = None; self.nlpar_patterns = None; self.nlpar_status.setText("No NLPAR file loaded")
-        self._remove_temp_files()          # previous dataset's NLPAR batch result
-        self.current_row = self.current_col = 0
-        self.iq_map = None; self.iq_mask = None
-        self._invalidate_sigma_map()      # sigma map belongs to the old scan
-        self._invalidate_global_range()   # so do the global-stretch bounds
-        self._lambda_optimized = False    # lambda gate re-arms for the new file
-        self._drop_nlobj()                # pyebsdindex object, its sigma and its input file object are per dataset
-        self._aperture_cache = None; self._aperture_cache_key = None  # auto-detect mask is per dataset
+        self._reset_dataset_state()
         self.orig_path = path; self.f_orig = f_new
         self.nrows, self.ncols = self.f_orig.nRows, self.f_orig.nCols
         ph, pw = int(self.f_orig.patternH), int(self.f_orig.patternW)
@@ -1957,14 +2014,17 @@ class MainWindow(QMainWindow):
             self.n_actual_rows = self.nrows
             self.n_actual_pats = n_expected
         # ---- Tier 1: hold the whole dataset in RAM when it fits (2026-09-27) ----
-        # Native dtype (uint8 = the file size). Threshold 60% of what this process may
-        # still allocate, leaving the rest for the per-pass temporaries the chunk sizing
-        # below draws from the same available_ram(). KPP_IN_MEMORY=1/0 forces it.
+        # Native dtype (uint8 = the file size). Threshold DEFAULTS.ram_fit_fraction of what this
+        # process may still allocate, leaving the rest for the per-pass temporaries the chunk
+        # sizing below draws from the same available_ram(). KPP_IN_MEMORY=1/0 forces it.
         self.patterns = None                       # release a previous dataset first
         need = self.n_actual_pats * ph * pw * bpp
         avail = available_ram()
-        force = os.environ.get('KPP_IN_MEMORY')
-        in_mem = (need <= 0.6 * avail) if force is None else force.strip().lower() not in ('0', 'no', 'false')
+        fit_pct = int(round(100 * DEFAULTS.ram_fit_fraction))
+        if os.environ.get('KPP_IN_MEMORY') is None:
+            in_mem = need <= DEFAULTS.ram_fit_fraction * avail
+        else:
+            in_mem = not _env_disabled('KPP_IN_MEMORY')
         why = f"{need/1e9:.1f} GB dataset, {avail/1e9:.0f} GB RAM available to this process"
         if in_mem:
             print(f"[LOAD] holding the dataset in RAM ({why})")
@@ -1981,7 +2041,7 @@ class MainWindow(QMainWindow):
             print(f"[LOAD] read {need/1e9:.1f} GB in {t_read:.1f}s ({need/1e6/max(t_read,1e-9):.0f} MB/s)")
             self.mem_mode = "in RAM"
         else:
-            print(f"[LOAD] streaming from disk on every pass ({why}; needs <= 60% of available, or KPP_IN_MEMORY=1)")
+            print(f"[LOAD] streaming from disk on every pass ({why}; needs <= {fit_pct}% of available, or KPP_IN_MEMORY=1)")
             self.mem_mode = "streamed from disk"
         # Chunked statistics for IQ map and mean pattern (only rows that exist).
         # Native dtype (uint8/uint16), cast one chunk at a time: a 20-row float32 read
@@ -2001,7 +2061,7 @@ class MainWindow(QMainWindow):
         # so cap the threads such that they fit in a quarter of the available RAM.
         ncols = int(self.ncols)
         row_bytes_f32 = ncols * ph * pw * 4
-        nthr = int(max(1, min(n_workers(), (0.25 * available_ram()) // (2 * row_bytes_f32))))
+        nthr = int(max(1, min(n_workers(), (DEFAULTS.ram_chunk_fraction * available_ram()) // (2 * row_bytes_f32))))
         print(f"[LOAD] {nthr} threads")
 
         data_max = 0
@@ -2056,7 +2116,8 @@ class MainWindow(QMainWindow):
         self.bg_status.setText("Background: all patterns")
         self.scan_canvas.set_map(self.iq_map, self.nrows, self.ncols)
         self.iq_mask = np.ones((self.nrows, self.ncols), dtype=bool)
-        self.iq_min_slider.setValue(0); self.iq_max_slider.setValue(1000); self._update_iq_range()
+        self.iq_min_slider.setValue(DEFAULTS.iq_range[0]); self.iq_max_slider.setValue(DEFAULTS.iq_range[1])
+        self._update_iq_range()
         self.on_pattern_clicked(0, 0); self.statusBar().showMessage("Ready")
 
     def unload(self):
@@ -2066,14 +2127,10 @@ class MainWindow(QMainWindow):
         Harmless when nothing is loaded."""
         if self._nlpar_busy:
             return False
-        self.f_nlpar = None; self.nlpar_patterns = None; self.nlpar_status.setText("No NLPAR file loaded")
-        self._remove_temp_files()
+        self._reset_dataset_state()
         self.orig_path = None; self.f_orig = None; self.patterns = None
-        self.nrows = self.ncols = self.current_row = self.current_col = 0
-        self.iq_map = None; self.iq_mask = None; self.mean_pattern = None; self.pixel_std = None; self.data_max = None
-        self._invalidate_sigma_map(); self._invalidate_global_range(); self._lambda_optimized = False
-        self._nlobj = None; self._nlobj_key = None; self._nl_infile = None
-        self._aperture_cache = None; self._aperture_cache_key = None
+        self.nrows = self.ncols = 0
+        self.mean_pattern = None; self.pixel_std = None; self.data_max = None
         self.file_label.setText("No file loaded"); self.bg_status.setText("Background: all patterns")
         for canvas in (self.scan_canvas, self.raw_canvas, self.proc_canvas):
             canvas.ax.clear(); canvas.ax.axis('off'); canvas.draw_idle()
@@ -2144,13 +2201,13 @@ class MainWindow(QMainWindow):
         """Byte budget to hand pyebsdindex as `chunksize`.
 
         pyebsdindex's _calcchunks assumes 8 bytes/pixel (a float32 input array plus a
-        float32 output array) when it turns this number into a tile size, so a 4 GB
-        budget means each in-memory float32 tile is about 2 GB. Its own default is
-        min(32 GB, total_RAM/4), which on a 33.7 GB machine asks for an 8.4 GB tile and
-        dies with _ArrayMemoryError on a 479x479 scan. Track AVAILABLE RAM instead so a
-        busy machine simply tiles smaller."""
-        # 16 GB cap (was 4): bigger numba tiles amortize better across many cores.
-        return int(min(16.0e9, 0.25 * available_ram()))
+        float32 output array) when it turns this number into a tile size, so each in-memory
+        float32 tile is about half this budget. Its own default is min(32 GB, total_RAM/4),
+        which on a 33.7 GB machine asks for an 8.4 GB tile and dies with _ArrayMemoryError
+        on a 479x479 scan. Track AVAILABLE RAM instead (DEFAULTS.ram_chunk_fraction of it,
+        capped at DEFAULTS.chunk_cap_bytes; the cap was raised from 4 to 16 GB because bigger
+        numba tiles amortize better across many cores) so a busy machine simply tiles smaller."""
+        return int(min(DEFAULTS.chunk_cap_bytes, DEFAULTS.ram_chunk_fraction * available_ram()))
 
     def optimize_lambda(self):
         """Estimate the NLPAR lambda straight off self.orig_path — no temp copy at all.
@@ -2246,10 +2303,10 @@ class MainWindow(QMainWindow):
         * automask=False. The aperture we pass IS the viewer's aperture; letting
           pyebsdindex add its circular mask on top would silently intersect the two.
 
-        Output goes to `_cpu_nlpar_result.up1` next to the input via calcnlpar's
-        `fileout=` (setoutfile -> copy_file(empty_data=True) clones the header and
+        Output goes to `_nlpar_result<ext>` (the source's extension) next to the input via
+        calcnlpar's `fileout=` (setoutfile -> copy_file(empty_data=True) clones the header and
         reserves the file, then each tile is written in place). Without `fileout`
-        pyebsdindex names the file itself as `<stem>_NLPAR_l{lam}sr{sr}.up1`, so the
+        pyebsdindex names the file itself as `<stem>_NLPAR_l{lam}sr{sr}<ext>`, so the
         glob below is kept as a fallback.
 
         raise_errors=True (batch_process, v1.7.0): a failure is raised to the caller
@@ -2393,11 +2450,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save Processed Patterns",
             os.path.dirname(self.orig_path), f"{ext[1:].upper()} Files (*{ext})")
         if not path: return
-        path = os.path.abspath(path)
-        if os.path.splitext(path)[1].lower() != ext:
-            # A different extension would change the bit depth the file is read with.
-            path = os.path.splitext(path)[0] + ext
-            print(f"[SAVE] output extension forced to {ext} (same bit depth as the source)")
+        path = self.output_path_for(path)
         if os.path.exists(path) and os.path.samefile(path, self.orig_path):
             QMessageBox.warning(self, "Error", "Cannot overwrite the loaded source file. Choose another name.")
             return
@@ -2433,12 +2486,7 @@ class MainWindow(QMainWindow):
             raise RuntimeError("no UP1/UP2 file loaded")
         if self.nlpar_chk.isChecked() and self.f_nlpar is None:
             raise RuntimeError("NLPAR is enabled but has not been applied to the full data set")
-        ext = self.src_ext
-        path = os.path.abspath(path)
-        if os.path.splitext(path)[1].lower() != ext:
-            # A different extension would change the bit depth the file is read with.
-            path = os.path.splitext(path)[0] + ext
-            print(f"[SAVE] output extension forced to {ext} (same bit depth as the source)")
+        path = self.output_path_for(path)
         if os.path.abspath(path) == os.path.abspath(self.orig_path) or \
                 (os.path.exists(path) and os.path.samefile(path, self.orig_path)):
             raise ValueError(f"{path}: cannot overwrite the loaded source file")
@@ -2709,7 +2757,8 @@ class MainWindow(QMainWindow):
                    f"{self.bg_mode.currentText()}, {'shared over all tiles' if shared_background is not None else 'per tile'}")
         print(f"[BATCH] {n_jobs} jobs; static bg: {bg_desc}; dynamic bg: {self.dyn_bg_chk.isChecked()}; "
               f"per-pattern stretch: {self.normalize_chk.isChecked()}; global stretch: {self.global_chk.isChecked()}; "
-              f"CLAHE: {self.clahe_chk.isChecked()}; IQ range: {iq_lo / 10:.1f}-{iq_hi / 10:.1f}% of each tile's range; "
+              f"CLAHE: {self.clahe_chk.isChecked()}; IQ range: {100 * iq_lo / DEFAULTS.iq_slider_max:.1f}-"
+              f"{100 * iq_hi / DEFAULTS.iq_slider_max:.1f}% of each tile's range; "
               f"NLPAR: {use_nlpar}")
         if use_nlpar:
             print(f"[BATCH] NLPAR SR={sr}, lambda={lam:.3f}: the preview tile's lambda is reused for every tile"
@@ -2732,10 +2781,7 @@ class MainWindow(QMainWindow):
                     src_abs = os.path.abspath(src)
                     if not os.path.isfile(src_abs):
                         raise FileNotFoundError(f"{src}: source file not found")
-                    ext = os.path.splitext(src_abs)[1].lower()
-                    out_abs = os.path.abspath(out)
-                    if os.path.splitext(out_abs)[1].lower() != ext:
-                        out_abs = os.path.splitext(out_abs)[0] + ext   # as save_processed does
+                    out_abs = self.output_path_for(out, src_ext=os.path.splitext(src_abs)[1].lower(), log=False)
                     if out_abs == src_abs or (os.path.exists(out_abs) and os.path.samefile(out_abs, src_abs)):
                         raise ValueError(f"{out}: output path is the source file")
                     self.statusBar().showMessage(f"Batch {i + 1}/{n_jobs}: loading {os.path.basename(src)}")
@@ -2822,9 +2868,7 @@ class MainWindow(QMainWindow):
     def _update_iq_range(self):
         if self.iq_map is None: return
         self.iq_mask = self._get_iq_mask()
-        iq_lo, iq_hi = self.iq_map.min(), self.iq_map.max()
-        vmin = iq_lo + (iq_hi - iq_lo) * self.iq_min_slider.value() / 1000.0
-        vmax = iq_lo + (iq_hi - iq_lo) * self.iq_max_slider.value() / 1000.0
+        vmin, vmax = self._iq_bounds()
         self.iq_min_lbl.setText(f"Min IQ: {vmin:.1f}"); self.iq_max_lbl.setText(f"Max IQ: {vmax:.1f}")
         self.scan_canvas.update_mask(self.iq_mask); self.update_display()
 
@@ -2895,18 +2939,21 @@ class MainWindow(QMainWindow):
         # of zeros (per-pattern min/max, global percentiles, NLPAR N_p and σ²) is
         # computed over active pixels only.
         g = QGroupBox("Aperture Mask (applied before all processing)"); gl = QFormLayout(g)
+        # Every start value below is DEFAULTS' (processor_defaults.py); only ranges and steps are here.
+        D = DEFAULTS
         self.aperture_mode = QComboBox()
-        self.aperture_mode.addItems(["None", "Circular (EBSD)", "Auto-detect"])
-        self.aperture_mode.setCurrentIndex(0)  # default None
+        self.aperture_mode.addItems(list(D.aperture_modes))
+        self.aperture_mode.setCurrentText(D.aperture_mode)
         self.aperture_mode.setMinimumContentsLength(15)  # ensure "Circular (EBSD)" fits without ellipsis
         self.aperture_mode.currentIndexChanged.connect(lambda *_: self._on_aperture_changed())
         gl.addRow("Mode:", self.aperture_mode)
         self.aperture_thresh_spin = QDoubleSpinBox()
         self.aperture_thresh_spin.setRange(0.001, 1.0)
-        self.aperture_thresh_spin.setValue(0.05)
+        self.aperture_thresh_spin.setValue(D.aperture_threshold)
         self.aperture_thresh_spin.setSingleStep(0.01)
         self.aperture_thresh_spin.setDecimals(3)
-        self.aperture_thresh_spin.setToolTip("Auto-detect threshold as fraction of 95th-percentile pixel std")
+        self.aperture_thresh_spin.setToolTip(f"Auto-detect threshold as fraction of the "
+                                             f"{D.variance_percentile:g}th-percentile pixel std")
         self.aperture_thresh_spin.valueChanged.connect(lambda *_: self._on_aperture_thresh_changed())
         gl.addRow("Threshold:", self.aperture_thresh_spin)
         b_show_mask = QPushButton("Show detected mask")
@@ -2919,9 +2966,13 @@ class MainWindow(QMainWindow):
         g.setToolTip("Patterns outside the IQ range take no part in the processing (background mean, global stretch,\n"
                      "NLPAR sigma and neighbours) and are written to the output as they are, unprocessed,\n"
                      "so that they stay in the data set and can still be indexed.")
-        self.iq_min_lbl = QLabel("Min IQ: 0"); self.iq_max_lbl = QLabel("Max IQ: 100")
-        self.iq_min_slider = QSlider(Qt.Horizontal); self.iq_min_slider.setRange(0, 1000); self.iq_min_slider.setValue(0)
-        self.iq_max_slider = QSlider(Qt.Horizontal); self.iq_max_slider.setRange(0, 1000); self.iq_max_slider.setValue(1000)
+        # Before a file is loaded the labels show the slider positions as percentages of the range.
+        self.iq_min_lbl = QLabel(f"Min IQ: {100 * D.iq_range[0] / D.iq_slider_max:g}")
+        self.iq_max_lbl = QLabel(f"Max IQ: {100 * D.iq_range[1] / D.iq_slider_max:g}")
+        self.iq_min_slider = QSlider(Qt.Horizontal); self.iq_min_slider.setRange(0, D.iq_slider_max)
+        self.iq_min_slider.setValue(D.iq_range[0])
+        self.iq_max_slider = QSlider(Qt.Horizontal); self.iq_max_slider.setRange(0, D.iq_slider_max)
+        self.iq_max_slider.setValue(D.iq_range[1])
         self.iq_min_slider.valueChanged.connect(self._update_iq_range)
         self.iq_max_slider.valueChanged.connect(self._update_iq_range)
         gl.addWidget(self.iq_min_lbl); gl.addWidget(self.iq_min_slider)
@@ -2930,31 +2981,30 @@ class MainWindow(QMainWindow):
         # NPAR - on-demand via checkbox
         g = QGroupBox("NPAR"); gl = QFormLayout(g)
         self.npar_chk = QCheckBox("Enable"); self.npar_chk.stateChanged.connect(self.update_display)
-        self.npar_radius_spin = QSpinBox(); self.npar_radius_spin.setRange(1, 10); self.npar_radius_spin.setValue(1)
+        self.npar_radius_spin = QSpinBox(); self.npar_radius_spin.setRange(1, 10); self.npar_radius_spin.setValue(D.npar_radius)
         self.npar_radius_spin.valueChanged.connect(self.update_display)
         gl.addRow(self.npar_chk); gl.addRow("Radius:", self.npar_radius_spin); cl.addWidget(g)
 
         # NLPAR - on-demand preview + batch operations
         g = QGroupBox("NLPAR"); gl = QFormLayout(g)
         self.nlpar_chk = QCheckBox("Enable Preview"); self.nlpar_chk.stateChanged.connect(self.update_display)
-        self.sr_spin = QSpinBox(); self.sr_spin.setRange(1, 10); self.sr_spin.setValue(3)
+        self.sr_spin = QSpinBox(); self.sr_spin.setRange(1, 10); self.sr_spin.setValue(D.search_radius)
         self.sr_spin.valueChanged.connect(self.update_display)
         self.lam_spin = QDoubleSpinBox(); self.lam_spin.setRange(0.01, 100.0)
-        # Canonical NLPAR lambda is dimensionless (post σ² normalization).
-        # Optimal values per Brewick et al. 2019 are typically 0.6–1.2.
-        self.lam_spin.setValue(1.0); self.lam_spin.setSingleStep(0.05); self.lam_spin.setDecimals(2)
+        # Canonical NLPAR lambda is dimensionless (post σ² normalization); see processor_defaults.py.
+        self.lam_spin.setValue(D.lam); self.lam_spin.setSingleStep(0.05); self.lam_spin.setDecimals(2)
         self.lam_spin.valueChanged.connect(self.update_display)
         gl.addRow(self.nlpar_chk)
         gl.addRow("Search Radius:", self.sr_spin); gl.addRow("Lambda:", self.lam_spin)
         # pyebsdindex parameters (Phase 3): saturation_protect drops near-saturated pixel pairs
-        # from the distance (default on, pyebsdindex default); dthresh is subtracted from the
-        # normalised dissimilarity before the exponent (default 0 = off, pyebsdindex default).
-        self.sat_chk = QCheckBox("Saturation protect (pyebsdindex)"); self.sat_chk.setChecked(True)
+        # from the distance; dthresh is subtracted from the normalised dissimilarity before the
+        # exponent (0 = off). The defaults are pyebsdindex's.
+        self.sat_chk = QCheckBox("Saturation protect (pyebsdindex)"); self.sat_chk.setChecked(D.saturation_protect)
         self.sat_chk.setToolTip("Drop pixel pairs where either value is at/above ~max intensity from the "
                                 "NLPAR distance and the sigma estimate (pyebsdindex saturation_protect).")
         self.sat_chk.toggled.connect(lambda *_: self._on_nlpar_param_changed('saturation'))
         self.dthresh_spin = QDoubleSpinBox(); self.dthresh_spin.setRange(0.0, 100.0)
-        self.dthresh_spin.setValue(0.0); self.dthresh_spin.setSingleStep(0.1); self.dthresh_spin.setDecimals(2)
+        self.dthresh_spin.setValue(D.dthresh); self.dthresh_spin.setSingleStep(0.1); self.dthresh_spin.setDecimals(2)
         self.dthresh_spin.setToolTip("pyebsdindex dthresh: subtracted from the normalised dissimilarity before "
                                      "the exponent, so pairs below it count as identical. 0 = off.")
         self.dthresh_spin.valueChanged.connect(lambda *_: self._on_nlpar_param_changed('dthresh'))
@@ -2967,9 +3017,10 @@ class MainWindow(QMainWindow):
 
         # Static BG
         g = QGroupBox("Static Background"); gl = QVBoxLayout(g)
-        self.static_bg_chk = QCheckBox("Enable"); self.static_bg_chk.stateChanged.connect(self.update_display)
+        self.static_bg_chk = QCheckBox("Enable"); self.static_bg_chk.setChecked(D.static_bg)
+        self.static_bg_chk.stateChanged.connect(self.update_display)
         self.static_bg_chk.toggled.connect(lambda *_: self._sync_bg_controls())
-        self.bg_mode = QComboBox(); self.bg_mode.addItems(["Subtract", "Divide"])
+        self.bg_mode = QComboBox(); self.bg_mode.addItems(list(D.bg_modes)); self.bg_mode.setCurrentText(D.bg_mode)
         self.bg_mode.currentIndexChanged.connect(self.update_display)
         b_recomp = QPushButton("Recompute Background (from IQ range)")
         b_recomp.clicked.connect(self.recompute_background)
@@ -2979,12 +3030,15 @@ class MainWindow(QMainWindow):
 
         # Dynamic BG
         g = QGroupBox("Dynamic Background"); gl = QVBoxLayout(g)
-        self.dyn_bg_chk = QCheckBox("Enable"); self.dyn_bg_chk.stateChanged.connect(self.update_display)
+        self.dyn_bg_chk = QCheckBox("Enable"); self.dyn_bg_chk.setChecked(D.dyn_bg)
+        self.dyn_bg_chk.stateChanged.connect(self.update_display)
         self.dyn_bg_chk.toggled.connect(lambda *_: self._sync_bg_controls())
-        self.dyn_sigma_lbl = QLabel("Sigma: 5.0")
-        self.dyn_sigma = QSlider(Qt.Horizontal); self.dyn_sigma.setRange(1, 200); self.dyn_sigma.setValue(50)
+        sigma_text = lambda v: f"Sigma: {v / D.sigma_slider_scale:.1f}"
+        self.dyn_sigma = QSlider(Qt.Horizontal); self.dyn_sigma.setRange(1, 20 * D.sigma_slider_scale)
+        self.dyn_sigma.setValue(int(round(D.dyn_sigma * D.sigma_slider_scale)))
+        self.dyn_sigma_lbl = QLabel(sigma_text(self.dyn_sigma.value()))
         self.dyn_sigma.valueChanged.connect(self.update_display)
-        self.dyn_sigma.valueChanged.connect(lambda v: self.dyn_sigma_lbl.setText(f"Sigma: {v/10:.1f}"))
+        self.dyn_sigma.valueChanged.connect(lambda v: self.dyn_sigma_lbl.setText(sigma_text(v)))
         gl.addWidget(self.dyn_bg_chk); gl.addWidget(self.dyn_sigma_lbl); gl.addWidget(self.dyn_sigma); cl.addWidget(g)
 
         # Normalization — per-pattern min-max stretch to [0,1].
@@ -2996,7 +3050,7 @@ class MainWindow(QMainWindow):
         #   patterns to reflect the actual signal level recorded by the detector.
         g = QGroupBox("Normalization"); gl = QVBoxLayout(g)
         self.normalize_chk = QCheckBox("Per-pattern stretch to [0,1]")
-        self.normalize_chk.setChecked(True)
+        self.normalize_chk.setChecked(D.per_pattern_stretch)
         self.normalize_chk.setToolTip(
             "ON: each pattern independently stretched to fill the display range.\n"
             "OFF: absolute intensity (native 8/16-bit scale) preserved in preview AND exported file.\n"
@@ -3005,15 +3059,16 @@ class MainWindow(QMainWindow):
         self.normalize_chk.stateChanged.connect(self.update_display)
         gl.addWidget(self.normalize_chk)
         # Global stretch — dataset-wide percentile stretch (mutually exclusive with per-pattern).
-        # Same (lo,hi) applied to every pattern, from the 0.5/99.5 percentiles over
+        # Same (lo,hi) applied to every pattern, from the DEFAULTS.global_percentiles over
         # ACTIVE pixels (dead detector corners excluded). Unlike per-pattern stretch,
         # this preserves RELATIVE intensity across patterns → safe for downstream IQ
         # (OIM/EMsoft) since it does not reorder pattern-to-pattern band contrast.
         # Carries into both the preview and the exported UP1.
-        self.global_chk = QCheckBox("Global stretch (dataset 0.5–99.5 pctile)")
-        self.global_chk.setChecked(False)
+        pct = D.global_percentile_text()
+        self.global_chk = QCheckBox(f"Global stretch (dataset {pct} pctile)")
+        self.global_chk.setChecked(D.global_stretch)
         self.global_chk.setToolTip(
-            "Dataset-wide stretch: one (lo,hi) for ALL patterns, from the 0.5/99.5\n"
+            f"Dataset-wide stretch: one (lo,hi) for ALL patterns, from the {pct}\n"
             "percentiles over active pixels (dead corners excluded).\n"
             "Preserves relative intensity across patterns (IQ-safe). Mutually\n"
             "exclusive with per-pattern stretch. Applies to preview AND saved UP1."
@@ -3025,12 +3080,12 @@ class MainWindow(QMainWindow):
 
         # Brightness / Contrast
         g = QGroupBox("Brightness / Contrast"); gl = QVBoxLayout(g)
-        self.bright_lbl = QLabel("Brightness: 0")
-        self.bright = QSlider(Qt.Horizontal); self.bright.setRange(-100, 100); self.bright.setValue(0)
+        self.bright_lbl = QLabel(f"Brightness: {D.brightness}")
+        self.bright = QSlider(Qt.Horizontal); self.bright.setRange(-100, 100); self.bright.setValue(D.brightness)
         self.bright.valueChanged.connect(self.update_display)
         self.bright.valueChanged.connect(lambda v: self.bright_lbl.setText(f"Brightness: {v}"))
-        self.cont_lbl = QLabel("Contrast: 0")
-        self.cont = QSlider(Qt.Horizontal); self.cont.setRange(-100, 100); self.cont.setValue(0)
+        self.cont_lbl = QLabel(f"Contrast: {D.contrast}")
+        self.cont = QSlider(Qt.Horizontal); self.cont.setRange(-100, 100); self.cont.setValue(D.contrast)
         self.cont.valueChanged.connect(self.update_display)
         self.cont.valueChanged.connect(lambda v: self.cont_lbl.setText(f"Contrast: {v}"))
         gl.addWidget(self.bright_lbl); gl.addWidget(self.bright)
@@ -3038,11 +3093,14 @@ class MainWindow(QMainWindow):
 
         # CLAHE
         g = QGroupBox("CLAHE"); gl = QVBoxLayout(g)
-        self.clahe_chk = QCheckBox("Enable"); self.clahe_chk.stateChanged.connect(self.update_display)
-        self.clahe_clip_lbl = QLabel("Clip Limit: 0.010")
-        self.clahe_clip = QSlider(Qt.Horizontal); self.clahe_clip.setRange(1, 50); self.clahe_clip.setValue(10)
+        self.clahe_chk = QCheckBox("Enable"); self.clahe_chk.setChecked(D.clahe)
+        self.clahe_chk.stateChanged.connect(self.update_display)
+        clip_text = lambda v: f"Clip Limit: {v / D.clip_slider_scale:.3f}"
+        self.clahe_clip = QSlider(Qt.Horizontal); self.clahe_clip.setRange(1, 50)
+        self.clahe_clip.setValue(int(round(D.clahe_clip * D.clip_slider_scale)))
+        self.clahe_clip_lbl = QLabel(clip_text(self.clahe_clip.value()))
         self.clahe_clip.valueChanged.connect(self.update_display)
-        self.clahe_clip.valueChanged.connect(lambda v: self.clahe_clip_lbl.setText(f"Clip Limit: {v/1000:.3f}"))
+        self.clahe_clip.valueChanged.connect(lambda v: self.clahe_clip_lbl.setText(clip_text(v)))
         gl.addWidget(self.clahe_chk); gl.addWidget(self.clahe_clip_lbl); gl.addWidget(self.clahe_clip); cl.addWidget(g)
 
         cl.addStretch()

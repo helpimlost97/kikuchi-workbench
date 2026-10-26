@@ -31,8 +31,9 @@ def run_sequence(mod, scan, out_path, do_nlpar):
     sig = w.sigma_sq_map.copy()
     print(f"  sigma map: median {float(__import__('numpy').median(sig)):.4g}  {t['sigma']:.1f}s")
     if do_nlpar:
-        t0 = time.time(); w._apply_nlpar_cpu(3, 0.9); t['nlpar'] = time.time() - t0
-        print(f"  NLPAR batch (SR=3, lam=0.9): {t['nlpar']:.1f}s -> {w.f_nlpar.filepath if w.f_nlpar else 'NO OUTPUT'}")
+        sr, lam = mod.DEFAULTS.search_radius, mod.DEFAULTS.lam
+        t0 = time.time(); w._apply_nlpar_cpu(sr, lam); t['nlpar'] = time.time() - t0
+        print(f"  NLPAR batch (SR={sr}, lam={lam}): {t['nlpar']:.1f}s -> {w.f_nlpar.filepath if w.f_nlpar else 'NO OUTPUT'}")
     # Apply && Save from the ORIGINAL patterns (same source in both versions)
     w.f_nlpar = None
     w.static_bg_chk.setChecked(True); w.bg_mode.setCurrentText("Subtract")

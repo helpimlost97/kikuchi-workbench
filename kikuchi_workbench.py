@@ -688,7 +688,7 @@ class Workbench(QMainWindow):
             path = recorder["path"]
             if path:
                 # the processor writes with the extension of the source file, whatever the dialog's answer had
-                path = os.path.splitext(path)[0] + self.proc.src_ext
+                path = self.proc.output_path_for(path, log=False)
                 if os.path.exists(path):
                     self._processor_saved(path)
 

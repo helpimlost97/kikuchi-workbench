@@ -1,7 +1,8 @@
 """Check that every GUI default comes from its owner: the indexing form, the point tab and the pattern processor
 are built headless, and each widget's start value is compared with the object that owns the default
 (``sph_core.Settings`` for the indexing and point tabs, ``pattern_processor.processor_defaults.DEFAULTS`` for the
-processor). Prints the differences and ends with ``RESULT: PASS`` or ``RESULT: FAIL`` (exit code 1).
+processor). Prints the differences and ends with ``RESULT: PASS`` or ``RESULT: FAIL`` (exit code 1). The one
+runtime rule it allows for: without a CUDA device the Workbench starts the backend at ``cpu``.
 
     python check_defaults.py
 
@@ -9,6 +10,7 @@ Runs on the CPU in a few seconds (Qt offscreen, ``KPP_GPU=0``), writes no files,
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 
@@ -37,9 +39,14 @@ def compare(what: str, got: dict, owner) -> None:
 wb = kw.Workbench()
 base = sph_core.Settings()
 
-# 1. the indexing tab: every Settings field the form has (after the LAZY / PC normalisation of Workbench.settings)
+# 1. the indexing tab: every Settings field the form has (after the LAZY / PC normalisation of Workbench.settings).
+# One runtime rule sits on top of the defaults: with no CUDA device the Workbench moves BACKEND to "cpu" at start.
+gpu_ok, gpu_text = sph_core.gpu_available()
+expected = base if gpu_ok else dataclasses.replace(base, BACKEND="cpu")
+if not gpu_ok:
+    print(f"no GPU here ({gpu_text}): the Workbench starts BACKEND at 'cpu', as expected")
 st = wb.settings()
-compare("indexing form", {n: getattr(st, n) for n in base.names() if wb.form.has(n)}, base)
+compare("indexing form", {n: getattr(st, n) for n in base.names() if wb.form.has(n)}, expected)
 missing = [n for n in base.names() if not wb.form.has(n)]
 print(f"indexing form: {len(wb.form._fields)} fields checked; Settings fields without a widget: {missing or 'none'}")
 
