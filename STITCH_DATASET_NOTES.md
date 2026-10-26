@@ -1,6 +1,7 @@
 # EDAX montage ("Stitch") dataset: how .edaxh5 and .up1 files relate
 
-Reference dataset: `D:\GPU-Accelerated EBSD\Stitch dataset\`
+Reference dataset: an APEX montage project, `GMAW 304L 309.edaxh5` plus one `.up1` per tile; a copy
+cropped to a few points per tile is in `example_data/montage_sample/`
 (collected 2026-09-28, EDAX APEX `PRODUCT_VERSION V3.1.2007.0001`, Velocity Gen1 camera).
 
 Purpose: give the information needed to add **batch pattern processing + batch spherical

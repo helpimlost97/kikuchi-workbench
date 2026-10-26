@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Cut a small, self-consistent sample out of an EDAX APEX montage (.edaxh5 + .up1/.up2 tiles) for development.
 
-    python make_montage_sample.py "D:\\GPU-Accelerated EBSD\\Stitch dataset\\GMAW 304L 309.edaxh5" ^
-        --out "D:\\GPU-Accelerated EBSD\\example_data\\montage_sample" --rows 3 --cols 40
+    python make_montage_sample.py "C:\\path\\to\\montage.edaxh5" ^
+        --out example_data\\montage_sample --rows 3 --cols 40
 
 Writes into --out:
 
