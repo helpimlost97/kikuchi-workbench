@@ -123,18 +123,21 @@ nvidia-smi
 
 The top right of the table says `CUDA Version: 13.x` or `12.x`. (If `nvidia-smi` refuses to
 run for permission reasons on Windows, the NVIDIA Control Panel's System Information shows the
-driver version; drivers from 580 onwards support CUDA 13.) Then install the matching wheel:
+driver version; drivers from 580 onwards support CUDA 13.) Then install the matching wheel
+together with its CUDA pieces (the `[ctk]` extra: the CUDA runtime, the NVRTC compiler CuPy builds
+its kernels with, cuFFT and cuBLAS, all as pip wheels, no CUDA Toolkit install and no admin rights):
 
 ```bash
-pip install cupy-cuda13x      # driver supports CUDA 13
+pip install "cupy-cuda13x[ctk]"      # driver supports CUDA 13
 # or
-pip install cupy-cuda12x      # driver supports CUDA 12 only
+pip install "cupy-cuda12x[ctk]"      # driver supports CUDA 12 only
 ```
 
-CuPy 14 is required on Python 3.14; older Python versions can take CuPy 13 as well. If the
-first GPU run fails with a missing cuBLAS or cuFFT library, install the runtime libraries
-through pip as well (`pip install nvidia-cublas nvidia-cufft` for CUDA 13, or
-`pip install nvidia-cublas-cu12 nvidia-cufft-cu12` for CUDA 12).
+CuPy 14 is required on Python 3.14; older Python versions can take CuPy 13 as well. Without the
+`[ctk]` extra, a machine that has no CUDA Toolkit installed fails at the first GPU kernel with
+"Failed to find CUDA headers" (the processor's Apply && Save, the indexer's cuFFT probe); the
+`CUDA path could not be detected` warning at import is harmless either way. NLPAR on the GPU in the
+pattern processor goes through OpenCL instead and needs `pip install pyopencl`.
 
 ---
 
