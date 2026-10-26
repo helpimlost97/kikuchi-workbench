@@ -1,6 +1,6 @@
 """Test that GPU memory is released after a spherical indexing run.
 
-Checks the cuFFT plan-cache patch of kikuchipy_local_patches.patch (README section 3): without it, several GB
+Checks the cuFFT plan-cache fix of the fork's workbench commit (README section 3): without it, several GB
 of VRAM stay allocated after a GPU run and the next run picks a tiny automatic batch size. Runs the nickel
 demo dataset twice on the GPU and checks that
 

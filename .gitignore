@@ -2,7 +2,6 @@
 *
 !.gitignore
 !README.md
-!kikuchipy_local_patches.patch
 !update_fork.py
 !make_montage_sample.py
 !STITCH_DATASET_NOTES.md

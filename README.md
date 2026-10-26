@@ -5,7 +5,8 @@ formerly its own repository) and GPU spherical indexing in one window, with a ta
 shows the master pattern at the orientation found, and a tab that runs processing and indexing over every tile of an
 EDAX APEX montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
 indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, which lives in his fork of kikuchipy;
-nothing of it is in upstream kikuchipy or on PyPI, so it is installed from a git clone (section 3).
+nothing of it is in upstream kikuchipy or on PyPI, so it is installed from a git clone (section 3) of
+https://github.com/helpimlost97/kikuchipy, a GitHub fork of his with this workbench's changes on top.
 Everything in this repository is the GUI and the functions it calls; there are no notebooks.
 
 Tested on: Windows 11, Python 3.14.0, RTX 5070 Laptop GPU (8 GB VRAM), driver with CUDA 13
@@ -18,16 +19,15 @@ only the path syntax in the examples changes.
 
 | File / folder | Purpose |
 |---|---|
-| `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/jwestraadt/kikuchipy, branch `develop`, pinned at commit `4c7a0035`, plus the local patches below. Installed in editable mode. |
-| `update_fork.py` | Clones or updates that clone, checks out the pinned commit, applies the patch and installs it, in one command. Also undoes an earlier patch first, so re-running it after Johan pushes new commits is safe. See step 3. |
-| `kikuchipy_local_patches.patch` | The uncommitted local changes to the fork (GPU memory release, fast lazy loading of `.up1` files). Applied by `update_fork.py`, or by hand, see step 3. |
+| `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/helpimlost97/kikuchipy, branch `workbench`, pinned at commit `31d2882d`: Johan's `develop` at `4c7a0035` plus the two workbench changes listed in step 3. Installed in editable mode. |
+| `update_fork.py` | Clones or updates that clone, checks out the pinned commit and installs it, in one command. A clone made with the old patch file (Johan's repository plus `kikuchipy_local_patches.patch`) is moved over to the fork's commit without losing anything. See step 3. |
 | `pattern_processor/` | The Kikuchi Pattern Processor: `gpu_pattern_viewer.py` (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`, the montage batch API), its patched OpenCL NLPAR kernel, its own README, plan notes and HPC launch script. Tab 1 of the workbench, and still runnable on its own (`python pattern_processor/gpu_pattern_viewer.py`). Merged from `helpimlost97/kikuchi-pattern-processor` with its history. |
 | `kikuchi_workbench.py`, `point_tab.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare, plus the single-pattern functions; usable from scripts), `point_tab.py` the *Index a point* tab, `live_view.py` the animated progress view. |
 | `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.2. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's fourth tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
 | `preset_RKD.txt` | Example preset file for the GUI (an RKD data set, detector parallel to the sample): the indexing parameters as `NAME = value` lines. The paths in it are placeholders and are not read by the GUI. |
 | `ebsd_params.py` | Reads acquisition parameters (pattern size, projection center, map size, step) from an EDAX `.ang` or `.edaxh5` file and a `.up1`/`.up2` file. Used by the GUI's *Read scan parameters* and usable from the command line. |
 | `sph_benchmark.py` | CPU vs GPU speed and parity benchmark on the nickel demo data set. Use it to verify the install. |
-| `test_gpu_memory_fix.py` | Checks that VRAM is released between two GPU runs (tests one of the local patches). |
+| `test_gpu_memory_fix.py` | Checks that VRAM is released between two GPU runs (tests one of the fork's workbench changes). |
 | `osc_refinement_handoff/` | Full pattern-matching refinement with a PC per map point (hours to days, CPU) as a stand-alone script for a cluster, with its own hand-off notes. |
 
 ---
@@ -55,38 +55,39 @@ Open a terminal in this folder (quote paths that contain spaces) and activate yo
 first. Then
 
 ```bash
-python update_fork.py                     # clones ./kikuchipy, checks out 4c7a0035, applies the patch, pip installs
+python update_fork.py                     # clones kikuchipy/ next to it, checks out 31d2882d, pip installs
 python update_fork.py --dir D:\path\to\kikuchipy   # if the clone lives elsewhere
 ```
 
 That is the whole of this step; the manual equivalent is
 
 ```bash
-git clone https://github.com/jwestraadt/kikuchipy.git
+git clone https://github.com/helpimlost97/kikuchipy.git
 cd kikuchipy
-git checkout 4c7a0035         # the commit everything here was tested with
-git apply ../kikuchipy_local_patches.patch
-git status --short            # should list 4 modified files
+git checkout 31d2882d         # the commit everything here was tested with
 pip install -e .
 ```
 
-`4c7a0035` is the head of `develop` on 2026-10-18. Compared with the earlier pin `71a1b2f` it adds
-NLPAR (`EBSD.average_non_local_neighbour_patterns`; not used here, the Kikuchi Pattern Processor
-does NLPAR through pyebsdindex), HROSM (`EBSD.hrosm`, not used here) and a HyperSpy 2.5 fix. The
-spherical indexing code and its `spherical_indexing()` signature are unchanged, the patch applies
-cleanly, and the fork's spherical indexing tests (326, with the patch) and the workbench's indexing
-of the demo data were re-run against it. To try a newer commit later:
+The fork's `workbench` branch starts from Johan's `develop` at `4c7a0035` (its head on 2026-10-18),
+so the history credits his commits to him and the workbench's own commits sit on top. Compared
+with the earlier base `71a1b2f`, `4c7a0035` adds NLPAR (`EBSD.average_non_local_neighbour_patterns`;
+not used here, the Kikuchi Pattern Processor does NLPAR through pyebsdindex), HROSM (`EBSD.hrosm`,
+not used here) and a HyperSpy 2.5 fix. The spherical indexing code and its `spherical_indexing()`
+signature are unchanged, and the fork's spherical indexing tests (326, with the workbench changes)
+and the workbench's indexing of the demo data were re-run against it.
 
 ```bash
-python update_fork.py --show-latest       # lists the commits on origin/develop after the pin
-python update_fork.py --commit develop    # checks it out and re-applies the patch (stops if the patch no longer fits)
+python update_fork.py --show-latest         # lists Johan's develop commits newer than 4c7a0035
+python update_fork.py --commit workbench    # the newest commit of the branch instead of the pin
 ```
 
-When moving the pin, change `PINNED_COMMIT` in `update_fork.py` and this README together. If
-you already have a clone with the patch applied by hand, `update_fork.py` recognises it (it
-reverts exactly that patch before checking out) and refuses to touch any other local change.
+`--commit workbench` currently adds an experimental fused Wigner kernel for the GPU backend
+(`505263ab`), not yet benchmarked end to end. When moving the pin, change `PINNED_COMMIT` in
+`update_fork.py` and this README together. `update_fork.py` refuses to touch any local change in
+the clone, except one whose files already equal the target commit (a clone of Johan's repository
+with the old `kikuchipy_local_patches.patch` applied), which it resets since nothing is lost.
 
-What the patch does:
+What the workbench commit `31d2882d` changes:
 
 - `io/plugins/edax_binary/_api.py`: lazy loading of large EDAX `.up1`/`.up2` files. Without
   it, opening a 30 GB file lazily takes minutes because Dask hashes and copies the whole
@@ -482,12 +483,13 @@ patterns per Dask chunk and, on the GPU, the device batch size.
   bandwidth 123, about 130 patterns/s on the GPU and about 28 on 8 CPU workers.
 - **VRAM held after a run.** Without the plan-cache patch, several GB of VRAM can stay
   allocated in the process after a GPU run, and the next call picks a tiny automatic batch
-  size. Work-arounds: apply the patch, set `CHUNKSIZE` explicitly, or restart the program
+  size (Johan's `develop` without the fork's workbench commit). Work-arounds: install the fork's
+  pinned commit (step 3), set `CHUNKSIZE` explicitly, or restart the program
   between runs. Also check that no other process holds VRAM when
   a run reports out of memory.
 - **Large pattern files.** `LAZY = "auto"` memory-maps files larger than a quarter of RAM.
   The operating system may show a lot of "used" memory for mapped file pages; that is cache,
-  not a leak. Apply the lazy-load patch or opening such files takes minutes.
+  not a leak. Without the fork's workbench commit (step 3) opening such files takes minutes.
 - **Accuracy vs the EMSphInx binary:** the author reports a median refined disagreement of
   about 0.3 deg, due to a pixel-stretch quirk in EMSphInx that was deliberately not copied.
   On an RKD data set this code matched an EMSphInx result to a median of 0.03 deg.
@@ -502,7 +504,8 @@ patterns per Dask chunk and, on the GPU, the device batch size.
 
 ## 9. References
 
-- Fork: https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `4c7a0035`).
+- Fork: https://github.com/helpimlost97/kikuchipy (branch `workbench`, commit `31d2882d`), a fork of
+  Johan Westraadt's https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `4c7a0035`).
   Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, design notes in `specs/`,
   tutorial in `doc/tutorials/spherical_indexing.ipynb`.
 - W. C. Lenthe, S. Singh, M. De Graef, "A spherical harmonic transform approach to the
