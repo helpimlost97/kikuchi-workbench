@@ -787,7 +787,7 @@ class Workbench(QMainWindow):
         bandwidths = [16, 32, 53, 63, 68, 74, 88, 95, 113, 123, 158, 172, 188, 263, 383]
         self.bandwidth_combo = form.add_combo("BANDWIDTH", "Bandwidth:", bandwidths, 68, "68 = EMSphInx default; 88 or 123 for more accuracy at lower speed (fast bandwidths only)")
         form.add_combo("BACKEND", "Backend:", ["gpu", "cpu"], "gpu")
-        form.add_int("N_WORKERS", "Dask workers:", max(1, (os.cpu_count() or 8) // 2), 1, 256, "About the number of performance cores")
+        form.add_int("N_WORKERS", "Dask workers:", 2, 1, 256, "Raise to about the number of performance cores")
         form.add_bool("REFINE", "Newton refinement", "", True)
         self.w_regions = form.add_int("N_REGIONS", "AHE tiles (n_regions):", 10, 0, 64, "Adaptive histogram equalization tiles per axis; 0 = off")
         self.w_circular = form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector", True)

@@ -155,7 +155,8 @@ once, a few MB):
 python sph_benchmark.py --backend both --workers 8 --compare    # from this folder
 ```
 
-`--workers` should be about your number of performance cores. The first call of each backend
+`--workers` defaults to 2, as does the GUI's `N_WORKERS`; set it to about your number of
+performance cores. The first call of each backend
 includes about 10 s of Numba compilation, which the script excludes by a warm-up run.
 Reference numbers from the tested laptop, bandwidth 68, refinement on:
 
@@ -208,7 +209,8 @@ The settings of the indexing tab (the names are those of `sph_core.Settings` and
   already background corrected or NLPAR processed (the default).
 - `BANDWIDTH`: 68 is the EMSphInx default, 88 or 123 for more accuracy at lower speed.
   `kp.indexing.fast_bandwidths()` lists the efficient values.
-- `BACKEND = "gpu"`, `N_WORKERS` = number of performance cores, `CHUNKSIZE = None` (automatic GPU
+- `BACKEND = "gpu"`, `N_WORKERS` = Dask threads (default 2; raise to about your number of performance
+  cores), `CHUNKSIZE = None` (automatic GPU
   batch size; set a number if a run reports out of memory).
 - `TWIST`: rotation of the detector about its normal. The indexer cannot use a twisted detector, so
   the indexed orientations are rotated about the sample normal afterwards. Flip the sign if the

@@ -125,7 +125,7 @@ class Settings:
     # indexing
     BANDWIDTH: int = 68
     BACKEND: str = "gpu"
-    N_WORKERS: int = 8
+    N_WORKERS: int = 2
     REFINE: bool = True
     N_REGIONS: int = 10
     CIRCULAR_MASK: bool = False

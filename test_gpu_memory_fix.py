@@ -43,7 +43,7 @@ def auto_batch():
     return _gpu._default_batch_size(BANDWIDTH, int(cupy.cuda.runtime.memGetInfo()[0]))
 
 
-dask.config.set(num_workers=8)
+dask.config.set(num_workers=2)
 print("kikuchipy", kp.__version__, "from", kp.__file__)
 print("GPU:", cupy.cuda.runtime.getDeviceProperties(0)["name"].decode())
 

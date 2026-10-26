@@ -9,7 +9,7 @@ first, as in the fork's tutorial.
                             [--chunksize N] [--no-refine] [--compare] [--bandwidth 68]
 
 --backend     which backend(s) to time (default: both). --compare forces both.
---workers     Dask threads (default: 8); about the number of performance cores.
+--workers     Dask threads (default: 2); raise to about the number of performance cores.
 --repeat      index the full map this many times per backend and report the best time (default: 1).
 --chunksize   patterns per Dask chunk and, on the GPU, the device batch size (default: automatic).
 --bandwidth   spherical harmonic bandwidth of the indexing (default: 68, the EMSphInx default).
@@ -28,7 +28,7 @@ import kikuchipy as kp
 
 p = argparse.ArgumentParser()
 p.add_argument("--backend", default="both", choices=["cpu", "gpu", "both"])
-p.add_argument("--workers", type=int, default=8)
+p.add_argument("--workers", type=int, default=2)
 p.add_argument("--repeat", type=int, default=1, help="best-of-N timing")
 p.add_argument("--chunksize", type=int, default=None)
 p.add_argument("--bandwidth", type=int, default=68)
