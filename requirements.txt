@@ -1,0 +1,26 @@
+# Kikuchi workbench: everything except CuPy, which depends on your NVIDIA driver (README section 4).
+#
+#   pip install -r requirements.txt
+#
+# The first line installs Johan Westraadt's kikuchipy fork with the workbench's patches straight
+# from GitHub, at the commit everything here was tested with (README section 3). pip needs git on
+# the PATH for it. Developers who want an editable clone instead: see "Developer install" in the README.
+kikuchipy @ git+https://github.com/helpimlost97/kikuchipy-workbench@31d2882d34bec58ab9710c3aedeb83bc0061d9bd
+
+# GUI and scripts
+PyQt5>=5.15
+pyebsdindex>=0.3.9
+numpy>=2.0
+scipy>=1.14
+scikit-image>=0.24
+matplotlib>=3.8
+psutil>=5.9
+pooch          # downloads the nickel demo data for sph_benchmark.py
+nlopt          # osc_refinement_handoff/refine_pc_per_point.py
+
+# GPU, installed separately:
+#   pip install cupy-cuda13x      # driver supports CUDA 13 (CuPy 14 is required on Python 3.14)
+#   pip install cupy-cuda12x      # driver supports CUDA 12 only
+# NLPAR on the GPU (optional): pyebsdindex uses its OpenCL kernels whenever pyopencl can see a GPU
+# device; without it NLPAR runs on the CPU with numba.
+#   pip install pyopencl

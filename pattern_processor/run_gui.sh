@@ -4,12 +4,12 @@
 # core count / memory / GPU there; the app sizes its thread pools and RAM budgets from
 # the allocation automatically).
 #
-#   bash /path/to/gpu-accelerated-ebsd/pattern_processor/run_gui.sh
+#   bash /path/to/kikuchi-workbench/pattern_processor/run_gui.sh
 #
 # Site-specific settings live in local/env.sh next to this script (git-ignored), e.g.:
 #   PYTHON_MODULE=python/3.12      # `module load` name, or empty if no modules
 #   CUDA_MODULE=cuda/12.9.1        # provides the OpenCL / CUDA runtime, or empty
-#   VENV=~/venvs/kikuchi           # virtualenv with requirements.txt installed
+#   VENV=~/venvs/kikuchi           # virtualenv with the repository's requirements.txt installed
 # Without that file the defaults below are used.
 #
 # Optional: KPP_THREADS=<n> to use fewer threads than allocated.

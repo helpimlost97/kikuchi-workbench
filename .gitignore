@@ -2,7 +2,8 @@
 *
 !.gitignore
 !README.md
-!update_fork.py
+!LICENSE
+!requirements.txt
 !make_montage_sample.py
 !STITCH_DATASET_NOTES.md
 !example_data/

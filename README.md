@@ -1,13 +1,15 @@
 # GPU-accelerated spherical indexing of EBSD / RKD patterns
 
-The **Kikuchi workbench**: a PyQt5 GUI that puts the Kikuchi Pattern Processor (`pattern_processor/`,
-formerly its own repository) and GPU spherical indexing in one window, with a tab that indexes one clicked pattern and
+The **Kikuchi workbench** (https://github.com/helpimlost97/kikuchi-workbench): a PyQt5 GUI that puts the
+Kikuchi Pattern Processor (`pattern_processor/`, formerly its own repository, now a module of this one) and GPU
+spherical indexing in one window, with a tab that indexes one clicked pattern and
 shows the master pattern at the orientation found, and a tab that runs processing and indexing over every tile of an
 EDAX APEX montage. The indexing is Johan Westraadt's Python port of **EMSphInx** (spherical harmonic EBSD
 indexing, Lenthe et al. 2019) with its **CuPy GPU backend**, which lives in his fork of kikuchipy;
-nothing of it is in upstream kikuchipy or on PyPI, so it is installed from a git clone (section 3) of
-https://github.com/helpimlost97/kikuchipy-workbench, a GitHub fork of his with this workbench's changes on top.
-Everything in this repository is the GUI and the functions it calls; there are no notebooks.
+nothing of it is in upstream kikuchipy or on PyPI, so `requirements.txt` installs it from
+https://github.com/helpimlost97/kikuchipy-workbench, a GitHub fork of his with this workbench's changes on top (section 3).
+Everything in this repository is the GUI and the functions it calls; there are no notebooks. Everything here is
+vibe coded; read the code before trusting a number. GPLv3, see section 10.
 
 Tested on: Windows 11, Python 3.14.0, RTX 5070 Laptop GPU (8 GB VRAM), driver with CUDA 13
 support, Core Ultra 9 275HX (8 performance cores), 32 GB RAM. Linux works the same way;
@@ -19,9 +21,10 @@ only the path syntax in the examples changes.
 
 | File / folder | Purpose |
 |---|---|
-| `kikuchipy/` | (Not in the repository; `update_fork.py` creates it in step 3.) Clone of https://github.com/helpimlost97/kikuchipy-workbench, branch `workbench`, pinned at commit `31d2882d`: Johan's `develop` at `4c7a0035` plus the two workbench changes listed in step 3. Installed in editable mode. |
-| `update_fork.py` | Clones or updates that clone, checks out the pinned commit and installs it, in one command. A clone made with the old patch file (Johan's repository plus `kikuchipy_local_patches.patch`) is moved over to the fork's commit without losing anything. See step 3. |
-| `pattern_processor/` | The Kikuchi Pattern Processor: `gpu_pattern_viewer.py` (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`, the montage batch API), its patched OpenCL NLPAR kernel, its own README, plan notes and HPC launch script. Tab 1 of the workbench, and still runnable on its own (`python pattern_processor/gpu_pattern_viewer.py`). Merged from `helpimlost97/kikuchi-pattern-processor` with its history. |
+| `requirements.txt` | Everything the GUI and scripts need except CuPy: the kikuchipy fork at the pinned commit `31d2882d` (installed by pip straight from GitHub), PyQt5, pyebsdindex and the rest. See step 3. |
+| `LICENSE` | GPLv3, for everything in this repository. See section 10. |
+| `kikuchipy/` | (Not in the repository, and not needed to run the workbench.) Optional developer clone of https://github.com/helpimlost97/kikuchipy-workbench for editing the fork in place; see "Developer install" in step 3. |
+| `pattern_processor/` | The Kikuchi Pattern Processor: `gpu_pattern_viewer.py` (NLPAR through pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`, the montage batch API), its patched OpenCL NLPAR kernel, its own README, plan notes and HPC launch script. Tab 1 of the workbench, and still runnable on its own (`python pattern_processor/gpu_pattern_viewer.py`). Formerly its own repository (`helpimlost97/kikuchi-pattern-processor`, now retired), merged here with its history. |
 | `kikuchi_workbench.py`, `point_tab.py`, `live_view.py`, `sph_core.py`, `Open workbench.bat` | The GUI: the Kikuchi Pattern Processor and spherical indexing in one window, see section 6.1. `sph_core.py` holds the indexing functions the GUI calls (one per step: load, preprocess, harmonics, detector, index, save, compare, plus the single-pattern functions; usable from scripts), `point_tab.py` the *Index a point* tab, `live_view.py` the animated progress view. |
 | `montage.py`, `montage_tab.py`, `STITCH_DATASET_NOTES.md`, `make_montage_sample.py`, `example_data/montage_sample/` | Batch processing and indexing of an EDAX APEX montage (a scan collected as tiles, to be stitched in OIM Analysis or MTEX afterwards), see section 6.2. `montage.py` reads the `.edaxh5` project, links each tile to its `.up1` by the GUID in the file header and writes results into a copy of the project; `montage_tab.py` is the GUI's fourth tab. The notes describe the file formats; the sample is a real project cropped to 3 x 40 points per tile by `make_montage_sample.py`. |
 | `preset_RKD.txt` | Example preset file for the GUI (an RKD data set, detector parallel to the sample): the indexing parameters as `NAME = value` lines. The paths in it are placeholders and are not read by the GUI. |
@@ -49,26 +52,23 @@ only the path syntax in the examples changes.
 
 ---
 
-## 3. Install the kikuchipy fork
+## 3. Install the workbench and the kikuchipy fork
 
-Open a terminal in this folder (quote paths that contain spaces) and activate your environment
-first. Then
-
-```bash
-python update_fork.py                     # clones kikuchipy/ next to it, checks out 31d2882d, pip installs
-python update_fork.py --dir D:\path\to\kikuchipy   # if the clone lives elsewhere
-```
-
-That is the whole of this step; the manual equivalent is
+Activate your environment, then (quote paths that contain spaces):
 
 ```bash
-git clone https://github.com/helpimlost97/kikuchipy-workbench.git
-cd kikuchipy
-git checkout 31d2882d         # the commit everything here was tested with
-pip install -e .
+git clone https://github.com/helpimlost97/kikuchi-workbench.git
+cd kikuchi-workbench
+pip install -r requirements.txt
 ```
 
-The fork's `workbench` branch starts from Johan's `develop` at `4c7a0035` (its head on 2026-10-18),
+That is the whole of this step. The first line of `requirements.txt` makes pip clone the fork
+https://github.com/helpimlost97/kikuchipy-workbench at commit `31d2882d`, the commit everything here
+was tested with, and install it like any other package (pip needs `git` on the PATH for that). The
+rest of the file is PyQt5, pyebsdindex and the other packages the GUI and scripts use. CuPy is the
+next step because its wheel depends on your driver.
+
+The fork's `develop` branch starts from Johan's `develop` at `4c7a0035` (its head on 2026-10-18),
 so the history credits his commits to him and the workbench's own commits sit on top. Compared
 with the earlier base `71a1b2f`, `4c7a0035` adds NLPAR (`EBSD.average_non_local_neighbour_patterns`;
 not used here, the Kikuchi Pattern Processor does NLPAR through pyebsdindex), HROSM (`EBSD.hrosm`,
@@ -76,16 +76,12 @@ not used here) and a HyperSpy 2.5 fix. The spherical indexing code and its `sphe
 signature are unchanged, and the fork's spherical indexing tests (326, with the workbench changes)
 and the workbench's indexing of the demo data were re-run against it.
 
-```bash
-python update_fork.py --show-latest         # lists Johan's develop commits newer than 4c7a0035
-python update_fork.py --commit workbench    # the newest commit of the branch instead of the pin
-python update_fork.py --commit workbench-dev    # the fork's test branch: experimental changes, not for production
-```
-
-When moving the pin, change `PINNED_COMMIT` in
-`update_fork.py` and this README together. `update_fork.py` refuses to touch any local change in
-the clone, except one whose files already equal the target commit (a clone of Johan's repository
-with the old `kikuchipy_local_patches.patch` applied), which it resets since nothing is lost.
+The fork has two branches: `develop` (the pin lives on it; Johan's develop plus the workbench's
+patches, nothing experimental) and `develop-fused-wigner` (experimental GPU changes, not benchmarked
+end to end, not for production). To try a newer commit, change the hash after `@` in
+`requirements.txt` and run `pip install -r requirements.txt` again; when the pin moves for everyone,
+change it there and in this README together. `git log 4c7a0035..upstream/develop` in a clone of the
+fork with Johan's repository added as `upstream` lists what he has added since the base.
 
 What the workbench commit `31d2882d` changes:
 
@@ -99,18 +95,20 @@ What the workbench commit `31d2882d` changes:
 - `tests/test_indexing/test_spherical_gpu.py`: a no-op to keep the author's test suite in
   step with the change above.
 
-`update_fork.py` has already run `pip install -e kikuchipy`. Add what the GUI and scripts need
-beyond the core package:
+In `requirements.txt`, `pooch` downloads the nickel demo data, `nlopt` is used by the refinement
+script, `psutil` decides whether to load a file lazily, and PyQt5, pyebsdindex, scipy and
+scikit-image are the pattern processor's packages (add `pyopencl` for NLPAR on the GPU).
+
+**Developer install.** To edit the fork in place instead of using pip's copy, clone it into
+`kikuchipy/` next to this README (the folder is git-ignored) and install it editable; this replaces
+the copy that `requirements.txt` installed, and running `pip install -r requirements.txt` again
+replaces it back:
 
 ```bash
-pip install pooch nlopt psutil pyqt5 pyebsdindex scipy scikit-image
+git clone https://github.com/helpimlost97/kikuchipy-workbench.git kikuchipy
+git -C kikuchipy checkout 31d2882d        # or develop, or develop-fused-wigner
+pip install -e kikuchipy
 ```
-
-In that line, `pooch` downloads the nickel demo data, `nlopt` is used by the refinement script,
-`psutil` decides whether to load a file lazily, and the last four are the pattern processor's
-packages (add `pyopencl` for NLPAR on the GPU). Alternatively
-`pip install -e ".[all]"` installs the author's full extra set (adds pyebsdindex, pyvista and
-ebsdsim); use that if you want them and nothing else in the environment pins pyebsdindex.
 
 ---
 
@@ -145,7 +143,8 @@ through pip as well (`pip install nvidia-cublas nvidia-cufft` for CUDA 13, or
 python -c "import kikuchipy as kp, cupy; print(kp.__version__, kp.__file__); print(cupy.cuda.runtime.getDeviceProperties(0)['name'].decode())"
 ```
 
-Expected: version `0.14.dev0`, a file path inside your clone, and your GPU's name. If CuPy
+Expected: version `0.14.dev0`, a file path in your environment's `site-packages` (or inside
+`kikuchipy/` after a developer install), and your GPU's name. If CuPy
 raises `cudaErrorNoDevice` or `cudaErrorInsufficientDriver`, the driver is too old for the
 wheel you picked; `backend="gpu"` will refuse to run rather than silently use the CPU.
 
@@ -277,8 +276,7 @@ python kikuchi_workbench.py --no-processor                    # the point, index
 ```
 
 On Windows `Open workbench.bat` does the same (set `PYTHON` at its top). The environment is the one
-of this README (fork, CuPy) plus the processor's packages: `pip install pyqt5 pyebsdindex scipy scikit-image` (and `pyopencl` for NLPAR
-on the GPU). The processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...) apply
+of sections 3 and 4 (`requirements.txt` plus CuPy; add `pyopencl` for NLPAR on the GPU). The processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...) apply
 inside the workbench too.
 
 Memory: with the background removals off (the default), the loaded patterns are indexed as they
@@ -504,7 +502,7 @@ patterns per Dask chunk and, on the GPU, the device batch size.
 
 ## 9. References
 
-- Fork: https://github.com/helpimlost97/kikuchipy-workbench (branch `workbench`, commit `31d2882d`), a fork of
+- Fork: https://github.com/helpimlost97/kikuchipy-workbench (branch `develop`, commit `31d2882d`), a fork of
   Johan Westraadt's https://github.com/jwestraadt/kikuchipy (branch `develop`, commit `4c7a0035`).
   Spherical indexing code is in `src/kikuchipy/indexing/_spherical/`, design notes in `specs/`,
   tutorial in `doc/tutorials/spherical_indexing.ipynb`.
@@ -512,3 +510,12 @@ patterns per Dask chunk and, on the GPU, the device batch size.
   indexing of electron back-scattered diffraction patterns", Ultramicroscopy 207 (2019).
 - EMSphInx: https://github.com/EMsoft-org/EMSphInx
 - kikuchipy documentation: https://kikuchipy.org
+
+---
+
+## 10. License
+
+Everything in this repository, `pattern_processor/` included, is under the GNU General Public License
+version 3 (`LICENSE`). The kikuchipy fork it installs is GPLv3 as well, copyright the kikuchipy
+developers and Johan Westraadt; pyebsdindex, CuPy and the other dependencies are separate projects under
+their own licenses.

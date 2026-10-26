@@ -25,7 +25,7 @@ module load cuda/12.x              # provides the OpenCL and CUDA runtimes (GPU 
 python -m venv ~/venvs/kikuchi
 source ~/venvs/kikuchi/bin/activate
 pip install --upgrade pip
-pip install -r requirements.txt
+pip install -r ../requirements.txt # the workbench's requirements.txt, one folder up (needs git on the PATH)
 pip install pyopencl               # NLPAR on the GPU through pyebsdindex (optional)
 pip install cupy-cuda12x           # previews / Apply && Save on the GPU (optional)
 ```
