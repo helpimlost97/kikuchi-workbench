@@ -241,17 +241,21 @@ Workflow in the indexing tab:
   IQ range out of the processing (background, stretch, NLPAR) but writes them unprocessed, so they
   are still in the file. The browse button takes any other file kikuchipy reads, e.g. a scan that
   was not processed. Big files are memory mapped and read chunk by chunk, so RAM is not a concern.
-- **Load patterns (quasi-IQ map)**: runs by itself after browsing for a pattern file (and when the
-  source is switched to the processor, whose IQ map is reused). It loads the patterns, computes a
-  quasi image quality map (the standard deviation of every raw pattern, the processor's definition),
-  stretches it between its 1st and 99th percentile and shows it in the **Live** view. For a memory
-  mapped file this is one read of the file.
+- **Load patterns**: runs by itself after browsing for a pattern file (and when the source is
+  switched to the processor). It loads the patterns and shows a black map of the scan's shape in the
+  **Live** view: every point of it can be clicked for its pattern, and a run paints its bands on it.
+  No map is computed on its own.
+- **Build quasi-IQ map** (optional, the same button is in the point tab): computes the quasi image
+  quality map of the loaded patterns (the standard deviation of every raw pattern, the processor's
+  definition), stretches it between its 1st and 99th percentile and puts it under the Live view. For
+  a memory mapped file this is one read of the file, which takes a while on a big scan; indexing does
+  not need it.
 - **Read scan parameters** fills the projection center from the `.ang`; the scan file dialog opens in
   the pattern file's folder. The **pixel size** is filled in automatically as 30 mm / pattern width
   for the EDAX/TSL convention (the EDAX detector is 30 mm wide) and stays editable; binning is
   always 1 here (it only scales that pixel size). Static and
-  dynamic background removal are off by default (the processor already did them) and the circular
-  mask is on.
+  dynamic background removal are off by default (the processor already did them), as are the circular
+  mask and the adaptive histogram equalization (AHE tiles 0).
 - **Click anywhere on the map** (before indexing) to see that pattern on the right exactly as the
   indexer will see it: raw when nothing is ticked, otherwise with the static and dynamic background
   removal, the Gaussian background and the adaptive histogram equalization (`N_REGIONS`) that are
@@ -312,21 +316,21 @@ sign without indexing a region.
   pattern (raw, no equalization) over the measured one: 0 % shows the measured pattern alone, 100 %
   the simulated one alone, anything between blends them so the band positions can be compared in
   place.
-- **Files and settings**: the pattern file, scan file, master file(s), projection center, bandwidth,
-  AHE tiles and circular mask are the same as the indexing tab's (a change in either tab is a change in
-  both; adjust the PC or the bandwidth here and index the point again to see the match change, the
-  indexer is rebuilt on the next click). The master bandwidth, the tilts, pixel size and twist, the
-  background steps and the other indexing settings (refinement, Gaussian background, ...) are read
-  from the indexing tab.
+- **Files and settings**: the pattern file, scan file, master file(s), projection center and its
+  convention, sample and camera tilts, pixel size, bandwidth, AHE tiles and circular mask are the same
+  as the indexing tab's (a change in either tab is a change in both; adjust the PC, a tilt or the
+  bandwidth here and index the point again to see the match change, the indexer is rebuilt on the next
+  click). The master bandwidth, the twist, the background steps and the other indexing settings
+  (refinement, Gaussian background, ...) are read from the indexing tab.
 - **Load patterns** loads the file (one data set in memory at a time, as everywhere) and shows the
   map: with a scan file given, the **IQ column of the scan file**: an `.ang` (the acquisition's Hough IQ,
   or an indexing result's), an APEX `.edaxh5` (the map chosen by the map filter), an `.h5` written by
   the workbench's *Save .h5* (orix crystal map; its IQ is the spherical one) or an h5ebsd `.h5` (EDAX
   OIM, kikuchipy, EMSphInx). It must be this scan's and on a square grid.
-  Without a scan file the map stays empty until **Build quasi-IQ map** computes the quasi-IQ map
+  Without a scan file the map is black until **Build quasi-IQ map** computes the quasi-IQ map
   (the standard deviation of every raw pattern, one read of the file); nothing is computed on its
-  own. The indexing tab still builds the quasi-IQ map by itself. **Read scan parameters** is the
-  indexing tab's button, for the projection center.
+  own, and every point of the black map can still be clicked for its pattern. **Read scan
+  parameters** is the indexing tab's button, for the projection center.
 - **Click a point** on the map: the pattern is shown on the right as the indexer will see it (as in
   the indexing tab, which follows the same click) and marked in red; the simulated panel empties
   until the point is indexed.

@@ -44,6 +44,7 @@ import inspect
 import io
 import os
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -737,8 +738,11 @@ class Workbench(QMainWindow):
         """Build tab 3: the settings form on the left, the buttons, live view, result maps and log on the right.
         Keeps the widgets the point tab mirrors: the pattern, scan and master file edits (``pattern_file_edit``,
         ``scan_file_edit``, ``master_file_edit``), the projection center edit (``pc_edit``), the bandwidth combo
-        (``bandwidth_combo``), the AHE tiles spin box (``w_regions``) and the circular mask box (``w_circular``);
-        and the tab widget as ``indexing_tab``."""
+        (``bandwidth_combo``), the AHE tiles spin box (``w_regions``), the circular mask box (``w_circular``), the
+        PC convention combo (``pc_convention_combo``), the sample tilt edit (``sample_tilt_edit``), the camera tilt
+        spin box (``camera_tilt_spin``) and the pixel size spin box (``px_size_spin``); the stop button
+        (``btn_stop``, enabled only while a run of ``run_indexing`` is in progress); and the tab widget as
+        ``indexing_tab``."""
         tab = QWidget()
         outer = QHBoxLayout(tab)
         self.form = form = SettingsForm(self.base)
@@ -760,11 +764,17 @@ class Workbench(QMainWindow):
             filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)", start_dir=self._pattern_file_dir)
         form.add_text("EDAXH5_MAP", "edaxh5 map filter:", tip="Only for .edaxh5 files with several maps: part of the map's name, e.g. 'Area 8'",
                       placeholder="None", literal=False)
-        self.btn_load = QPushButton("Load patterns (quasi-IQ map)")
-        self.btn_load.setToolTip("Loads the pattern file, shows its quasi image quality map "
-                                 "in the Live view and fills the pixel size; done automatically after browsing for a file")
-        self.btn_load.clicked.connect(self.load_patterns_clicked)
+        self.btn_load = QPushButton("Load patterns")
+        self.btn_load.setToolTip("Loads the pattern file (one data set in memory at a time) and fills the pixel size; done "
+                                 "automatically after browsing for a file. The Live view then shows a black map of the scan's "
+                                 "shape to click on; 'Build quasi-IQ map' puts the quasi-IQ map there")
+        self.btn_load.clicked.connect(lambda: self.load_patterns_clicked())
         form.add_widget(self.btn_load)
+        self.btn_quasi = QPushButton("Build quasi-IQ map")
+        self.btn_quasi.setToolTip("The quasi image quality map of the loaded patterns (the standard deviation of every raw "
+                                  "pattern, one read of the file) as the Live view's map; not needed for indexing")
+        self.btn_quasi.clicked.connect(lambda: self.build_map("quasi"))
+        form.add_widget(self.btn_quasi)
         self.btn_scan = QPushButton("Read scan parameters")
         self.btn_scan.setToolTip("Reads the scan and pattern file headers, prints them in the log and fills the projection center")
         self.btn_scan.clicked.connect(self.read_scan)
@@ -795,8 +805,8 @@ class Workbench(QMainWindow):
         self.pc_edit = form.add_text("PC", "Projection center (x*, y*, z*):", "Values from an .ang file are in the EDAX convention")
         self.pc_convention_combo = form.add_combo("PC_CONVENTION", "PC convention:", sph_core.PC_CONVENTIONS)
         self.pc_convention_combo.currentTextChanged.connect(lambda *_: self.auto_px_size())
-        form.add_text("SAMPLE_TILT", "Sample tilt deg:", tip="Blank = the tilt the master pattern was simulated for (as EMSphInx does)", placeholder="None = from master")
-        form.add_float("CAMERA_TILT", "Camera tilt deg:", -180, 180, 2, "Detector tilt / camera elevation (EMSphInx thetac): 8 for EBSD, -90 for RKD")
+        self.sample_tilt_edit = form.add_text("SAMPLE_TILT", "Sample tilt deg:", tip="Blank = the tilt the master pattern was simulated for (as EMSphInx does)", placeholder="None = from master")
+        self.camera_tilt_spin = form.add_float("CAMERA_TILT", "Camera tilt deg:", -180, 180, 2, "Detector tilt / camera elevation (EMSphInx thetac): 8 for EBSD, -90 for RKD")
         self.px_size_spin = form.add_float("PX_SIZE", "Pixel size um:", 1e-6, 1e6, 4,
                                            f"Detector pixel size. Filled automatically as {ebsd_params.DETECTOR_WIDTH_UM / 1000:.0f} mm / pattern width "
                                            "for the EDAX/TSL convention once the pattern width is known; editable")
@@ -838,13 +848,20 @@ class Workbench(QMainWindow):
         self.btn_full = QPushButton("Index full map")
         self.btn_full.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px; }")
         self.btn_full.clicked.connect(lambda: self.run_indexing(test=False))
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setStyleSheet("QPushButton:enabled { background-color: #C62828; color: white; font-weight: bold; padding: 6px; }")
+        self.btn_stop.setToolTip("Stop the running indexing after the band in progress: the bands already indexed are discarded "
+                                 "and nothing is saved. Greyed out when no indexing runs")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self.stop_indexing)
+        self._stop_event = threading.Event()
         self.btn_save = QPushButton("Save .ang / .h5")
         self.btn_save.clicked.connect(self.save_result)
         self.btn_compare = QPushButton("Compare with reference")
         self.btn_compare.clicked.connect(self.compare_reference)
         rl.addLayout(button_rows([self.btn_preset_load, self.btn_preset_save, self.btn_geometry, self.btn_compare,
-                                  self.btn_test, self.btn_full, self.btn_save]))
-        self.live_check = QCheckBox("Live view: index band by band and animate the progress on the quasi-IQ map")
+                                  self.btn_test, self.btn_full, self.btn_stop, self.btn_save]))
+        self.live_check = QCheckBox("Live view: index band by band and animate the progress on the map")
         self.live_check.setChecked(True)
         self.live_check.setToolTip("Off = one call for the whole map (no animation, a few per cent faster on tiny maps)")
         rl.addWidget(self.live_check)
@@ -950,7 +967,7 @@ class Workbench(QMainWindow):
         enabled when the processor has written a file. The browse buttons stay enabled; ``_refuse_while_busy``
         guards what they trigger."""
         for b in (self.btn_geometry, self.btn_test, self.btn_full, self.btn_save, self.btn_compare,
-                  self.btn_preset_load, self.btn_scan, self.btn_load):
+                  self.btn_preset_load, self.btn_scan, self.btn_load, self.btn_quasi):
             b.setEnabled(not busy)
         self.btn_load_processed.setEnabled(not busy and bool(self.processed_file))
         if self.point_tab is not None:
@@ -1155,14 +1172,15 @@ class Workbench(QMainWindow):
         self.log("Pattern processor: data set unloaded (a file is being loaded in the indexing tab)")
         return True
 
-    def load_patterns_clicked(self, iq_source: str | None = "quasi"):
-        """'Load patterns (quasi-IQ map)': load the pattern file on a worker, then build and show its map.
+    def load_patterns_clicked(self, iq_source: str | None = None):
+        """'Load patterns': load the pattern file on a worker and show it; a map only when asked for.
 
-        ``iq_source``: the map built right after the load by ``build_map``: "quasi" (the quasi-IQ map, the
-        indexing tab's button), "scan" (the IQ column of the scan file, the point tab's load with a scan file) or
-        None (no map yet; the point tab's load without a scan file, 'Build quasi-IQ map' makes one later).
-        Nothing is done when the same data set (``_load_key``) is already loaded, except showing it again, and
-        building the map asked for when the loaded one is of another source or missing. The processor's data set
+        ``iq_source``: the map built right after the load by ``build_map``: None (the default, the indexing
+        tab's button and the loads after browsing: no map, the views show a black map of the scan's shape to
+        click on, 'Build quasi-IQ map' makes the quasi-IQ map later), "scan" (the IQ column of the scan file, the
+        point tab's load with a scan file) or "quasi" (the quasi-IQ map). Nothing is done when the same data set
+        (``_load_key``) is already loaded, except showing it again, and building the map asked for when the
+        loaded one is of another source or missing. The processor's data set
         is unloaded first (one data set at a time), then the indexer's own; a result of this very data set is
         kept, so it can still be saved. On the worker: ``sph_core.load_patterns`` and the sample mean pattern
         for the click preview. Done: ``loaded`` is set (without a map), the pattern width taken from the signal,
@@ -1281,8 +1299,10 @@ class Workbench(QMainWindow):
 
     def _show_loaded(self):
         """Put the loaded data set's map into the live views (this tab's and the point tab's), bring this tab's
-        Live view to the front and preview the centre pattern. Without a map yet (``build_map`` not run) or for a
-        1D map (a line scan) the views get a note instead of a map; the centre pattern is still previewed."""
+        Live view to the front and preview the centre pattern. Without a map yet (``build_map`` not run) the views
+        get a black map of the scan's shape, so that every point can still be clicked for its pattern (and a
+        run paints its bands on it); for a 1D map (a line scan) they get a note instead of a map. The centre
+        pattern is previewed either way."""
         if self.loaded is None:
             return
         iq, source = self.loaded["iq"], self.loaded.get("iq_source")
@@ -1290,8 +1310,12 @@ class Workbench(QMainWindow):
         name = os.path.basename(self.loaded["source_file"]) if self.loaded["source_file"] else "nickel demo"
         if iq is not None and iq.ndim == 2:
             base, title = iq, f"{'IQ' if source == 'scan' else 'Quasi-IQ'} of {name} ({iq.shape[1]} x {iq.shape[0]} points)"
+        elif iq is None and len(nav_shape) == 2:
+            # a black map of the scan's shape: clickable, and the bands of a run are painted on it
+            base = np.zeros(tuple(int(v) for v in nav_shape), dtype=np.float32)
+            title = f"{name} ({nav_shape[1]} x {nav_shape[0]} points): no map built, click anywhere for the pattern"
         elif iq is None:
-            base, title = None, f"{name}: no map yet (give a scan file and load again, or 'Build quasi-IQ map')"
+            base, title = None, f"{name}: no map yet"
         else:
             base, title = None, f"{name}: 1D map, no live view"
         for view in self._preview_views():
@@ -1428,24 +1452,35 @@ class Workbench(QMainWindow):
 
         Without the data set loaded by 'Load patterns' the live view shows a blank map (a note says so). Done: the
         result is stored and the Results tab filled. Refused while a step runs.
+
+        The 'Stop' button (``stop_indexing``) is enabled for the run: it sets ``_stop_event``, which the worker
+        checks after the preparation, before every band (``index_blocks``'s ``stop``) and after a one-call run;
+        a stopped run ends with ``run_end`` (``success`` False), the worker returns no result, ``last_run`` is
+        left as it was and nothing is saved.
         """
         begun = self._begin_prepared_step()
         if begun is None:
             return
         st, prepared = begun
+        self._stop_event.clear()
+        stop = self._stop_event.is_set
 
         live = self.live_check.isChecked()
         if self.loaded is None or self.loaded["key"] != self._load_key(st):
-            # the quasi-IQ map of this data set is not there yet: the live view then shows a blank map
+            # this data set was not loaded with 'Load patterns': the live view then shows a blank map
             self.loaded = None
             self.live.set_base_map(None, "")
             if live:
-                self.log("NB! Click 'Load patterns (quasi-IQ map)' first to see the map fill in during indexing")
+                self.log("NB! Click 'Load patterns' first to see the map fill in during indexing "
+                         "('Build quasi-IQ map' puts the quasi-IQ map under it)")
         self.live_run = None
 
         def work(log, emit):
             # worker thread
             result = self._prepare_in_worker(st, prepared, log)
+            if stop():
+                log("Indexing stopped before it started; nothing kept")
+                return result, None
             prepared_, harmonics, _hkey, det = result
             s = prepared_["signal"]
             if test:
@@ -1468,9 +1503,14 @@ class Workbench(QMainWindow):
                     emit(name, data)
 
                 # a test region is small: shorter bands, so that the animation shows several of them
-                xmap_indexed, dt, speed = sph_core.index_blocks(
-                    s_run, harmonics, det, st, log, on_event=on_event,
-                    target_seconds=1.0 if test else sph_core.LIVE_BLOCK_SECONDS)
+                try:
+                    xmap_indexed, dt, speed = sph_core.index_blocks(
+                        s_run, harmonics, det, st, log, on_event=on_event,
+                        target_seconds=1.0 if test else sph_core.LIVE_BLOCK_SECONDS, stop=stop)
+                except sph_core.IndexingStopped as e:
+                    emit("run_end", {"success": False})
+                    log(f"Indexing stopped after {e.done_patterns} of {e.total_patterns} patterns; nothing kept, nothing saved")
+                    return result, None
                 xmap = sph_core.apply_twist(xmap_indexed, st.TWIST)
                 log(f"{xmap.size} patterns in {dt:.1f} s; steady speed {speed:.0f} patterns/s ({st.BACKEND}, bandwidth {st.BANDWIDTH})")
                 if st.TWIST:
@@ -1478,6 +1518,11 @@ class Workbench(QMainWindow):
             else:
                 xmap, xmap_indexed, dt = sph_core.index(s_run, harmonics, det, st, log, warm_up=s_warm)
                 speed = xmap.size / dt
+                if stop():
+                    # one call cannot be interrupted: the stop discards its result once it returns
+                    emit("run_end", {"success": False})
+                    log(f"Indexing stopped: the result of the {label} is discarded, nothing saved")
+                    return result, None
             emit("run_end", {"success": True})
             if test:
                 n_all = int(np.prod(s.axes_manager.navigation_shape))
@@ -1498,14 +1543,27 @@ class Workbench(QMainWindow):
                                 settings=st)
 
         def done(out):
+            self.btn_stop.setEnabled(False)
             result, run = out
             self._store_prepared(result)
+            if run is None:
+                return  # stopped: the previous result (if any) stays, nothing is saved
             self.last_run = run
             self.show_indexing_maps(run)
             # the Live tab keeps the finished IPF map in front; the Results tab has the score, IQ and IPF maps
             self.log("Done: the Results tab has the score, IQ, IPF-Z and IPF-X maps")
 
-        self._start(work, done, on_event=self.on_run_event)
+        if self._start(work, done, on_event=self.on_run_event, on_failed=lambda: self.btn_stop.setEnabled(False)):
+            self.btn_stop.setEnabled(True)
+
+    def stop_indexing(self):
+        """'Stop': ask the running indexing (``run_indexing``) to end after the band in progress. The button is
+        greyed out at once; the worker discards what it indexed and the run ends with ``run_end`` (not a success).
+        Nothing is saved."""
+        self.btn_stop.setEnabled(False)
+        if not self._stop_event.is_set():
+            self._stop_event.set()
+            self.log("Stop requested: the band in progress finishes, then the run ends; nothing will be kept or saved")
 
     # ---------------------------------------------------------------- live view plumbing
     def _live_pattern(self, row, col):

@@ -9,10 +9,10 @@ file when one is given, else the quasi-IQ map built on request (*Build quasi-IQ 
 Three columns: the file fields, the shared settings and the buttons on the left; the map in the middle (with
 the status line and the log under it); on the right the clicked pattern as the indexer sees it above the pattern
 simulated from the master, with a slider between them that lays the simulated pattern over the measured one at
-any opacity. The pattern, scan and master file fields, the projection center, the bandwidth, the
-AHE tiles and the circular mask mirror the spherical indexing tab's widgets (a change in either tab is a change
-in both); the master bandwidth, tilts, pixel size, twist, background steps and the other indexing settings are
-read from that tab. ``PointTab`` is built by ``Workbench.__init__`` with the Workbench as ``wb`` and uses its
+any opacity. The pattern, scan and master file fields, the projection center, its convention, the sample and
+camera tilts, the pixel size, the bandwidth, the AHE tiles and the circular mask mirror the spherical indexing
+tab's widgets (a change in either tab is a change in both); the master bandwidth, twist, background steps and
+the other indexing settings are read from that tab. ``PointTab`` is built by ``Workbench.__init__`` with the Workbench as ``wb`` and uses its
 data set (``loaded``, ``prepared``, ``harmonics``), its worker (``_start``), its preparation
 (``_begin_prepared_step``, ``_prepare_in_worker``, ``_store_prepared``), its click preview (``preview_point``,
 which calls ``set_base_map`` / ``show_pattern`` / ``set_marker`` here as on a ``LiveView``) and its ``log``.
@@ -28,8 +28,8 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSlider,
-    QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
+    QSlider, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 import sph_core
@@ -37,12 +37,14 @@ import sph_core
 
 def _mirror(a, b):
     """Keep two widgets of the same kind equal: a change of either is copied to the other (no loop: a value
-    that is already there is not set again). Line edits (text), spin boxes (value), check boxes (checked) and
-    combo boxes (current text). ``a`` takes ``b``'s value first."""
+    that is already there is not set again). Line edits (text), spin boxes (value, int or float), check boxes
+    (checked) and combo boxes (current text). ``a`` takes ``b``'s value first."""
     if isinstance(a, QLineEdit):
         signal, get, set_ = "textChanged", QLineEdit.text, QLineEdit.setText
     elif isinstance(a, QSpinBox):
         signal, get, set_ = "valueChanged", QSpinBox.value, QSpinBox.setValue
+    elif isinstance(a, QDoubleSpinBox):
+        signal, get, set_ = "valueChanged", QDoubleSpinBox.value, QDoubleSpinBox.setValue
     elif isinstance(a, QCheckBox):
         signal, get, set_ = "toggled", QCheckBox.isChecked, QCheckBox.setChecked
     elif isinstance(a, QComboBox):
@@ -271,7 +273,7 @@ class PointTab(QWidget):
             filter="Scan files (*.ang *.edaxh5 *.h5 *.hdf5);;All files (*)", start_dir=self._pattern_file_dir)
         self.btn_load = QPushButton("Load patterns")
         self.btn_load.setToolTip("Loads the pattern file (one data set in memory at a time) and shows the scan file's IQ map; "
-                                 "without a scan file the map stays empty until 'Build quasi-IQ map'")
+                                 "without a scan file the map is black (still clickable) until 'Build quasi-IQ map'")
         self.btn_load.clicked.connect(self.load_patterns)
         form.add_widget(self.btn_load)
         self.btn_scan = QPushButton("Read scan parameters")
@@ -283,7 +285,8 @@ class PointTab(QWidget):
                                   "file to take the IQ from")
         self.btn_quasi.clicked.connect(self.build_quasi_iq)
         form.add_widget(self.btn_quasi)
-        note = QLabel("With a scan file the map is its IQ column; without one, build the quasi-IQ map.")
+        note = QLabel("With a scan file the map is its IQ column; without one it is black until 'Build quasi-IQ map', "
+                      "and clicking anywhere on it still shows the pattern there.")
         note.setStyleSheet("color: gray")
         form.add_widget(note)
 
@@ -293,13 +296,32 @@ class PointTab(QWidget):
                                              "list ['a.sht', 'b.sht']. The same field as in the spherical indexing tab",
             filter=kw.MASTER_FILE_FILTER, multi=True)
 
-        form.group("Indexing (shared with the spherical indexing tab)")
-        # the four shared fields start at the indexing tab's current values (its form holds the Settings defaults)
+        form.group("Detector geometry (shared with the spherical indexing tab)")
+        # the shared fields start at the indexing tab's current values (its form holds the Settings defaults)
         self.pc_edit = form.add_text(
             "PC", "Projection center (x*, y*, z*):",
             "The same value as in the spherical indexing tab (in its PC convention): adjust it here and index the point "
             "again to see the match change; 'Read scan parameters' fills it from the scan file",
             default=wb.form._fields["PC"][0]())
+        self.pc_convention_combo = form.add_combo(
+            "PC_CONVENTION", "PC convention:", sph_core.PC_CONVENTIONS,
+            "The convention the projection center is given in; the same as in the spherical indexing tab",
+            default=wb.pc_convention_combo.currentText())
+        self.sample_tilt_edit = form.add_text(
+            "SAMPLE_TILT", "Sample tilt deg:",
+            "Blank = the tilt the master pattern was simulated for (as EMSphInx does); the same as in the spherical indexing tab",
+            placeholder="None = from master", default=wb.form._fields["SAMPLE_TILT"][0]())
+        self.camera_tilt_spin = form.add_float(
+            "CAMERA_TILT", "Camera tilt deg:", -180, 180, 2,
+            "Detector tilt / camera elevation (EMSphInx thetac): 8 for EBSD, -90 for RKD; the same as in the spherical indexing tab",
+            default=wb.camera_tilt_spin.value())
+        self.px_size_spin = form.add_float(
+            "PX_SIZE", "Pixel size um:", 1e-6, 1e6, 4,
+            "Detector pixel size; the same as in the spherical indexing tab (filled automatically for the EDAX/TSL convention "
+            "once the pattern width is known; editable)",
+            default=wb.px_size_spin.value())
+
+        form.group("Indexing (shared with the spherical indexing tab)")
         self.bandwidth_combo = form.add_combo(
             "BANDWIDTH", "Bandwidth:", sph_core.FAST_BANDWIDTHS,
             "The indexing bandwidth (fast values only), the same as in the spherical indexing tab; changing it rebuilds the "
@@ -310,8 +332,8 @@ class PointTab(QWidget):
                                       default=wb.w_regions.value())
         self.w_circular = form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector. "
                                         "The same as in the spherical indexing tab", default=wb.w_circular.isChecked())
-        note = QLabel("The master bandwidth, the tilts, pixel size and twist, the background steps and the other "
-                      "indexing settings are those of the spherical indexing tab.")
+        note = QLabel("The master bandwidth, the twist, the background steps and the other indexing settings are "
+                      "those of the spherical indexing tab.")
         note.setStyleSheet("color: gray")
         form.add_widget(note)
         self.btn_index = QPushButton("Index this point")
@@ -330,6 +352,10 @@ class PointTab(QWidget):
         _mirror(self.scan_file_edit, wb.scan_file_edit)
         _mirror(self.master_file_edit, wb.master_file_edit)
         _mirror(self.pc_edit, wb.pc_edit)
+        _mirror(self.pc_convention_combo, wb.pc_convention_combo)
+        _mirror(self.sample_tilt_edit, wb.sample_tilt_edit)
+        _mirror(self.camera_tilt_spin, wb.camera_tilt_spin)
+        _mirror(self.px_size_spin, wb.px_size_spin)
         _mirror(self.bandwidth_combo, wb.bandwidth_combo)
         _mirror(self.w_regions, wb.w_regions)
         _mirror(self.w_circular, wb.w_circular)
@@ -418,7 +444,7 @@ class PointTab(QWidget):
     # ------------------------------------------------------------------------------------------ actions
     def load_patterns(self):
         """'Load patterns': the workbench's load with the scan file's IQ column as the map, or no map without a
-        scan file (built later by 'Build quasi-IQ map')."""
+        scan file (a black, clickable map until 'Build quasi-IQ map')."""
         st = self.wb.settings()
         self.wb.load_patterns_clicked(iq_source="scan" if st.SCAN_FILE else None)
 

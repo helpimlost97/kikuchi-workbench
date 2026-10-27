@@ -127,8 +127,8 @@ class Settings:
     BACKEND: str = "gpu"
     N_WORKERS: int = 2
     REFINE: bool = True
-    N_REGIONS: int = 10
-    CIRCULAR_MASK: bool = True
+    N_REGIONS: int = 0
+    CIRCULAR_MASK: bool = False
     GAUSSIAN_BACKGROUND: bool = False
     NORMALIZE: bool = True
     CHUNKSIZE: int | None = None
@@ -156,6 +156,17 @@ BACKENDS = ("gpu", "cpu")
 LAZY_CHOICES = ("auto", True, False)
 #: Largest ``N_REGIONS`` (adaptive histogram equalization tiles per axis) the GUI offers.
 N_REGIONS_MAX = 64
+
+
+class IndexingStopped(Exception):
+    """Raised by :func:`index_blocks` when its ``stop`` callable asked for the run to end: ``done_patterns`` of
+    ``total_patterns`` had been indexed, and nothing of them is returned (the caller keeps no partial map)."""
+
+    def __init__(self, done_patterns: int, total_patterns: int):
+        super().__init__(f"indexing stopped after {done_patterns} of {total_patterns} patterns")
+        self.done_patterns = int(done_patterns)
+        self.total_patterns = int(total_patterns)
+
 #: Percentiles of :func:`stretch` and :func:`grey_limits`: how maps and patterns are shown.
 STRETCH_PERCENTILES = (1.0, 99.0)
 #: :func:`index_blocks`: seconds of work per band of the live view, and the fewest patterns of the first band.
@@ -1222,7 +1233,7 @@ def assemble_blocks(blocks: Sequence, nav_shape: tuple[int, int], step_size: tup
 
 def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, navigation_mask=None,
                  on_event: Callable[[str, dict], None] | None = None, target_seconds: float = LIVE_BLOCK_SECONDS,
-                 first_patterns: int | None = None, verbose: int = 0):
+                 first_patterns: int | None = None, verbose: int = 0, stop: Callable[[], bool] | None = None):
     """Spherical indexing of a 2D map band by band (whole map rows, from the top), so that a GUI can show the
     map growing; the result is that of one ``spherical_indexing`` call (every pattern is indexed on its own,
     and :func:`assemble_blocks` copies the results bit for bit).
@@ -1257,6 +1268,10 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
 
     (``run_start`` and ``run_end`` are the workbench's own events around this call, not emitted here.) A line
     scan (one navigation axis) is indexed as one band with ``r0, r1 = 0, 1`` and ``c1`` its length.
+
+    ``stop()`` (optional) is called before every band, on the calling thread; when it returns True the run ends
+    there with :exc:`IndexingStopped` (the bands already indexed are discarded; a band in progress always runs to
+    its end, so a stop takes effect within about ``target_seconds``).
 
     Returns ``(xmap, seconds, patterns_per_second)``: the crystal map as indexed on the full grid (``TWIST`` not
     applied; masked-out points not in its data), the summed time of the bands, and the steady speed
@@ -1375,6 +1390,8 @@ def index_blocks(s, harmonics: Sequence, det, st: Settings, log: Log = _print, n
     r0 = 0
     i = 0
     while r0 < n_rows:
+        if stop is not None and stop():
+            raise IndexingStopped(done_patterns, total_patterns)
         wanted = first_patterns if rate is None else target_seconds * rate
         # the fewest rows from r0 holding at least ``wanted`` patterns (at least one row)
         r1 = int(np.searchsorted(cum_patterns, cum_patterns[r0] + wanted, side="left"))
