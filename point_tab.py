@@ -63,7 +63,7 @@ def _mirror(a, b):
     getattr(b, signal).connect(copy_to(a))
 
 
-#: (vmin, vmax) for a grey image: ``sph_core.grey_limits`` (the same percentiles as the live view and the maps).
+#: (vmin, vmax) for a grey image without given limits: ``sph_core.grey_limits`` (the percentiles of the maps).
 _grey_limits = sph_core.grey_limits
 
 
@@ -132,8 +132,10 @@ class ClickMap(QWidget):
 class PairCanvas(QWidget):
     """The right column: the measured pattern as the indexer sees it (top), with the simulated pattern laid
     over it at the opacity of the slider under it (0 % = the measured pattern alone, 100 % = the simulated one
-    alone), and the pattern simulated from the master at the orientation found (bottom). Grey with percentile
-    limits, each image its own. ``ax_top`` / ``ax_bottom`` are the two axes (each in its own figure)."""
+    alone), and the pattern simulated from the master at the orientation found (bottom). Grey on the fixed scale
+    the caller gives (``sph_core.preview_limits``: 0 to the data's full scale for a raw pattern, as the pattern
+    processor shows it), percentile limits only without one. ``ax_top`` / ``ax_bottom`` are the two axes (each
+    in its own figure)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,15 +163,25 @@ class PairCanvas(QWidget):
         lay.addWidget(self.slider)
         lay.addWidget(self.canvas_bottom, 1)
         self._overlay = None          # the simulated pattern laid over the measured one, or None
+        self._overlay_limits = None   # its grey limits
         self._overlay_artist = None
         self.clear()
 
-    def _show(self, ax, pattern, title):
+    @staticmethod
+    def _limits(pattern, limits):
+        """``(vmin, vmax)``: ``limits`` when given (a fixed grey scale, e.g. ``sph_core.preview_limits``: 0 and the
+        data's full scale for a raw pattern, as the pattern processor shows it), else the percentile limits."""
+        if limits is None:
+            return _grey_limits(pattern)
+        lo, hi = float(limits[0]), float(limits[1])
+        return lo, (hi if hi > lo else lo + 1.0)
+
+    def _show(self, ax, pattern, title, limits=None):
         ax.clear()
         ax.set_xticks([])
         ax.set_yticks([])
         if pattern is not None:
-            lo, hi = _grey_limits(pattern)
+            lo, hi = self._limits(pattern, limits)
             ax.imshow(np.asarray(pattern, dtype=np.float32), cmap="gray", vmin=lo, vmax=hi, interpolation="nearest",
                       aspect="equal")
         ax.set_title(title, fontsize=10)
@@ -186,7 +198,7 @@ class PairCanvas(QWidget):
         if self._overlay is None or not self.ax_top.images:
             self._set_slider_text()
             return
-        lo, hi = _grey_limits(self._overlay)
+        lo, hi = self._limits(self._overlay, self._overlay_limits)
         self._overlay_artist = self.ax_top.imshow(np.asarray(self._overlay, dtype=np.float32), cmap="gray", vmin=lo, vmax=hi,
                                                   interpolation="nearest", aspect="equal", alpha=self.slider.value() / 100.0,
                                                   zorder=2)
@@ -207,16 +219,18 @@ class PairCanvas(QWidget):
             self.canvas_top.draw_idle()
         self._set_slider_text()
 
-    def show_measured(self, pattern, title):
-        """The top panel; the overlay, when there is one, is drawn again on top of it."""
-        self._show(self.ax_top, pattern, title)
+    def show_measured(self, pattern, title, limits=None):
+        """The top panel, drawn with the grey ``limits`` (see ``_limits``); the overlay, when there is one, is drawn
+        again on top of it."""
+        self._show(self.ax_top, pattern, title, limits)
         self._draw_overlay()
 
-    def show_simulated(self, pattern, title):
+    def show_simulated(self, pattern, title, limits=None):
         """The bottom panel, and the same pattern as the overlay of the top one (None clears both, the title
-        stays)."""
-        self._show(self.ax_bottom, pattern, title)
+        stays), both drawn with the grey ``limits``."""
+        self._show(self.ax_bottom, pattern, title, limits)
         self._overlay = None if pattern is None else np.asarray(pattern)
+        self._overlay_limits = limits
         if self.ax_top.images:
             # drop an earlier overlay (the measured image is the first artist), then draw the new one
             for im in list(self.ax_top.images[1:]):
@@ -419,11 +433,12 @@ class PointTab(QWidget):
         """Show the loaded data set's map (or clear it for None) in the middle column."""
         self.map_view.set_base_map(iq, title)
 
-    def show_pattern(self, pattern, row=None, col=None):
-        """Show the clicked pattern (as the indexer sees it) in the top right panel. A new point empties the
-        simulated panel until it is indexed."""
+    def show_pattern(self, pattern, row=None, col=None, limits=None):
+        """Show the clicked pattern (as the indexer sees it) in the top right panel, with the grey ``limits`` of
+        ``sph_core.preview_limits`` (0 to the data's full scale for a raw pattern, as the pattern processor shows
+        it). A new point empties the simulated panel until it is indexed."""
         rc = None if row is None else (int(row), int(col))
-        self.pair.show_measured(pattern, f"Measured ({row}, {col}), as the indexer sees it" if rc else "Measured pattern")
+        self.pair.show_measured(pattern, f"Measured ({row}, {col}), as the indexer sees it" if rc else "Measured pattern", limits)
         if rc != self._shown_rc or self.last_point is None:
             self.pair.show_simulated(None, "Simulated from the master ('Index this point')")
         self._shown_rc = rc
@@ -487,6 +502,7 @@ class PointTab(QWidget):
         # the caches are read here, on the GUI thread, and handed to the worker as plain values
         indexer, indexer_key = self.indexer, self.indexer_key
         masters, masters_key = self.masters, self.masters_key
+        scale_max = loaded.get("scale_max") or sph_core.intensity_full_scale(loaded["signal"].data.dtype)
 
         def work(log):
             # worker thread
@@ -528,9 +544,12 @@ class PointTab(QWidget):
             e = res["euler_deg"]
             summary = (f"({row}, {col}): {res['phase']}, Euler {e[0]:.2f}, {e[1]:.2f}, {e[2]:.2f} deg, "
                        f"score {res['score']:.3f}, IQ {res['iq']:.3f}, NCC {res['ncc']:.3f}, {res['seconds']:.2f} s")
-            self.pair.show_measured(p["seen"], f"Measured ({row}, {col}), as the indexer sees it")
+            # the measured pattern on the data's intensity scale (the indexer's steps, when ticked, change the
+            # range: ``preview_limits``); the simulated one is uint8, so 0-255 is its full scale
+            self.pair.show_measured(p["seen"], f"Measured ({row}, {col}), as the indexer sees it",
+                                    sph_core.preview_limits(st, scale_max, p["seen"]))
             self.pair.show_simulated(p["simulated"], f"Simulated from the master: {res['phase']}, Euler {e[0]:.1f}, {e[1]:.1f}, "
-                                                     f"{e[2]:.1f} deg, score {res['score']:.3f}")
+                                                     f"{e[2]:.1f} deg, score {res['score']:.3f}", (0.0, 255.0))
             self.result_label.setText(summary)
             self.map_view.set_marker(row, col)
 

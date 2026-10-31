@@ -217,13 +217,16 @@ class LiveView(QWidget):
     # ------------------------------------------------------------------------------------------
 
     def set_pattern_source(self, fn):
-        """``fn(row, col) -> 2D array or None``, polled on the GUI thread every ``_SWEEP_MS`` during a run to
-        fill the pattern panel. None disables the panel's cycling. Exceptions of ``fn`` are reported once per run
-        through ``error`` and never stop the run."""
+        """``fn(row, col) -> 2D array, (2D array, (vmin, vmax)) or None``, polled on the GUI thread every
+        ``_SWEEP_MS`` during a run to fill the pattern panel; the optional limits are the grey scale the pattern is
+        drawn with (``show_pattern``). None disables the panel's cycling. Exceptions of ``fn`` are reported once
+        per run through ``error`` and never stop the run."""
         self._pattern_source = fn
 
-    def show_pattern(self, pattern, row=None, col=None):
-        """Display one pattern on the right, grey, with the colour limits at its 1st and 99th percentile.
+    def show_pattern(self, pattern, row=None, col=None, limits=None):
+        """Display one pattern on the right, grey, black at ``limits[0]`` and white at ``limits[1]`` (e.g.
+        ``sph_core.preview_limits``: 0 and the data's full scale for a raw pattern, as the pattern processor
+        shows it); without ``limits`` at its 1st and 99th percentile (``sph_core.grey_limits``).
 
         ``pattern``: 2D array of any dtype (None, a non-2D or empty array is ignored). ``row``/``col`` go into the
         panel's title. Does not move the marker (``set_marker``). Redrawn at the next redraw tick.
@@ -234,7 +237,7 @@ class LiveView(QWidget):
         if p.ndim != 2 or p.size == 0:
             return
         pf = p.astype(np.float32, copy=False)
-        lo, hi = sph_core.grey_limits(pf)
+        lo, hi = (float(limits[0]), float(limits[1])) if limits is not None else sph_core.grey_limits(pf)
         if not hi > lo:
             hi = lo + 1.0
         if self._pat_artist is None or self._pat_shape != p.shape:
@@ -699,9 +702,12 @@ class LiveView(QWidget):
             return
         if pattern is None:
             return
+        limits = None
+        if isinstance(pattern, tuple):
+            pattern, limits = pattern
         self.n_fetched += 1
         try:
-            self.show_pattern(pattern, row, col)
+            self.show_pattern(pattern, row, col, limits)
         except Exception as e:  # noqa: BLE001
             self._report_error(f"Live view: the pattern at ({row}, {col}) could not be shown ({type(e).__name__}: {e})")
 

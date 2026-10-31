@@ -555,10 +555,54 @@ def scan_iq_map(st: Settings, nav_shape: tuple, log: Log = _print) -> np.ndarray
 def sample_mean_pattern(s, max_patterns: int = 5000) -> np.ndarray:
     """The static background the indexing would use, float32 of the signal shape: the one stored with the file,
     else the mean of up to ``max_patterns`` patterns spread over the map. Same rule as :func:`preprocess`."""
-    if getattr(s, "static_background", None) is not None:
-        return np.asarray(s.static_background, dtype=np.float32)
+    return sample_background_and_scale(s, max_patterns)[0]
+
+
+def intensity_full_scale(dtype, data_max: float | None = None) -> float:
+    """The intensity a pattern of ``dtype`` is shown white at (black at 0): the pattern processor's rule, so that
+    tabs 2 and 3 show a raw pattern exactly as tab 1 does. 255 for 8-bit data; for a wider integer type the
+    smallest ``2**k - 1`` (k >= 8) that holds ``data_max`` (a 12-bit camera stored in a .up2 gives 4095), the
+    type's maximum when ``data_max`` is unknown; for float data ``data_max`` itself (1.0 without one)."""
+    dtype = np.dtype(dtype)
+    if np.issubdtype(dtype, np.integer):
+        dtype_max = int(np.iinfo(dtype).max)
+        if dtype_max <= 255 or data_max is None:
+            return float(dtype_max)
+        bits = max(8, int(np.ceil(np.log2(float(data_max) + 1)))) if data_max > 0 else 8
+        return float(min((1 << bits) - 1, dtype_max))
+    return float(data_max) if data_max is not None and data_max > 0 else 1.0
+
+
+def sample_background_and_scale(s, max_patterns: int = 5000) -> tuple[np.ndarray, float]:
+    """``(static_bg, scale_max)`` from one read of up to ``max_patterns`` patterns spread over the map: the static
+    background of :func:`sample_mean_pattern` (the stored one when the file has it) and the intensity full scale
+    of :func:`intensity_full_scale` for the data type and the sample's maximum value."""
     flat = _sample_patterns(s.data, tuple(s.axes_manager.navigation_shape[::-1]), max_patterns)
-    return np.asarray(flat.astype(np.float32).mean(axis=0), dtype=np.float32)
+    scale_max = intensity_full_scale(flat.dtype, float(flat.max()) if flat.size else None)
+    if getattr(s, "static_background", None) is not None:
+        return np.asarray(s.static_background, dtype=np.float32), scale_max
+    return np.asarray(flat.astype(np.float32).mean(axis=0), dtype=np.float32), scale_max
+
+
+def preview_limits(st: Settings, scale_max: float, shown: np.ndarray) -> tuple[float, float]:
+    """``(vmin, vmax)`` for drawing a :func:`preview_pattern` (or :func:`preprocess_pattern_for_preview`) result
+    the way the pattern processor draws its patterns: a fixed intensity scale, never a per-pattern stretch.
+
+    - Nothing ticked, or the background removals only: ``(0, scale_max)``, the data's full scale
+      (:func:`intensity_full_scale`); a raw pattern is shown exactly as measured, and the background removals
+      rescale into the data type's range.
+    - ``N_REGIONS`` (the adaptive histogram equalization): ``(0, 255)``, its output being 8-bit as EMSphInx's.
+    - ``GAUSSIAN_BACKGROUND`` alone: the pattern's own minimum and maximum (its values are centred on zero, and
+      the indexer takes them as they are).
+    """
+    if st.N_REGIONS:
+        return 0.0, 255.0
+    if st.GAUSSIAN_BACKGROUND:
+        pf = np.asarray(shown, dtype=np.float32)
+        finite = pf[np.isfinite(pf)]
+        lo, hi = (float(finite.min()), float(finite.max())) if finite.size else (0.0, 1.0)
+        return lo, (hi if hi > lo else lo + 1.0)
+    return 0.0, float(scale_max) if scale_max and scale_max > 0 else 1.0
 
 
 def preview_pattern(pattern: np.ndarray, st: Settings, static_bg: np.ndarray | None = None,

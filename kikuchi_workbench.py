@@ -1205,9 +1205,10 @@ class Workbench(QMainWindow):
         def work(log):
             # worker thread
             s, scan = sph_core.load_patterns(st, log=log)
-            static_bg = sph_core.sample_mean_pattern(s)
+            static_bg, scale_max = sph_core.sample_background_and_scale(s)
+            log(f"{np.dtype(s.data.dtype).name} patterns, shown on the intensity scale 0-{int(scale_max)} (as in the pattern processor)")
             return {"key": key, "signal": s, "scan": scan, "iq": None, "iq_source": None, "source": "file",
-                    "static_bg": static_bg, "source_file": st.PATTERN_FILE,
+                    "static_bg": static_bg, "scale_max": scale_max, "source_file": st.PATTERN_FILE,
                     "nav_shape": tuple(s.axes_manager.navigation_shape[::-1])}
 
         def done(loaded):
@@ -1275,12 +1276,15 @@ class Workbench(QMainWindow):
             # the background removals are applied here unless they were already done in place on the data set
             shown = sph_core.preview_pattern(raw, st, loaded.get("static_bg"),
                                              apply_background=not any(loaded.get("preprocessed", (False, False))))
+            # a fixed grey scale (0 = black, the data's full scale = white), as the pattern processor shows its
+            # patterns: a raw pattern is seen exactly as measured, never stretched per pattern
+            limits = sph_core.preview_limits(st, loaded.get("scale_max") or sph_core.intensity_full_scale(raw.dtype), shown)
         except Exception as e:  # noqa: BLE001
             self.log(f"Pattern preview failed: {type(e).__name__}: {e}")
             return
         self._preview_rc = (int(row), int(col))
         for view in self._preview_views():
-            view.show_pattern(shown, int(row), int(col))
+            view.show_pattern(shown, int(row), int(col), limits)
             view.set_marker(int(row), int(col))
         steps = [name for name, on in (("static background", st.REMOVE_STATIC_BACKGROUND), ("dynamic background", st.REMOVE_DYNAMIC_BACKGROUND),
                                        ("Gaussian background", st.GAUSSIAN_BACKGROUND), (f"AHE {st.N_REGIONS} x {st.N_REGIONS}", bool(st.N_REGIONS)))
@@ -1474,6 +1478,8 @@ class Workbench(QMainWindow):
                 self.log("NB! Click 'Load patterns' first to see the map fill in during indexing "
                          "('Build quasi-IQ map' puts the quasi-IQ map under it)")
         self.live_run = None
+        # the live view's grey scale: the loaded data's full scale, read here on the GUI thread
+        scale_max = self.loaded.get("scale_max") if self.loaded is not None else None
 
         def work(log, emit):
             # worker thread
@@ -1492,7 +1498,8 @@ class Workbench(QMainWindow):
             n_run = int(np.prod(nav_shape))
             log(f"Indexing the {label}: {n_run} patterns, bandwidth {st.BANDWIDTH}, {st.BACKEND}")
             emit("run_start", {"r0": offset[0], "c0": offset[1], "rows": nav_shape[0], "cols": nav_shape[-1] if len(nav_shape) == 2 else 1,
-                               "n_patterns": n_run, "signal": s_run, "label": label, "st": st})
+                               "n_patterns": n_run, "signal": s_run, "label": label, "st": st,
+                               "scale_max": scale_max if scale_max else sph_core.sample_background_and_scale(s_run)[1]})
             if live and len(nav_shape) == 2:
                 def on_event(name, data):
                     # the band's IPF colours are computed here, on the worker, not on the GUI thread
@@ -1570,7 +1577,8 @@ class Workbench(QMainWindow):
         """One pattern of the running region, for the live view (called in the GUI thread, a few times per second).
 
         (row, col) are map coordinates of the whole map; the run's offset is subtracted. The montage tab's live
-        view uses this too. None when no run is shown.
+        view uses this too. Returns ``(pattern, (vmin, vmax))``, the grey limits of ``sph_core.preview_limits``
+        on the run's intensity scale; None when no run is shown.
         """
         run = self.live_run
         if run is None:
@@ -1581,7 +1589,8 @@ class Workbench(QMainWindow):
         else:
             data = np.asarray(s.data[int(row) - run["r0"], int(col) - run["c0"]])
         # the prepared signal already carries the background removals; only the indexer's own steps remain
-        return sph_core.preview_pattern(data, run["st"], None, apply_background=False)
+        shown = sph_core.preview_pattern(data, run["st"], None, apply_background=False)
+        return shown, sph_core.preview_limits(run["st"], run["scale_max"], shown)
 
     def on_run_event(self, name, data):
         """GUI thread slot for the worker's events: drives the live view, the status line and the speed estimate.
@@ -1590,8 +1599,10 @@ class Workbench(QMainWindow):
         run's region and offset by the run's ``r0``/``c0`` before they reach the live view):
 
         - ``run_start``: ``r0``, ``c0`` (offset of the region in the map), ``rows``, ``cols``, ``n_patterns``,
-          ``signal`` (the region's signal, for ``_live_pattern``), ``label``, ``st`` (the Settings) and optionally
-          ``live_view`` (the montage tab's view instead of this tab's). Starts ``live_run`` and the view's run.
+          ``signal`` (the region's signal, for ``_live_pattern``), ``label``, ``st`` (the Settings), ``scale_max``
+          (the data's intensity full scale, ``sph_core.intensity_full_scale``, the live view's white) and
+          optionally ``live_view`` (the montage tab's view instead of this tab's). Starts ``live_run`` and the
+          view's run.
         - ``progress``: ``frac_index``, ``frac_refine`` (0..1 of the current band), ``what`` ("iq" during the
           quasi-IQ map: only the status line is updated).
         - ``block_start``: ``r0``, ``r1``, ``c0``, ``c1``, ``n_patterns`` of the band being indexed.
@@ -1606,6 +1617,7 @@ class Workbench(QMainWindow):
         """
         if name == "run_start":
             self.live_run = {"signal": data["signal"], "st": data["st"], "r0": data["r0"], "c0": data["c0"], "n_patterns": data["n_patterns"],
+                             "scale_max": data.get("scale_max") or sph_core.intensity_full_scale(data["signal"].data.dtype),
                              "done": 0, "t0": time.perf_counter(), "window": collections.deque(), "block": None}
             # the live view that shows this run: the indexing tab's, or the montage tab's own
             self._live_view = data.get("live_view", self.live)

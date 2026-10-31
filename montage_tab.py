@@ -640,7 +640,8 @@ class MontageTab(QWidget):
                     emit("tile_start", {"index": i, "n_tiles": len(tiles), "tile": tile.name, "h5_path": tile.h5_path, "iq": iq_map,
                                         "one_line": len(nav_shape) == 1})
                     emit("run_start", {"r0": 0, "c0": 0, "rows": nav_shape[0] if len(nav_shape) == 2 else 1, "cols": nav_shape[-1],
-                                       "n_patterns": n_run, "signal": s, "label": tile.name, "st": st_t, "live_view": live})
+                                       "n_patterns": n_run, "signal": s, "label": tile.name, "st": st_t, "live_view": live,
+                                       "scale_max": sph_core.sample_background_and_scale(s)[1]})
 
                     def on_block_event(name, data):
                         if name == "block_done":
