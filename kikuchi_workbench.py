@@ -88,7 +88,7 @@ else:
 from PyQt5.QtCore import Qt, QThread, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
     QAction, QActionGroup, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QGridLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QHBoxLayout, QGridLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMenuBar, QMessageBox, QPlainTextEdit, QPushButton,
     QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa: E402
@@ -309,6 +309,62 @@ def side_by_side(left: QWidget, right: QWidget, left_width: int = 470) -> QSplit
 
 #: ``SettingsForm.add_*`` default: take the field's default from the ``Settings`` the form was built with.
 FROM_DEFAULTS = object()
+
+
+class _ProgressLabel(QLabel):
+    """The progress line at the right end of the menu bar (``QMenuBar.setCornerWidget``): the step running and
+    its per cent, time or ETA. A menu bar places its corner widget from ``sizeHint`` only when the widget is set
+    or the bar is resized, and lets the window's minimum width grow to the widget's ``minimumSizeHint``. So the
+    label's hint is a fixed share (``max_fraction``) of the window's width, independent of the text, its minimum
+    width is tiny, and the text is elided in the middle to fit, right aligned; ``setText`` keeps the full text
+    (``text()``) and paints the elided one, and the window's ``resizeEvent`` calls ``refit``."""
+
+    _MARGIN = 10
+
+    def __init__(self, max_fraction: float = 0.45):
+        super().__init__("")
+        self._full = ""
+        self._max_fraction = max_fraction
+        self._row_height = 0
+        self.setContentsMargins(0, 0, self._MARGIN, 0)
+        self.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+    def _hint_width(self) -> int:
+        window = self.window()
+        width = window.width() if window is not None and window is not self else 1200
+        return max(200, int(width * self._max_fraction))
+
+    def setText(self, text: str):  # noqa: N802 (Qt name)
+        self._full = text
+        super().setText(self.fontMetrics().elidedText(text, Qt.ElideMiddle, self._hint_width() - self._MARGIN))
+
+    def text(self) -> str:  # noqa: N802 (Qt name)
+        return self._full
+
+    def refit(self):
+        """Re-elide the text for the window's current width and have the menu bar place the label again
+        (called from the window's ``resizeEvent``)."""
+        self.setText(self._full)
+        bar = self.parentWidget()
+        if isinstance(bar, QMenuBar):
+            bar.setCornerWidget(self, Qt.TopRightCorner)
+
+    def set_row_height(self, height: int):
+        """Make the label as tall as the menu bar's titles (their ``actionGeometry`` height, measured by the window
+        before the label is set as the corner widget), so its text sits on the titles' line. Measured once, not
+        read back from the bar: the bar's height follows the corner widget's hint, so reading it would feed back."""
+        self._row_height = int(height)
+
+    def sizeHint(self):  # noqa: N802 (Qt name)
+        hint = super().sizeHint()
+        hint.setWidth(self._hint_width())
+        hint.setHeight(max(hint.height(), self._row_height))
+        return hint
+
+    def minimumSizeHint(self):  # noqa: N802 (Qt name)
+        hint = super().minimumSizeHint()
+        hint.setWidth(self._MARGIN)
+        return hint
 
 
 class SettingsForm(QWidget):
@@ -600,6 +656,7 @@ class Workbench(QMainWindow):
         super().__init__()
         # the appearance (dark by default, or the one chosen last) before any widget or figure is made
         theme.apply(QApplication.instance(), theme.current())
+        self.progress_label = _ProgressLabel()   # the progress line, at the right end of the menu bar (_build_menu)
         self.setWindowTitle(f"Kikuchi workbench v{__version__}: pattern processor + spherical indexing")
         self.setGeometry(60, 60, 1500, 950)
         self.worker: Worker | None = None
@@ -641,8 +698,10 @@ class Workbench(QMainWindow):
     def _build_menu(self):
         """The menu bar: *Appearance* with *Dark* (the default) and *Light*, exclusive and checkable. Choosing
         one switches every widget and figure at once (``theme.apply``) and is remembered for the next start.
-        The actions are ``appearance_actions`` (mode -> QAction)."""
-        menu = self.menuBar().addMenu("Appearance")
+        The actions are ``appearance_actions`` (mode -> QAction). At the bar's right end sits the progress line
+        (``progress_label``, written by ``set_progress``)."""
+        bar = self.menuBar()
+        menu = bar.addMenu("Appearance")
         group = QActionGroup(self)
         group.setExclusive(True)
         self.appearance_actions = {}
@@ -654,6 +713,9 @@ class Workbench(QMainWindow):
             group.addAction(action)
             menu.addAction(action)
             self.appearance_actions[mode] = action
+        # the progress line at the right end, as tall as the titles' row (measured before it joins the bar)
+        self.progress_label.set_row_height(bar.actionGeometry(menu.menuAction()).height())
+        bar.setCornerWidget(self.progress_label, Qt.TopRightCorner)
 
     def set_appearance(self, mode: str):
         """Switch to the ``"dark"`` or ``"light"`` appearance, tick its menu entry and remember the choice."""
@@ -771,7 +833,8 @@ class Workbench(QMainWindow):
     def _build_indexing_tab(self):
         """Build tab 3: the settings form on the left, the buttons, live view, result maps and log on the right.
         Keeps the widgets the point tab mirrors: the pattern, scan and master file edits (``pattern_file_edit``,
-        ``scan_file_edit``, ``master_file_edit``), the projection center edit (``pc_edit``), the bandwidth combo
+        ``scan_file_edit``, ``master_file_edit``), the edaxh5 map filter edit (``edaxh5_map_edit``), the
+        projection center edit (``pc_edit``), the bandwidth combo
         (``bandwidth_combo``), the AHE tiles spin box (``w_regions``), the circular mask box (``w_circular``), the
         Gaussian background box (``w_gaussian``), the
         PC convention combo (``pc_convention_combo``), the sample tilt edit (``sample_tilt_edit``), the camera tilt
@@ -797,8 +860,9 @@ class Workbench(QMainWindow):
         self.scan_file_edit = form.add_path(
             "SCAN_FILE", "Scan file (.ang/.edaxh5):", tip="The .ang or .edaxh5 written at acquisition: gives the projection center, map size and step",
             filter="Scan files (*.ang *.edaxh5 *.h5);;All files (*)", start_dir=self._pattern_file_dir)
-        form.add_text("EDAXH5_MAP", "edaxh5 map filter:", tip="Only for .edaxh5 files with several maps: part of the map's name, e.g. 'Area 8'",
-                      placeholder="None", literal=False)
+        self.edaxh5_map_edit = form.add_text(
+            "EDAXH5_MAP", "edaxh5 map filter:", tip="Only for .edaxh5 files with several maps: part of the map's name, e.g. 'Area 8'",
+            placeholder="None", literal=False)
         self.btn_load = QPushButton("Load patterns")
         self.btn_load.setToolTip("Loads the pattern file (one data set in memory at a time) and fills the pixel size; done "
                                  "automatically after browsing for a file. The Live view then shows a black map of the scan's "
@@ -917,11 +981,9 @@ class Workbench(QMainWindow):
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
-        self.progress_label = QLabel("")
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumBlockCount(5000)
-        bl.addWidget(self.progress_label)
         bl.addWidget(self.log_box)
         split.addWidget(bottom)
         split.setSizes([600, 300])
@@ -990,12 +1052,14 @@ class Workbench(QMainWindow):
                 tab.log(text)
 
     def set_progress(self, text: str):
-        """Show ``text`` (its last 200 characters) in the status line under the views, and in the point and
-        montage tabs'."""
+        """Show ``text`` (its last 200 characters) in the progress line at the right end of the menu bar: the
+        console progress bars of the running step, the band summaries of a run, the batch's stage. One line for
+        the whole window, blank between steps."""
         self.progress_label.setText(text[-200:])
-        for tab in (self.point_tab, self.montage_tab):
-            if tab is not None:
-                tab.set_progress(text)
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt name)
+        super().resizeEvent(event)
+        self.progress_label.refit()
 
     def _busy(self, busy: bool):
         """Disable (``busy``) or enable the action buttons of the indexing tab. 'Load processed patterns' is only

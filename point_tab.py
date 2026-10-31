@@ -7,10 +7,11 @@ harmonics the indexer matched against, projected on the same detector). The map 
 file when one is given, else the quasi-IQ map built on request (*Build quasi-IQ map*), never automatically.
 
 Three columns: the file fields, the shared settings and the buttons on the left; the map in the middle (with
-the status line and the log under it); on the right the clicked pattern as the indexer sees it above the pattern
+the log under it); on the right the clicked pattern as the indexer sees it above the pattern
 simulated from the master, with a slider between them that lays the simulated pattern over the measured one at
-any opacity. The pattern, scan and master file fields, the projection center, its convention, the sample and
-camera tilts, the pixel size, the bandwidth, the AHE tiles, the circular mask and the Gaussian background mirror
+any opacity. The pattern, scan and master file fields, the edaxh5 map filter, the projection center, its
+convention, the sample and camera tilts, the pixel size, the bandwidth, the AHE tiles, the circular mask and the
+Gaussian background mirror
 the spherical indexing tab's widgets (a change in either tab is a change in both); the master bandwidth, twist,
 the static and dynamic background removal and the other indexing settings are read from that tab. ``PointTab`` is built by ``Workbench.__init__`` with the Workbench as ``wb`` and uses its
 data set (``loaded``, ``prepared``, ``harmonics``), its worker (``_start``), its preparation
@@ -247,7 +248,7 @@ class PairCanvas(QWidget):
 
 class PointTab(QWidget):
     """The single-point tab: the file fields, shared settings and buttons on the left, the clickable map
-    (``ClickMap``) with the status line and log in the middle, the measured | simulated pair (``PairCanvas``)
+    (``ClickMap``) with the log under it in the middle, the measured | simulated pair (``PairCanvas``)
     on the right.
 
     Attributes read by the workbench or by scripts: ``map_view``, ``pair``, ``indexer`` / ``indexer_key`` (the
@@ -285,6 +286,11 @@ class PointTab(QWidget):
                                                   "its IQ column becomes the map here, and 'Read scan parameters' takes the projection "
                                                   "center from an acquisition file",
             filter="Scan files (*.ang *.edaxh5 *.h5 *.hdf5);;All files (*)", start_dir=self._pattern_file_dir)
+        self.edaxh5_map_edit = form.add_text(
+            "EDAXH5_MAP", "edaxh5 map filter:", tip="Only for an .edaxh5 project with several maps (areas): part of the map's name, "
+                                                   "e.g. 'Area 7', so that 'Read scan parameters' and the IQ map take that map. The "
+                                                   "same field as in the spherical indexing tab",
+            placeholder="None", literal=False, default=wb.form._fields["EDAXH5_MAP"][0]())
         self.btn_load = QPushButton("Load patterns")
         self.btn_load.setToolTip("Loads the pattern file (one data set in memory at a time) and shows the scan file's IQ map; "
                                  "without a scan file the map is black (still clickable) until 'Build quasi-IQ map'")
@@ -367,6 +373,7 @@ class PointTab(QWidget):
         # one value, two widgets: the indexing tab's fields and these
         _mirror(self.pattern_file_edit, wb.pattern_file_edit)
         _mirror(self.scan_file_edit, wb.scan_file_edit)
+        _mirror(self.edaxh5_map_edit, wb.edaxh5_map_edit)
         _mirror(self.master_file_edit, wb.master_file_edit)
         _mirror(self.pc_edit, wb.pc_edit)
         _mirror(self.pc_convention_combo, wb.pc_convention_combo)
@@ -378,7 +385,7 @@ class PointTab(QWidget):
         _mirror(self.w_circular, wb.w_circular)
         _mirror(self.w_gaussian, wb.w_gaussian)
 
-        # middle column: the map, the status line and the log; right column: the measured | simulated pair
+        # middle column: the map and the log; right column: the measured | simulated pair
         middle = QWidget()
         ml = QVBoxLayout(middle)
         ml.setContentsMargins(0, 0, 0, 0)
@@ -389,12 +396,9 @@ class PointTab(QWidget):
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
-        self.progress_label = QLabel("")
-        self.progress_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumBlockCount(5000)
-        bl.addWidget(self.progress_label)
         bl.addWidget(self.log_box)
         msplit.addWidget(bottom)
         msplit.setSizes([650, 200])
@@ -417,10 +421,6 @@ class PointTab(QWidget):
         """Append a line to the tab's log pane, scrolled to the end (``Workbench.log`` mirrors every line here)."""
         self.log_box.appendPlainText(text)
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
-
-    def set_progress(self, text: str):
-        """Show the last 200 characters of ``text`` in the status line (mirrored from ``Workbench.set_progress``)."""
-        self.progress_label.setText(text[-200:])
 
     def _pattern_file_dir(self):
         """Folder of the pattern file as typed, or None: where the scan file dialog starts."""

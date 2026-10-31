@@ -22,6 +22,19 @@ Everything in this repository is vibe coded; read the code before trusting a num
 Tested on Windows 11, Python 3.14, an RTX 5070 Laptop GPU (8 GB VRAM) with a CUDA 13 driver, 32 GB RAM. Linux
 works the same way; only the path syntax in the examples changes.
 
+**In this README**
+
+1. [What is in this folder](#1-what-is-in-this-folder)
+2. [Install](#2-install)
+3. [Verify the install](#3-verify-the-install)
+4. [The workbench](#4-the-workbench): the four tabs and the rules they share, then [4.1 Index a point](#41-index-a-point)
+   and [4.2 Spherical indexing tab](#42-spherical-indexing-tab), each as a workflow first and a description of
+   the buttons and fields after it
+5. [Montage batch](#5-montage-batch): processing and indexing every tile of an EDAX APEX montage
+6. [Command line and scripts](#6-command-line-and-scripts)
+7. [Performance notes and known issues](#7-performance-notes-and-known-issues)
+8. [References and license](#8-references-and-license)
+
 ---
 
 ## 1. What is in this folder
@@ -117,17 +130,22 @@ python kikuchi_workbench.py --no-processor         # the point, indexing and mon
 On Windows `Open workbench.bat` does the same (set `PYTHON` at its top to your environment's interpreter). The
 processor's own switches (`KPP_GPU=0`, `KPP_THREADS`, `KPP_IN_MEMORY`, ...) apply inside the workbench too. Long
 steps run in a worker thread with their console output in the log pane. The **Appearance** menu switches the
-whole window, figures included, between **Dark** (the default) and **Light**; the choice is remembered.
+whole window, figures included, between **Dark** (the default) and **Light**; the choice is remembered. At the
+right end of the menu bar, the **progress line** shows the step running with its per cent, time or ETA (the
+console progress bars of the step, the band summaries of a run, the batch's current tile); it is blank between
+steps.
 
-The four tabs:
+The tabs follow the order of a job: **process the patterns if they need it (tab 1), index a point or two to see
+that the orientation found is the right one (tab 2), then index the full map (tab 3) or every map of a montage
+(tab 4).** The four tabs:
 
 1. **Pattern processor**: `gpu_pattern_viewer.py` as it is, so it also runs on its own. NLPAR through
    pyebsdindex, aperture, IQ range, background, stretch, CLAHE, `Apply && Save`. Its defaults live in
    `pattern_processor/processor_defaults.py`; its README is in that folder.
 2. **Index a point**: click a point on the map, index that one pattern and see it next to the master pattern
-   simulated at the orientation found (4.2).
+   simulated at the orientation found (4.1).
 3. **Spherical indexing**: the indexing settings as a form on the left (drag the divider to resize it), the live
-   view, the result maps and a log on the right (4.1).
+   view, the result maps and a log on the right (4.2).
 4. **Montage batch**: processing and indexing for every tile of an EDAX APEX montage (section 5).
 
 Two rules hold across the tabs. **One data set at a time**: loading a file in any tab unloads the others' data
@@ -137,43 +155,78 @@ tab, and the saved file is kept. **One pattern file for the first three tabs**: 
 becomes the pattern file of the point and indexing tabs (one field, shown in both), and the processor's *Load
 UP1 / UP2* dialog opens on the file set there.
 
-### 4.1 Spherical indexing tab
+### 4.1 Index a point
 
-The settings (the names are those of `sph_core.Settings` and of the preset files):
+The **2. Index a point** tab indexes a single clicked pattern and shows the master pattern simulated at the
+orientation found next to it. It is the check between processing and a full run: index a couple of pixels,
+confirm that the orientation, the projection center, the camera tilt and the twist sign are right, then go to
+tab 3 or tab 4 with the same settings. Everything a basic run needs is on this tab; the fields it shares with
+the indexing tab are one value shown in two places.
 
-- `PC` and `PC_CONVENTION`: the projection center. Values from an `.ang` are in the `"edax"` convention, the
-  default; *Read scan parameters* fills them in.
-- `CAMERA_TILT`: detector tilt / camera elevation in degrees (EMSphInx `thetac`). Typically 8 for a
-  conventional EBSD camera, -90 for RKD (detector parallel to the sample).
-- `SAMPLE_TILT = None` takes the tilt the master pattern was simulated for, as EMSphInx does. Set
-  `OVERRIDE_MASTER_SAMPLE_TILT` only if you deliberately want another value.
-- `MASTER_FILE`: an EMSphInx `.sht` or an EMsoft master pattern `.h5`. Several files index several phases.
-- `REMOVE_STATIC_BACKGROUND` / `REMOVE_DYNAMIC_BACKGROUND`: off by default, for pattern files the processor
-  already corrected.
-- `BANDWIDTH`: 68 is the EMSphInx default; 88 or 123 for more accuracy at lower speed. Only the values the
-  spherical harmonic transform is fast at are offered.
-- `BACKEND = "gpu"`, `N_WORKERS` = Dask threads (default 2; raise to about your number of performance cores),
-  `CHUNKSIZE = None` (automatic GPU batch size; set a number if a run reports out of memory).
-- `TWIST`: rotation of the detector about its normal. The indexer cannot use a twisted detector, so the indexed
-  orientations are rotated about the sample normal afterwards. Flip the sign if the IPF-X and IPF-Y maps come
-  out rotated the wrong way.
-- `TEST_SIZE`: side of the square test region, in map points. If the test maps look like noise, try
-  `FLIP_PATTERNS_UD` or check the projection center and camera tilt.
-- `ROI`: `(col_start, col_stop, row_start, row_stop)` to index part of the map; `REFERENCE_FILE`: an `.ang` of
-  the same map from EMSphInx or OIM for *Compare with reference*.
+**Workflow**
 
-The workflow:
+1. **Pattern file**: browse for the `.up1`/`.up2` (or any file kikuchipy reads). A file loaded in the processor
+   or in the indexing tab is already here, since the three tabs share the field.
+2. **Scan file**: the `.ang` or `.edaxh5` written at acquisition. For an `.edaxh5` project with several areas,
+   type part of the wanted map's name in **edaxh5 map filter** (for instance `Area 7`), so that map is read.
+   **Read scan parameters** then fills the projection center, its convention and the pixel size from the file:
+   no hunting for a pattern center.
+3. **Load patterns**: the map appears, with the scan file's IQ column as its image.
+4. **Master file(s)**: one EMsoft master pattern `.h5` per phase.
+5. **Click a point** on the map and press **Index this point**. The measured pattern is shown above the pattern
+   simulated from the master at the orientation found; drag the **opacity slider** to lay one over the other
+   and compare the band positions in place. The result line gives the phase, the Euler angles, the score and
+   the cross-correlation between the two patterns.
+6. If the simulated pattern does not match: a wrong projection center, camera tilt or `FLIP_PATTERNS_UD` are
+   the usual causes. Raw full-resolution patterns from a conventional detector often need **AHE tiles** (10 is
+   EMSphInx's default) and the **circular mask** before the indexer finds the right orientation; tick them here,
+   index the point again, and they are already set for tab 3.
+7. Repeat for a second point in another grain, then move on to **3. Spherical indexing** for the whole map or
+   **4. Montage batch** for a stitched project.
+
+**The buttons and fields**
+
+- **Layout**: files, shared settings and buttons on the left; the map in the middle with the log under it; on
+  the right the clicked pattern as the indexer sees it, above the pattern simulated from the
+  master. The **opacity slider** between them lays the simulated pattern over the measured one.
+- **Pattern file**, **Scan file**, **edaxh5 map filter**, **Master file(s)**, **Projection center** and its
+  **convention**, the **sample and camera tilts**, **pixel size**, **bandwidth**, **AHE tiles**, **circular
+  mask** and **Gaussian background** are the same fields as the indexing tab's (a change in either tab is a
+  change in both). The other indexing settings are read from the indexing tab.
+- **Load patterns** shows the map: with a scan file, its **IQ column** (an `.ang`, an APEX `.edaxh5`, an `.h5`
+  written by *Save .h5*, or an h5ebsd `.h5`; it must be this scan's, on a square grid). Without one the map is
+  black until **Build quasi-IQ map**; every point is clickable either way.
+- **Read scan parameters** prints the scan and pattern file headers in the log and fills the projection center
+  (EDAX convention) and the pixel size (30 mm / pattern width for the EDAX/TSL convention; binning is always 1
+  here). The camera elevation of the file is reported, never copied into the camera tilt.
+- **Build quasi-IQ map**: the standard deviation of every raw pattern (one read of the file) as the map, for
+  scans without a usable scan file.
+- **Click a point**: the pattern is shown on the right and marked in red, on a fixed grey scale from 0 to the
+  data's full range, as the processor shows its patterns: raw when nothing is ticked, otherwise with the ticked
+  AHE tiles, circular mask and Gaussian background applied, exactly as the indexer will see it.
+- **Index this point** indexes the pattern on the CPU and fills the right column with the measured pattern as
+  the indexer sees it and the pattern simulated from the master at the orientation found (exactly what the
+  indexer matched against, projected on the same detector). Phase, Euler angles (Bunge, `TWIST` applied as in
+  the saved maps), score, IQ, the normalized cross-correlation between the two patterns and the timings go to
+  the result line and the log. The indexer is built on the first click (a second at bandwidth 68) and reused
+  until the master, the detector or an indexing setting changes.
+
+### 4.2 Spherical indexing tab
+
+**Workflow**
 
 - **Pattern source**: always a file. **Load processed patterns** is greyed out until the processor's
   `Apply && Save` has written a file; it then loads that file. Every pattern of the file is indexed: patterns
   the processor left outside its IQ range are in the file unprocessed. The browse button takes any other file
   kikuchipy reads. Big files are memory mapped and read chunk by chunk.
+- **Scan file** and **edaxh5 map filter**: the `.ang` or `.edaxh5` of the scan and, for a project with several
+  areas, part of the wanted map's name. **Read scan parameters** fills the projection center from it. The
+  **pixel size** is filled in as 30 mm / pattern width for the EDAX/TSL convention and stays editable; binning
+  is always 1 here.
 - **Load patterns** runs by itself after browsing for a file. It loads the patterns and shows a black map of the
   scan's shape in the **Live** view: every point of it can be clicked for its pattern, and a run paints its
   bands on it. **Build quasi-IQ map** (optional) puts the quasi image quality map (the standard deviation of
   every raw pattern, one read of the file) under the Live view; indexing does not need it.
-- **Read scan parameters** fills the projection center from the `.ang`. The **pixel size** is filled in as
-  30 mm / pattern width for the EDAX/TSL convention and stays editable; binning is always 1 here.
 - **Click anywhere on the map** before indexing to see that pattern on the right exactly as the indexer will
   see it, on a fixed grey scale from 0 to the data's full range, as the processor shows its patterns: raw when
   nothing is ticked, otherwise with the background removals, the Gaussian background and the adaptive histogram
@@ -189,30 +242,33 @@ The workflow:
   to or taken from one. Every default of the form is the `sph_core.Settings` default, so a default is changed
   there alone (`python check_defaults.py` verifies this).
 
-### 4.2 Index a point
+**The settings** (the names are those of `sph_core.Settings` and of the preset files):
 
-The **2. Index a point** tab indexes a single clicked pattern and shows the master pattern at the orientation
-found next to it, to check a point, the projection center, the camera tilt or the twist sign without indexing a
-region.
-
-- **Layout**: files, shared settings and buttons on the left; the map in the middle with the status line and
-  log under it; on the right the clicked pattern as the indexer sees it, above the pattern simulated from the
-  master. The **opacity slider** between them lays the simulated pattern over the measured one, so the band
-  positions can be compared in place.
-- **Settings**: the pattern file, scan file, master file(s), projection center and convention, tilts, pixel
-  size, bandwidth, AHE tiles, circular mask and Gaussian background are the same fields as the indexing tab's (a change in either tab
-  is a change in both). The other indexing settings are read from the indexing tab.
-- **Load patterns** shows the map: with a scan file, its **IQ column** (an `.ang`, an APEX `.edaxh5`, an `.h5`
-  written by *Save .h5*, or an h5ebsd `.h5`; it must be this scan's, on a square grid). Without one the map is
-  black until **Build quasi-IQ map**; every point is clickable either way.
-- **Click a point**: the pattern is shown on the right and marked in red. **Index this point** indexes it on the
-  CPU and fills the right column with the measured pattern as the indexer sees it and the pattern simulated from
-  the master at the orientation found (exactly what the indexer matched against, projected on the same
-  detector). Phase, Euler angles (Bunge, `TWIST` applied as in the saved maps), score, IQ, the normalized
-  cross-correlation between the two patterns and the timings go to the result line and the log. The indexer is
-  built on the first click (a second at bandwidth 68) and reused until the master, the detector or an indexing
-  setting changes. A simulated pattern that looks nothing like the measured one points at the projection
-  center, the camera tilt or `FLIP_PATTERNS_UD`.
+- `SCAN_FILE` and `EDAXH5_MAP`: the acquisition file and, for an `.edaxh5` with several maps, part of the
+  wanted map's name (case insensitive). Also where the IQ map and the map size of an old `.up1` come from.
+- `PC` and `PC_CONVENTION`: the projection center. Values from an `.ang` are in the `"edax"` convention, the
+  default; *Read scan parameters* fills them in.
+- `CAMERA_TILT`: detector tilt / camera elevation in degrees (EMSphInx `thetac`). Typically 8 for a
+  conventional EBSD camera, -90 for RKD (detector parallel to the sample).
+- `SAMPLE_TILT = None` takes the tilt the master pattern was simulated for, as EMSphInx does. Set
+  `OVERRIDE_MASTER_SAMPLE_TILT` only if you deliberately want another value.
+- `MASTER_FILE`: an EMSphInx `.sht` or an EMsoft master pattern `.h5`. Several files index several phases.
+- `REMOVE_STATIC_BACKGROUND` / `REMOVE_DYNAMIC_BACKGROUND`: off by default, for pattern files the processor
+  already corrected.
+- `N_REGIONS`, `CIRCULAR_MASK`, `GAUSSIAN_BACKGROUND`: EMSphInx's own pattern preparation inside the indexer:
+  adaptive histogram equalization in `N_REGIONS` x `N_REGIONS` tiles (0 = off, 10 = EMSphInx's default), a
+  circular mask over the detector, and a Gaussian background fit. Shared with the point tab.
+- `BANDWIDTH`: 68 is the EMSphInx default; 88 or 123 for more accuracy at lower speed. Only the values the
+  spherical harmonic transform is fast at are offered.
+- `BACKEND = "gpu"`, `N_WORKERS` = Dask threads (default 2; raise to about your number of performance cores),
+  `CHUNKSIZE = None` (automatic GPU batch size; set a number if a run reports out of memory).
+- `TWIST`: rotation of the detector about its normal. The indexer cannot use a twisted detector, so the indexed
+  orientations are rotated about the sample normal afterwards. Flip the sign if the IPF-X and IPF-Y maps come
+  out rotated the wrong way.
+- `TEST_SIZE`: side of the square test region, in map points. If the test maps look like noise, try
+  `FLIP_PATTERNS_UD` or check the projection center and camera tilt.
+- `ROI`: `(col_start, col_stop, row_start, row_stop)` to index part of the map; `REFERENCE_FILE`: an `.ang` of
+  the same map from EMSphInx or OIM for *Compare with reference*.
 
 ---
 

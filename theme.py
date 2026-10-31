@@ -4,7 +4,8 @@
 ``"light"``: the Fusion widget style with a matching palette, and matplotlib's colours (figure and axes
 background, titles, ticks, labels) for the figures still to be created and for every figure already on screen.
 Dark is true black (``#000000`` window, inputs, log panes and figure backgrounds, for OLED displays) with buttons
-and splitter handles lifted just enough to be found and soft grey text. ``style_title_bar(window, mode)`` makes
+and splitter handles lifted just enough to be found, soft grey text, and check-box frames in that grey (a
+per-class palette, see ``_indicator_palette``). ``style_title_bar(window, mode)`` makes
 the Windows title bar follow (black caption, border and buttons; nothing elsewhere). ``current()`` is the mode
 to start in: the one chosen last in the *Appearance* menu (kept in ``QSettings``), else ``DEFAULT``. Nothing
 here changes the data shown: images keep their colour maps and grey scales.
@@ -73,6 +74,18 @@ def _palette(mode: str) -> QPalette:
         p.setColor(QPalette.Mid, QColor("#181818"))
         p.setColor(QPalette.Dark, QColor("#0a0a0a"))
         p.setColor(QPalette.Shadow, QColor("#000000"))
+    return p
+
+
+def _indicator_palette(mode: str) -> QPalette:
+    """The palette of check boxes (and radio buttons) only, set per class with ``QApplication.setPalette(p,
+    "QCheckBox")``. Fusion draws the frame of a check box from the *Window* colour (darkened by 140 then
+    lightened by 110), which on true black is black: the box vanishes. A white Window for these classes alone
+    gives a ``#c8c8c8`` frame, the soft grey of the text; nothing else of a check box uses Window (the box is
+    filled from Base, the mark from Text, and the widget does not paint its own background), so the black stays."""
+    p = _palette(mode)
+    if mode == "dark":
+        p.setColor(QPalette.Window, QColor("#ffffff"))
     return p
 
 
@@ -164,6 +177,8 @@ def apply(app: QApplication, mode: str, remember: bool = False) -> None:
         raise ValueError(f"appearance must be one of {MODES}, not {mode!r}")
     app.setStyle("Fusion")
     app.setPalette(_palette(mode))
+    for cls in ("QCheckBox", "QRadioButton"):   # visible frames on black; class palettes survive setPalette
+        app.setPalette(_indicator_palette(mode), cls)
     app.setStyleSheet(_stylesheet(mode))
     _rc(mode)
     _current = mode

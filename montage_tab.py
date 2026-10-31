@@ -187,11 +187,9 @@ class MontageTab(QWidget):
         bottom = QWidget()
         bl = QVBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 0, 0)
-        self.progress_label = QLabel("")
         self.log_box = QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumBlockCount(5000)
-        bl.addWidget(self.progress_label)
         bl.addWidget(self.log_box)
         split.addWidget(bottom)
         split.setSizes([600, 300])
@@ -209,9 +207,9 @@ class MontageTab(QWidget):
         self.log_box.verticalScrollBar().setValue(self.log_box.verticalScrollBar().maximum())
 
     def set_progress(self, text: str):
-        """Show the last 200 characters of ``text`` in the progress line above the log (mirrored from
-        ``Workbench.set_progress`` as well)."""
-        self.progress_label.setText(text[-200:])
+        """Show ``text`` in the window's progress line at the right end of the menu bar (``Workbench.set_progress``):
+        the batch's stage, shared background progress, or blank when the batch ends."""
+        self.wb.set_progress(text)
 
     def _project_dir(self):
         """Folder of the project path as typed, or None: where the folder dialogs of the tab start."""
