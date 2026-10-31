@@ -8,6 +8,7 @@
 !STITCH_DATASET_NOTES.md
 !example_data/
 !example_data/**
+example_data/montage_sample/processed/
 !sph_core.py
 !kikuchi_workbench.py
 !pattern_processor/
