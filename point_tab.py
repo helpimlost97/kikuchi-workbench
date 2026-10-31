@@ -10,9 +10,9 @@ Three columns: the file fields, the shared settings and the buttons on the left;
 the status line and the log under it); on the right the clicked pattern as the indexer sees it above the pattern
 simulated from the master, with a slider between them that lays the simulated pattern over the measured one at
 any opacity. The pattern, scan and master file fields, the projection center, its convention, the sample and
-camera tilts, the pixel size, the bandwidth, the AHE tiles and the circular mask mirror the spherical indexing
-tab's widgets (a change in either tab is a change in both); the master bandwidth, twist, background steps and
-the other indexing settings are read from that tab. ``PointTab`` is built by ``Workbench.__init__`` with the Workbench as ``wb`` and uses its
+camera tilts, the pixel size, the bandwidth, the AHE tiles, the circular mask and the Gaussian background mirror
+the spherical indexing tab's widgets (a change in either tab is a change in both); the master bandwidth, twist,
+the static and dynamic background removal and the other indexing settings are read from that tab. ``PointTab`` is built by ``Workbench.__init__`` with the Workbench as ``wb`` and uses its
 data set (``loaded``, ``prepared``, ``harmonics``), its worker (``_start``), its preparation
 (``_begin_prepared_step``, ``_prepare_in_worker``, ``_store_prepared``), its click preview (``preview_point``,
 which calls ``set_base_map`` / ``show_pattern`` / ``set_marker`` here as on a ``LiveView``) and its ``log``.
@@ -74,7 +74,7 @@ class ClickMap(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.figure = Figure(figsize=(5, 4), facecolor="w")
+        self.figure = Figure(figsize=(5, 4))   # colours from the appearance (theme.py)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.setMinimumSize(200, 120)
@@ -139,9 +139,9 @@ class PairCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.fig_top = Figure(figsize=(4, 4), facecolor="w")
+        self.fig_top = Figure(figsize=(4, 4))   # colours from the appearance (theme.py)
         self.canvas_top = FigureCanvas(self.fig_top)
-        self.fig_bottom = Figure(figsize=(4, 4), facecolor="w")
+        self.fig_bottom = Figure(figsize=(4, 4))
         self.canvas_bottom = FigureCanvas(self.fig_bottom)
         for c in (self.canvas_top, self.canvas_bottom):
             c.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -346,8 +346,11 @@ class PointTab(QWidget):
                                       default=wb.w_regions.value())
         self.w_circular = form.add_bool("CIRCULAR_MASK", "Circular mask", "Use only the inscribed circle of the detector. "
                                         "The same as in the spherical indexing tab", default=wb.w_circular.isChecked())
-        note = QLabel("The master bandwidth, the twist, the background steps and the other indexing settings are "
-                      "those of the spherical indexing tab.")
+        self.w_gaussian = form.add_bool("GAUSSIAN_BACKGROUND", "Gaussian background",
+                                        "Fit and subtract a 2D Gaussian background (EMSphInx gausbckg). "
+                                        "The same as in the spherical indexing tab", default=wb.w_gaussian.isChecked())
+        note = QLabel("The master bandwidth, the twist, the static and dynamic background removal and the other "
+                      "indexing settings are those of the spherical indexing tab.")
         note.setStyleSheet("color: gray")
         form.add_widget(note)
         self.btn_index = QPushButton("Index this point")
@@ -373,6 +376,7 @@ class PointTab(QWidget):
         _mirror(self.bandwidth_combo, wb.bandwidth_combo)
         _mirror(self.w_regions, wb.w_regions)
         _mirror(self.w_circular, wb.w_circular)
+        _mirror(self.w_gaussian, wb.w_gaussian)
 
         # middle column: the map, the status line and the log; right column: the measured | simulated pair
         middle = QWidget()

@@ -31,6 +31,7 @@ import traceback
 
 import numpy as np
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QHeaderView, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
     QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
@@ -38,6 +39,7 @@ from PyQt5.QtWidgets import (
 
 import montage
 import sph_core
+import theme
 
 #: The Settings fields that describe one tile's file and grid: cleared when a tile is put into the indexing tab
 #: and overridden per tile in the batch, so that nothing of the previously loaded scan applies to a tile.
@@ -365,7 +367,7 @@ class MontageTab(QWidget):
                     item.setData(Qt.UserRole, t.h5_path)  # rows are told apart by the map's path, not its name
                     item.setToolTip(t.h5_path)
                 if j == 4 and status != "ok":
-                    item.setForeground(Qt.darkRed if t.pattern is not None or tp.pattern is not None else Qt.gray)
+                    item.setForeground(QColor(theme.WARNING_RED) if t.pattern is not None or tp.pattern is not None else Qt.gray)
                 self.table.setItem(i, j, item)
         n_raw, n_proc = sum(t.ok for t in raw), sum(t.ok for t in processed)
         self.log(f"{n_raw} of {len(raw)} tiles have a raw pattern file in {self.pattern_dir()}; {n_proc} have a processed file in {self.output_dir()}")

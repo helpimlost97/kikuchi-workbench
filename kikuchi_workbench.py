@@ -87,9 +87,9 @@ else:
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal  # noqa: E402
 from PyQt5.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QGridLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
-    QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QAction, QActionGroup, QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
+    QHBoxLayout, QGridLayout, QLabel, QLayout, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QScrollArea, QSizePolicy, QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas  # noqa: E402
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT  # noqa: E402
@@ -97,6 +97,7 @@ from matplotlib.figure import Figure  # noqa: E402
 
 import ebsd_params  # noqa: E402
 import sph_core  # noqa: E402
+import theme  # noqa: E402
 from live_view import LiveView  # noqa: E402
 from montage_tab import MontageTab  # noqa: E402
 from point_tab import PointTab  # noqa: E402
@@ -523,7 +524,7 @@ class MapCanvas(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.figure = Figure(figsize=(9, 4), facecolor="w")
+        self.figure = Figure(figsize=(9, 4))   # colours from the appearance (theme.py)
         self.canvas = FigureCanvas(self.figure)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         lay = QVBoxLayout(self)
@@ -597,6 +598,8 @@ class Workbench(QMainWindow):
     def __init__(self, preset: str | None = None):
         """Build the window; ``preset`` is a preset file to load into the indexing form at start."""
         super().__init__()
+        # the appearance (dark by default, or the one chosen last) before any widget or figure is made
+        theme.apply(QApplication.instance(), theme.current())
         self.setWindowTitle(f"Kikuchi workbench v{__version__}: pattern processor + spherical indexing")
         self.setGeometry(60, 60, 1500, 950)
         self.worker: Worker | None = None
@@ -625,6 +628,7 @@ class Workbench(QMainWindow):
         self.montage_tab = MontageTab(self)
         self.tabs.addTab(self.montage_tab, "4. Montage batch")
         self.tabs.setCurrentIndex(1 if self.proc is None else 0)
+        self._build_menu()
         if preset:
             self.load_preset(preset)
         gpu_ok, gpu_text = sph_core.gpu_available()
@@ -632,6 +636,36 @@ class Workbench(QMainWindow):
         self.log(f"GPU for spherical indexing: {gpu_text}")
         if not gpu_ok and self.form.has("BACKEND"):
             self.form.set_value("BACKEND", "cpu")
+
+    # ---------------------------------------------------------------- menu bar
+    def _build_menu(self):
+        """The menu bar: *Appearance* with *Dark* (the default) and *Light*, exclusive and checkable. Choosing
+        one switches every widget and figure at once (``theme.apply``) and is remembered for the next start.
+        The actions are ``appearance_actions`` (mode -> QAction)."""
+        menu = self.menuBar().addMenu("Appearance")
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self.appearance_actions = {}
+        for mode, label in (("dark", "Dark"), ("light", "Light")):
+            action = QAction(label, self, checkable=True)
+            action.setChecked(theme.active() == mode)
+            action.setToolTip(f"{label} appearance for the whole workbench; remembered for the next start")
+            action.triggered.connect(lambda checked, m=mode: self.set_appearance(m))
+            group.addAction(action)
+            menu.addAction(action)
+            self.appearance_actions[mode] = action
+
+    def set_appearance(self, mode: str):
+        """Switch to the ``"dark"`` or ``"light"`` appearance, tick its menu entry and remember the choice."""
+        theme.apply(QApplication.instance(), mode, remember=True)
+        theme.style_title_bar(self, mode)
+        self.appearance_actions[mode].setChecked(True)
+        self.log(f"Appearance: {mode}")
+
+    def showEvent(self, event):  # noqa: N802 (Qt name)
+        """Qt override: the title bar follows the appearance once the native window exists."""
+        super().showEvent(event)
+        theme.style_title_bar(self)
 
     # ---------------------------------------------------------------- tab 1: the processor
     def _build_processor_tab(self):
@@ -739,6 +773,7 @@ class Workbench(QMainWindow):
         Keeps the widgets the point tab mirrors: the pattern, scan and master file edits (``pattern_file_edit``,
         ``scan_file_edit``, ``master_file_edit``), the projection center edit (``pc_edit``), the bandwidth combo
         (``bandwidth_combo``), the AHE tiles spin box (``w_regions``), the circular mask box (``w_circular``), the
+        Gaussian background box (``w_gaussian``), the
         PC convention combo (``pc_convention_combo``), the sample tilt edit (``sample_tilt_edit``), the camera tilt
         spin box (``camera_tilt_spin``) and the pixel size spin box (``px_size_spin``); the stop button
         (``btn_stop``, enabled only while a run of ``run_indexing`` is in progress); and the tab widget as

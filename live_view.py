@@ -80,7 +80,7 @@ class LiveView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.figure = Figure(figsize=(9, 4), facecolor="w")
+        self.figure = Figure(figsize=(9, 4))   # colours from the appearance (theme.py)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.canvas.setMinimumSize(200, 120)
